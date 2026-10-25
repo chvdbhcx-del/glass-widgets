@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.0] - 2026-10-25
+
+### Added
+- Setting "Accent on: Main / Everywhere" (`accentScope`). Everywhere is Apple's "Tinted" style: all text, icons and graphics of the cards take the accent (the red / orange warnings keep their colour); Main keeps the accent on titles, rings and bars.
+- Developer aid: `MSW_TEXT_LINT=1` + `tools/text-lint.py` report how evenly the text sits in every card and which sizes it uses.
+
+### Changed
+- One type scale for the whole desk: every font size snaps to 10 / 11 / 12 / 13 / 15 / 17 / 20 / 24 / 28 / 34 / 40 / 46 / 54 / 64 / 76 px (no more 14.276 or 9.5).
+
 ## [0.4.0] - 2026-10-25
 
 ### Changed

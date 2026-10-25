@@ -250,6 +250,9 @@ struct Probe {
 /// Run `f` with a `Cx` for this card; panics inside the widget are caught (needs panic=unwind, set in Cargo.toml).
 fn with_cx<R>(c: &mut CardView, sh: &Shared, gfx: &Gfx, now: &Now, base: Matrix3x2, light: bool, what: &str, f: impl FnOnce(&mut dyn Widget, &mut Cx) -> R) -> Option<R> {
     let CardView { widget, cfg, flags, size, hover, lum, uid, type_id, err_logged, .. } = c;
+    if what == "draw" && std::env::var_os("MSW_TEXT_LINT").is_some() {
+        eprintln!("CARD\t{}\t{:?}", type_id, size);
+    }
     let mut cx = Cx::new(CxParts {
         gfx,
         res: &sh.res,

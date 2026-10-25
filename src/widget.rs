@@ -585,6 +585,32 @@ fn tinted(c: Color, light: bool) -> Color {
     }
 }
 
+/// The type scale of the cards (px). Widgets ask for the size they want (and fit loops step through fractions: 14.276, 11.5, 9.5...); every request
+/// snaps to the nearest step so the whole desk shares one hierarchy: caption 11, small 12, body 13, emphasis 15, headline 17, then the number sizes.
+/// `MSW_TEXT_SCALE=off` keeps the requested sizes.
+const TYPE_SCALE: [f32; 15] = [10.0, 11.0, 12.0, 13.0, 15.0, 17.0, 20.0, 24.0, 28.0, 34.0, 40.0, 46.0, 54.0, 64.0, 76.0];
+
+fn snap_size(size: f32) -> f32 {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("MSW_TEXT_SCALE").is_ok_and(|v| v == "off")) || size <= 0.0 {
+        return size;
+    }
+    let mut best = TYPE_SCALE[0];
+    for &t in &TYPE_SCALE {
+        // ties go up: 11.5 -> 12, 12.5 -> 13
+        if (t - size).abs() <= (best - size).abs() {
+            best = t;
+        }
+    }
+    if size > TYPE_SCALE[TYPE_SCALE.len() - 1] { size } else { best }
+}
+
+/// `MSW_TEXT_LINT` is set: every `Cx::text` logs its geometry (a developer aid, see tools/text-lint.py).
+fn text_lint() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MSW_TEXT_LINT").is_some())
+}
+
 /// Size-dependent tracking in px (SF-like): small text opens up a little, large text tightens.
 fn auto_track(size: f32) -> f32 {
     match size {
@@ -624,6 +650,7 @@ impl Res {
     }
 
     fn format(&self, gfx: &Gfx, st: Style) -> Result<IDWriteTextFormat> {
+        let st = Style { size: snap_size(st.size), ..st };
         let key: FmtKey = ((st.size * 10.0) as u32, st.weight, st.align as u8, st.valign as u8, st.wrap, st.ellipsis);
         if let Some(f) = self.fmts.borrow().get(&key) {
             return Ok(f.clone());
@@ -1022,6 +1049,17 @@ impl<'a> Cx<'a> {
     pub fn text(&self, r: Rect, s: &str, st: Style, c: Color) {
         if s.is_empty() {
             return;
+        }
+        if text_lint() {
+            // `MSW_TEXT_LINT=1`: one TSV line per text run (card size, box, natural size, font size / weight / alignment, colour alpha) for tools/text-lint.py
+            let (nw, nh) = self.measure(s, st, r.w);
+            let al = match st.align {
+                Align::Left => 'L',
+                Align::Center => 'C',
+                Align::Right => 'R',
+            };
+            let chars: String = s.chars().take(22).collect();
+            eprintln!("TXT\t{:?}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{:.2}\t{}", self.size, r.x, r.y, r.w, r.h, nw, nh, st.size, st.weight, al, c.a, chars.replace('\t', " "));
         }
         if let Ok(l) = self.layout(s, st, r.w, r.h) {
             // `MSW_TEXT_SNAP=1`: the text origin on whole pixels, so stems do not straddle pixel boundaries (needs an upright, unscaled card)
