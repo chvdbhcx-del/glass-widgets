@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.1] - 2026-10-25
+
+### Changed
+- Text is smoother: unhinted symmetric grayscale rendering by default (the hinted mode made edges look blocky; `MSW_TEXT_MODE=natural` brings it back).
+- The typeface is now Inter (bundled, SIL OFL), crisper at small sizes than Nunito. `MSW_FONT=nunito` selects Nunito, `MSW_FONT=system` Segoe UI.
+
 ## [0.2.0] - 2026-10-25
 
 ### Changed

@@ -558,7 +558,7 @@ impl Res {
             };
             let round: ID2D1StrokeStyle = gfx.d2d.CreateStrokeStyle(&sp, None)?.cast()?;
             let coll = crate::fonts::collection(&gfx.dw);
-            let fams = if coll.is_some() { std::array::from_fn(|_| HSTRING::from(crate::fonts::FAMILY)) } else { [family(gfx, "Small"), family(gfx, "Text"), family(gfx, "Display")] };
+            let fams = if coll.is_some() { std::array::from_fn(|_| HSTRING::from(crate::fonts::family())) } else { [family(gfx, "Small"), family(gfx, "Text"), family(gfx, "Display")] };
             Ok(Res {
                 brush: gfx.dc.CreateSolidColorBrush(&col(1.0, 1.0, 1.0, 1.0), None)?,
                 round,
@@ -576,7 +576,7 @@ impl Res {
             return Ok(f.clone());
         }
         unsafe {
-            let f = gfx.dw.CreateTextFormat(&self.fams[cut_for(st.size)], self.coll.as_ref(), DWRITE_FONT_WEIGHT(weight_for(st.size, st.weight, self.coll.is_some())), DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, st.size, w!("ru-ru"))?;
+            let f = gfx.dw.CreateTextFormat(&self.fams[cut_for(st.size)], self.coll.as_ref(), DWRITE_FONT_WEIGHT(weight_for(st.size, st.weight, self.coll.is_some() && crate::fonts::family() == "Nunito")), DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, st.size, w!("ru-ru"))?;
             f.SetTextAlignment(match st.align {
                 Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
                 Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,

@@ -277,9 +277,10 @@ fn mixc(c: D2D1_COLOR_F, t: (f32, f32, f32), k: f32) -> D2D1_COLOR_F {
 // ---------------------------------------------------------------- the window
 
 unsafe fn text_fmt(dw: &IDWriteFactory, family: PCWSTR, px: f32, weight: i32, center: bool) -> Option<IDWriteTextFormat> {
-    // Nunito when bundled (same face as the widgets), else the system family that was asked for
+    // the bundled family when available (same face as the widgets), else the system family that was asked for
     let coll = crate::fonts::collection(dw);
-    let family = if coll.is_some() { w!("Nunito") } else { family };
+    let name = windows::core::HSTRING::from(crate::fonts::family());
+    let family = if coll.is_some() { PCWSTR(name.as_ptr()) } else { family };
     let f = dw.CreateTextFormat(family, coll.as_ref(),DWRITE_FONT_WEIGHT(weight), DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, px, w!("ru-ru")).ok()?;
     let _ = f.SetTextAlignment(if center { DWRITE_TEXT_ALIGNMENT_CENTER } else { DWRITE_TEXT_ALIGNMENT_LEADING });
     let _ = f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -350,7 +351,7 @@ unsafe fn build(hwnd: HWND, hi: windows::Win32::Foundation::HINSTANCE, o: &Promp
 
     // the EDIT's font and its line height
     crate::fonts::install_gdi();
-    let edit_font = CreateFontW(-((15.0 * k).round() as i32), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, w!("Nunito"));
+    let edit_font = CreateFontW(-((15.0 * k).round() as i32), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, &windows::core::HSTRING::from(crate::fonts::family()));
     let dc0 = GetDC(hwnd);
     let old = SelectObject(dc0, edit_font);
     let mut tm = TEXTMETRICW::default();

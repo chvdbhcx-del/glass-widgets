@@ -89,13 +89,13 @@ fn set_text_params(dw: &IDWriteFactory, dc: &ID2D1DeviceContext) {
     let (gamma, contrast) = (knob("MSW_TEXT_GAMMA", 2.2), knob("MSW_TEXT_CONTRAST", 0.6));
     unsafe {
         if let Ok(f3) = dw.cast::<IDWriteFactory3>() {
-            // `MSW_TEXT_MODE`: natural (default: hinted vertically, crisp x-height / baselines, even digits at 100 %) | sym (unhinted, softer,
-            // better at high DPI) | gdi (fully hinted: breaks kerning, kept for comparison)
+            // `MSW_TEXT_MODE`: sym (default: unhinted symmetric grayscale, smooth curves like macOS, no pixel-snapped stems) | natural (hinted
+            // vertically: crisper but blocky edges) | gdi (fully hinted: breaks kerning, kept for comparison) | natural_nofit
             let (mode, fit) = match std::env::var("MSW_TEXT_MODE").unwrap_or_default().as_str() {
-                "sym" => (DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC, DWRITE_GRID_FIT_MODE_DISABLED),
+                "natural" => (DWRITE_RENDERING_MODE1_NATURAL, DWRITE_GRID_FIT_MODE_ENABLED),
                 "gdi" => (DWRITE_RENDERING_MODE1_GDI_NATURAL, DWRITE_GRID_FIT_MODE_ENABLED),
                 "natural_nofit" => (DWRITE_RENDERING_MODE1_NATURAL, DWRITE_GRID_FIT_MODE_DISABLED),
-                _ => (DWRITE_RENDERING_MODE1_NATURAL, DWRITE_GRID_FIT_MODE_ENABLED),
+                _ => (DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC, DWRITE_GRID_FIT_MODE_DISABLED),
             };
             if let Ok(p) = f3.CreateCustomRenderingParams(gamma, contrast, contrast, 0.0, DWRITE_PIXEL_GEOMETRY_FLAT, mode, fit) {
                 dc.SetTextRenderingParams(&p);

@@ -1,13 +1,28 @@
-//! Bundled typeface: Nunito (SIL OFL 1.1, `assets/fonts/OFL.txt`), five static weights subset to Latin + Cyrillic, embedded in the exe.
+//! Bundled typefaces (SIL OFL 1.1: `assets/fonts/OFL.txt`, `Inter-LICENSE.txt`), five static weights each, subset to Latin + Cyrillic, embedded in the exe.
 //! DirectWrite reads them from memory (Windows 10 1703+); when that is not available the callers keep the system Segoe UI.
-//! `MSW_FONT=system` skips the bundled font.
+//! Default Inter; `MSW_FONT=nunito` picks Nunito, `MSW_FONT=system` skips the bundled fonts.
 use std::sync::OnceLock;
 use windows::core::{Interface, IUnknown};
 use windows::Win32::Graphics::DirectWrite::*;
 
-pub const FAMILY: &str = "Nunito";
+/// Family used for all text.
+pub fn family() -> &'static str {
+    if std::env::var("MSW_FONT").is_ok_and(|v| v == "nunito") {
+        "Nunito"
+    } else {
+        "Inter"
+    }
+}
 
-static FILES: [&[u8]; 5] = [
+static INTER: [&[u8]; 5] = [
+    include_bytes!("../assets/fonts/Inter-Light.ttf"),
+    include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+    include_bytes!("../assets/fonts/Inter-Medium.ttf"),
+    include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/Inter-Bold.ttf"),
+];
+
+static NUNITO: [&[u8]; 5] = [
     include_bytes!("../assets/fonts/Nunito-Light.ttf"),
     include_bytes!("../assets/fonts/Nunito-Regular.ttf"),
     include_bytes!("../assets/fonts/Nunito-Medium.ttf"),
@@ -21,7 +36,7 @@ fn build(dw: &IDWriteFactory) -> windows::core::Result<IDWriteFontCollection> {
         let loader = f5.CreateInMemoryFontFileLoader()?;
         f5.RegisterFontFileLoader(&loader)?;
         let set = f5.CreateFontSetBuilder()?;
-        for data in FILES {
+        for data in INTER.iter().chain(NUNITO.iter()).copied() {
             let file = loader.CreateInMemoryFontFileReference(dw, data.as_ptr().cast(), data.len() as u32, None::<&IUnknown>)?;
             set.AddFontFile(&file)?;
         }
@@ -47,7 +62,7 @@ pub fn install_gdi() {
     use windows::Win32::Graphics::Gdi::AddFontMemResourceEx;
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let d = FILES[1];
+        let d = if family() == "Nunito" { NUNITO[1] } else { INTER[1] };
         let mut n = 0u32;
         unsafe {
             AddFontMemResourceEx(d.as_ptr().cast(), d.len() as u32, None, &mut n);
