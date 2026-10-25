@@ -252,6 +252,9 @@ struct App {
     update_silent: bool,
     /// `accentMode` "wallpaper": the wallpaper file (and its time) the accent was taken from; a change recomputes it
     accent_key: Option<(String, Option<SystemTime>)>,
+    /// live-backdrop accent: when it was last taken and what was picked (a new pick that is close to it is ignored: no flicker on video wallpapers)
+    accent_last: Instant,
+    accent_cur: Option<[u8; 3]>,
     st: Stats,
     bench: Option<u32>,
     t0: Instant,
@@ -568,6 +571,8 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         panels_saved: panels,
         update_silent: false,
         accent_key,
+        accent_last: Instant::now() - Duration::from_secs(60),
+        accent_cur: accent_rgb,
         st: Stats::default(),
         bench: o.bench,
         t0: Instant::now(),
@@ -3162,16 +3167,39 @@ impl App {
         }
         let rgb = if self.settings.accent == AccentMode::Wallpaper {
             let key = crate::accent::wallpaper_key();
-            if !force && key == self.accent_key {
-                return;
-            }
-            let rgb = key.as_ref().and_then(|k| crate::accent::from_file(&k.0));
+            // what is on the screen: the captured desktop (a dynamic / slideshow wallpaper included); the wallpaper file only without a capture
+            let live = if self.settings.live && (force || self.accent_last.elapsed() >= Duration::from_secs(8)) {
+                self.accent_last = Instant::now();
+                self.scene.backdrop_colors(&self.gfx).ok().map(|px| crate::accent::pick(&px))
+            } else {
+                None
+            };
+            let rgb = match live {
+                Some(p) => match (p, self.accent_cur) {
+                    // close to what is shown already: keep it (a video wallpaper must not make the accent flicker)
+                    (Some(n), Some(o)) if !force && n.iter().zip(o).map(|(a, b)| (*a as i32 - b as i32).abs()).sum::<i32>() < 60 => Some(o),
+                    (p, _) => p,
+                },
+                None if self.settings.live => {
+                    if !force {
+                        return;
+                    }
+                    self.accent_cur
+                }
+                None => {
+                    if !force && key == self.accent_key {
+                        return;
+                    }
+                    key.as_ref().and_then(|k| crate::accent::from_file(&k.0))
+                }
+            };
             self.accent_key = key;
             rgb
         } else {
             self.accent_key = None;
             None
         };
+        self.accent_cur = rgb;
         if crate::widget::set_accent(rgb) {
             self.scene.invalidate_all();
             let now = self.now();

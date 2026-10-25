@@ -1006,6 +1006,11 @@ impl Scene {
     /// Re-measure the backdrop luminance of the cards in `mask` (8x8 GPU downscale + 256 byte readback) and re-decide their light / dark
     /// appearance from the 8x8 statistics (mean, percentile, bright share, contrast under the text, hysteresis).
     /// `smooth`: low-pass the new value (live mode) so the adaptive veil never flickers; a flip then needs two consecutive probes.
+    /// The captured desktop behind the cards, 64 x 36 px BGRA: what the user actually sees (a live / slideshow wallpaper included).
+    pub fn backdrop_colors(&self, gfx: &Gfx) -> Result<Vec<u8>> {
+        self.probe.colors(gfx, (self.w, self.h), 64, 36)
+    }
+
     pub fn measure_lum(&mut self, gfx: &Gfx, mask: u64, smooth: bool) -> Result<()> {
         for i in 0..self.cards.len().min(62) {
             if mask & (1 << i) == 0 {
@@ -1449,6 +1454,27 @@ impl Probe {
             fx_u32(&scale, 2, 5)?; // HIGH_QUALITY_CUBIC (prefiltered when shrinking)
             Ok(Probe { out: scale.GetOutput()?, scale, tgt: gfx.target(8, 8)?, cpu: gfx.cpu_read(8, 8)? })
         }
+    }
+
+    /// The whole backdrop (`bw` x `bh` px) shrunk to `w` x `h` as premultiplied BGRA rows (a few ms: the wallpaper accent only).
+    fn colors(&self, gfx: &Gfx, (bw, bh): (i32, i32), w: u32, h: u32) -> Result<Vec<u8>> {
+        let (sx, sy) = (w as f32 / bw.max(1) as f32, h as f32 / bh.max(1) as f32);
+        fx_vec2(&self.scale, 0, [sx, sy])?;
+        let (tgt, cpu) = (gfx.target(w, h)?, gfx.cpu_read(w, h)?);
+        let dc = &gfx.dc;
+        unsafe {
+            dc.SetTarget(&tgt);
+            dc.BeginDraw();
+            dc.SetTransform(&mat(1.0, 0.0, 0.0));
+            dc.Clear(None);
+            dc.DrawImage(&self.out, Some(&pt(0.0, 0.0)), Some(&rf(0.0, 0.0, w as f32, h as f32)), D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_COPY);
+            let e = dc.EndDraw(None, None);
+            dc.SetTarget(None::<&ID2D1Image>);
+            e?;
+        }
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        gfx.read_rect(&tgt, &cpu, RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }, |_, row| px.extend_from_slice(row))?;
+        Ok(px)
     }
 
     /// The 8x8 cells of the backdrop under the card as luminance 0..1, row-major.
