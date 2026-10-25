@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.7] - 2026-10-25
+
+### Changed
+- Weather M: the hourly forecast is one tight block (hour, glyph, temperature close together, centred on the card) instead of three rows spread over the full height, which did not read as columns.
+
 ## [0.5.6] - 2026-10-25
 
 ### Fixed
