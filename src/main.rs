@@ -60,6 +60,8 @@ struct Args {
     time: Option<Now>,
     no_config: bool,
     selftest: bool,
+    /// `--prompt-demo single|multi`: show only the text prompt (a look-and-feel check), print the answer, exit
+    prompt_demo: Option<String>,
     no_hotkeys: bool,
     dim: bool,
     dump_ui: Option<String>,
@@ -139,6 +141,7 @@ fn parse_args() -> Args {
             "--calib-rounds" => a.calib_rounds = val().parse().ok(),
             "--calib-dump" => a.calib_dump = Some(val()),
             "--selftest-dupl" => a.selftest = true,
+            "--prompt-demo" => a.prompt_demo = Some(val()),
             other => eprintln!("mswidgets: unknown argument {other}"),
         }
     }
@@ -177,6 +180,14 @@ fn main() {
     if let Some(mode) = &a.calib {
         let r = calib::run(&calib::CalibArgs { mode: mode.clone(), dir: a.calib_dir.clone().unwrap_or_else(|| "calib/ref".into()), out: a.calib_out.clone(), params: a.glass_params.clone(), rounds: a.calib_rounds.unwrap_or(6), dump: a.calib_dump.clone() });
         std::process::exit(report(r));
+    }
+    if let Some(mode) = &a.prompt_demo {
+        let multi = mode == "multi";
+        let mut o = input::PromptOpts::new(if multi { "Новая заметка" } else { "Новое напоминание" }, "", multi);
+        o.placeholder = if multi { "Текст заметки…".into() } else { "Что напомнить?".into() };
+        o.ok_label = "Добавить".into();
+        println!("{:?}", input::prompt_ex(o));
+        std::process::exit(0);
     }
     if a.selftest {
         std::process::exit(selftest_dupl(a.fps.unwrap_or(30)));

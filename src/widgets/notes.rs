@@ -260,7 +260,8 @@ impl Notes {
             Ask::New => (cx.t("Новая заметка", "New note"), String::new()),
             Ask::Edit(id) => (cx.t("Заметка", "Note"), self.notes.iter().find(|n| n.id == id).map(|n| win_nl(&n.text)).unwrap_or_default()),
         };
-        self.ask = Some((cx.prompt_text(title, &initial, true), a));
+        let ok = if matches!(a, Ask::New) { cx.t("Добавить", "Add") } else { cx.t("Сохранить", "Save") };
+        self.ask = Some((cx.prompt_text_ex(title, &initial, true, cx.t("Текст заметки…", "Write a note…"), ok), a));
     }
 
     fn step(&mut self, d: i32) -> bool {

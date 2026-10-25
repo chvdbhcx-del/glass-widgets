@@ -625,7 +625,7 @@ impl Widget for Shortcuts {
                 if i < n {
                     cx.invoke_system(Action::Open(self.items[i].target.clone()));
                 } else if self.prompt.is_none() {
-                    self.prompt = Some(cx.prompt_text(cx.t("Путь или адрес", "Path or URL"), "", false));
+                    self.prompt = Some(cx.prompt_text_ex(cx.t("Новый ярлык", "New shortcut"), "", false, cx.t("Путь или адрес (https://…)", "Path or URL (https://…)"), cx.t("Добавить", "Add")));
                 }
             } else if ev.right_clicked(cell) && i < n {
                 self.items.remove(i);

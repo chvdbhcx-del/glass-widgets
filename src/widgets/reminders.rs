@@ -568,7 +568,8 @@ impl Reminders {
 
     fn ask_text(&mut self, cx: &Cx, title: &str, initial: &str, a: Ask) {
         if self.ask.is_none() {
-            self.ask = Some((cx.prompt_text(title, initial, false), a));
+            let ok = if matches!(a, Ask::New) { cx.t("Добавить", "Add") } else { cx.t("Сохранить", "Save") };
+            self.ask = Some((cx.prompt_text_ex(title, initial, false, cx.t("Что напомнить?", "Remind me to…"), ok), a));
         }
     }
 

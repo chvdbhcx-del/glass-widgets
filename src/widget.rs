@@ -833,8 +833,14 @@ impl<'a> Cx<'a> {
     /// Ask the user for a line of text (a small popup with a real EDIT control near the cursor; Enter = OK, Esc = cancel; `multiline`: Ctrl+Enter).
     /// Returns a `Pending`: poll `take()` in `tick`; the value is `Some(text)` (non-empty) or `None` when cancelled. No-op in preview mode.
     pub fn prompt_text(&self, title: &str, initial: &str, multiline: bool) -> Pending<Option<String>> {
-        let (t, i) = (title.to_string(), initial.to_string());
-        self.spawn(move || crate::input::prompt(&t, &i, multiline))
+        self.prompt_text_ex(title, initial, multiline, "", "")
+    }
+    /// `prompt_text` plus a dimmed `placeholder` (shown while the field is empty) and the label of the primary button
+    /// (`""` = "Готово" / "Done"); the prompt follows the widget language.
+    pub fn prompt_text_ex(&self, title: &str, initial: &str, multiline: bool, placeholder: &str, ok_label: &str) -> Pending<Option<String>> {
+        let mut o = crate::input::PromptOpts::new(title, initial, multiline);
+        (o.placeholder, o.ok_label, o.lang) = (placeholder.to_string(), ok_label.to_string(), self.lang);
+        self.spawn(move || crate::input::prompt_ex(o))
     }
     /// A waker for your own threads (e.g. a long-lived listener): `waker.wake()` makes the framework call `tick`.
     pub fn waker(&self) -> Waker {

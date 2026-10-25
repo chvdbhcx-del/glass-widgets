@@ -789,7 +789,7 @@ impl Widget for TimerW {
 impl TimerW {
     fn ask_custom(&mut self, cx: &Cx) {
         if self.ask.is_none() {
-            self.ask = Some(cx.prompt_text(cx.t("Длительность: 90 (мин), 1:30, 25m, 90s", "Length: 90 (min), 1:30, 25m, 90s"), "", false));
+            self.ask = Some(cx.prompt_text_ex(cx.t("Длительность", "Length"), "", false, cx.t("90 (мин), 1:30, 25m, 90s", "90 (min), 1:30, 25m, 90s"), cx.t("Старт", "Start")));
         }
     }
 }
