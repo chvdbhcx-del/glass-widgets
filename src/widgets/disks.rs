@@ -152,12 +152,14 @@ impl Widget for Disks {
         match cx.size {
             Size::S => {
                 let d = &self.drives[0];
-                cx.text(Rect::new(c.x, c.y, c.w, 18.0), &d.name(lang), Style::TITLE.ellipsis(), DIM);
-                let center = (c.cx(), c.y + 22.0 + 50.0);
-                cx.ring(center, 45.0, 9.0, d.used_pct() / 100.0, d.color());
+                // the title is a label, not decoration: brighter than DIM so it reads on any glass
+                cx.text(Rect::new(c.x, c.y, c.w, 18.0), &d.name(lang), Style::TITLE.ellipsis(), SUBTLE);
+                // a slimmer, larger ring leaves a roomy centre: number and unit sit clear of the stroke (inner width ~ 94 px)
+                let center = (c.cx(), c.y + 22.0 + 55.0);
+                cx.ring(center, 51.0, 7.0, d.used_pct() / 100.0, d.color());
                 let (n, u) = fmt_size_parts(d.free, lang);
-                cx.text(Rect::new(center.0 - 40.0, center.1 - 26.0, 80.0, 34.0), &n, Style::new(30.0, 300).mono().center().ellipsis(), TEXT);
-                cx.text(Rect::new(center.0 - 40.0, center.1 + 7.0, 80.0, 16.0), &format!("{u} {free_word}"), Style::CAPTION.center().ellipsis(), DIM);
+                cx.text(Rect::new(center.0 - 46.0, center.1 - 29.0, 92.0, 36.0), &n, Style::new(32.0, 300).mono().center().ellipsis(), TEXT);
+                cx.text(Rect::new(center.0 - 46.0, center.1 + 8.0, 92.0, 16.0), &format!("{u} {free_word}"), Style::new(11.0, 500).center().ellipsis(), SUBTLE);
             }
             Size::M => {
                 let n = self.drives.len().min(3);
@@ -224,13 +226,14 @@ fn drive_row(cx: &Cx, r: Rect, d: &Drive, tall: bool) {
     let w = r.right() - x;
     if tall {
         cx.text(Rect::new(x, r.y + 5.0, w - 50.0, 18.0), &d.name(lang), Style::BODY.ellipsis(), TEXT);
-        cx.text(Rect::new(r.right() - 50.0, r.y + 5.0, 50.0, 18.0), &format!("{}%", d.used_pct().round() as i32), Style::MONO.right(), DIM);
+        cx.text(Rect::new(r.right() - 50.0, r.y + 5.0, 50.0, 18.0), &format!("{}%", d.used_pct().round() as i32), Style::MONO.right(), SUBTLE);
         cx.bar(Rect::new(x, r.y + 27.0, w, 6.0), d.used_pct() / 100.0, d.color());
-        cx.text(Rect::new(x, r.y + 33.0, w, 14.0), &free, Style::CAPTION.ellipsis(), DIM);
+        cx.text(Rect::new(x, r.y + 34.0, w, 14.0), &free, Style::CAPTION.ellipsis(), SUBTLE);
     } else {
+        // the name keeps the left, the free / total text the right (SUBTLE: readable on bright glass); a clear gap above the bar
         cx.text(Rect::new(x, r.y, w * 0.5, 18.0), &d.name(lang), Style::BODY.ellipsis(), TEXT);
-        cx.text(Rect::new(x + w * 0.5, r.y, w * 0.5, 18.0), &free, Style::CAPTION.right().ellipsis(), DIM);
-        cx.bar(Rect::new(x, r.y + 23.0, w, 6.0), d.used_pct() / 100.0, d.color());
+        cx.text(Rect::new(x + w * 0.5, r.y + 1.0, w * 0.5, 18.0), &free, Style::new(11.0, 500).right().ellipsis(), SUBTLE);
+        cx.bar(Rect::new(x, r.y + 25.0, w, 6.0), d.used_pct() / 100.0, d.color());
     }
 }
 

@@ -368,7 +368,9 @@ impl Color {
 }
 // palette (white text with alpha steps, like the Apple references)
 pub const TEXT: Color = Color::rgba(1.0, 1.0, 1.0, 0.96);
-pub const DIM: Color = Color::rgba(1.0, 1.0, 1.0, 0.62);
+pub const DIM: Color = Color::rgba(1.0, 1.0, 1.0, 0.70);
+/// secondary text that must stay readable on bright glass: titles of cards, units next to a big number
+pub const SUBTLE: Color = Color::rgba(1.0, 1.0, 1.0, 0.80);
 pub const FAINT: Color = Color::rgba(1.0, 1.0, 1.0, 0.38);
 /// subtle fills, ring tracks, bar tracks, separators
 pub const FILL: Color = Color::rgba(1.0, 1.0, 1.0, 0.18);

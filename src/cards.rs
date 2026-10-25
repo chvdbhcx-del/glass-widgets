@@ -1131,8 +1131,8 @@ impl Scene {
 
     /// The grayscale / darken effect of every card (created on demand, outside a frame session).
     fn ensure_dim(&mut self, gfx: &Gfx) -> Result<()> {
-        // saturation .08, brightness .92: out_o = k * (.08 * in_o + .92 * luma(in))
-        let (k, a) = (0.92f32, 0.08f32);
+        // saturation .45, brightness .95: out_o = k * (.45 * in_o + .55 * luma(in)); the colours stay readable (rings, accents), only calmer
+        let (k, a) = (0.95f32, 0.45f32);
         let lw = [0.2126f32, 0.7152, 0.0722];
         let mut cm = [0f32; 20];
         for i in 0..3 {
