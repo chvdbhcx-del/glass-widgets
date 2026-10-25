@@ -1,10 +1,13 @@
-//! Next event: the upcoming events of a local .ics (iCalendar) file.
+//! Next event: the upcoming events of a local .ics (iCalendar) file or of a calendar subscription link.
 //! S = the next event (day, title, start time, "через 52 мин"); M = that plus the next three on the right; L = a list of six.
-//! Settings: `cfg.ics` = path of the .ics file (default none: the card says how to set it; a click opens a text prompt that writes it).
+//! Settings: `cfg.ics` = path of the .ics file OR an `https://` / `webcal://` link (default none: the card says how to set it; a click opens a
+//! text prompt that writes it). A link is fetched by the worker (WinHTTP, <= 2 MB, 15 s, redirects followed by hand and re-checked, If-None-Match /
+//! If-Modified-Since when known) every 30 min, the last good body is cached in `%APPDATA%\macshell\cache\nextevent-<hash>.ics` so the card works
+//! offline. The link often holds a secret token: it is never logged (only the host), never put into error text, and the cache name is a hash.
 //! Parsed: VEVENT DTSTART / DTEND / SUMMARY / RRULE / EXDATE / STATUS:CANCELLED. DTSTART is UTC ("...Z", moved to local time with the
 //! CURRENT UTC offset), a floating local time or an all-day date (VALUE=DATE); TZID is ignored (the value is read as local time).
 //! RRULE: FREQ=DAILY|WEEKLY|MONTHLY|YEARLY with INTERVAL, COUNT, UNTIL and (weekly) BYDAY=MO,WE; anything fancier is shown as a single event.
-//! The file is read by a worker every 5 min (never in preview: previews parse a built-in sample ics). Times inside are "local seconds"
+//! A file is read by a worker every 5 min (never in preview: previews parse a built-in sample ics and never touch the network). Times inside are "local seconds"
 //! (`days_from_civil * 86400 + time of day`, like `Now::local_secs`), so no OS time-zone call is needed.
 use super::reminders::wrap_lines;
 use crate::registry::{Registry, WidgetDef};
@@ -12,6 +15,12 @@ use crate::tz;
 use crate::widget::*;
 
 const REFRESH_SECS: i64 = 300;
+/// a calendar link is polled every 30 min, again after 5 min when only the cache could be shown
+const URL_REFRESH_SECS: i64 = 1800;
+const URL_RETRY_SECS: i64 = 300;
+const MAX_BODY: usize = 2 << 20;
+const FETCH_TIMEOUT_MS: i32 = 15_000;
+const MAX_HOPS: usize = 5;
 const HORIZON_DAYS: i64 = 400;
 const MAX_STEPS: i64 = 20_000;
 const MAX_FILE: u64 = 8 << 20;
@@ -391,6 +400,243 @@ fn clean_path(s: &str) -> String {
     s.trim().trim_matches('"').trim().to_string()
 }
 
+// ================================================================ calendar link (https / webcal)
+
+/// Where the calendar comes from. `BadUrl` = looks like a link (`scheme://`) but is not an acceptable one.
+#[derive(Clone, Debug, PartialEq)]
+enum Source {
+    Path(String),
+    /// normalized: `https://host[:port]/path?query`
+    Url(String),
+    BadUrl,
+}
+
+/// The `scheme` of a `scheme://...` text (a drive letter `C:\\` or a UNC path is not one).
+fn scheme_of(s: &str) -> Option<&str> {
+    let (sch, _) = s.split_once("://")?;
+    (sch.len() >= 2 && sch.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))).then_some(sch)
+}
+
+fn source_of(s: &str) -> Source {
+    match scheme_of(s) {
+        None => Source::Path(s.to_string()),
+        Some(_) => normalize_url(s).map_or(Source::BadUrl, Source::Url),
+    }
+}
+
+/// IPv4 addresses that are not on the public internet (loopback, private, link-local incl. cloud metadata, CGNAT, multicast / reserved).
+fn private_v4(a: [u8; 4]) -> bool {
+    matches!(a, [0 | 10 | 127, ..] | [169, 254, ..] | [192, 168, ..] | [100, 64..=127, ..] | [192, 0, 0, _] | [224..=255, ..]) || (a[0] == 172 && (16..=31).contains(&a[1]))
+}
+
+/// A subscription link made safe to fetch: `webcal(s)://` becomes `https://`, only https is accepted (a token in a plain-http link would travel
+/// in the clear). Rejected: other schemes, user:password@ tricks, backslashes / spaces / non-ASCII, IPv6 literals, odd IPv4 spellings (decimal,
+/// hex), single-label and local-looking hosts (`localhost`, `*.local`, `*.internal`, ...) and private / loopback / link-local addresses, so the
+/// widget cannot be pointed at the user's own network. ponytail: a public name that resolves to a private address (DNS rebinding) is not caught.
+fn normalize_url(raw: &str) -> std::result::Result<String, &'static str> {
+    let raw = raw.trim();
+    if raw.len() > 2048 || !raw.bytes().all(|b| b.is_ascii_graphic()) || raw.contains('\\') {
+        return Err("characters");
+    }
+    let (scheme, rest) = raw.split_once("://").ok_or("scheme")?;
+    if !["https", "webcal", "webcals"].iter().any(|s| s.eq_ignore_ascii_case(scheme)) {
+        return Err("scheme");
+    }
+    let rest = rest.split('#').next().unwrap_or("");
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (auth, tail) = rest.split_at(end);
+    if auth.contains('@') {
+        return Err("userinfo");
+    }
+    if auth.starts_with('[') {
+        return Err("ipv6");
+    }
+    let (host, port) = match auth.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p.parse::<u16>().ok().filter(|&n| n != 0 && p.bytes().all(|b| b.is_ascii_digit())).ok_or("port")?)),
+        None => (auth, None),
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 || labels.iter().any(|l| l.is_empty() || l.starts_with('-') || l.ends_with('-') || !l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+        return Err("host");
+    }
+    if ["localhost", "local", "localdomain", "internal", "lan", "home", "corp", "arpa"].contains(&labels[labels.len() - 1]) {
+        return Err("local host");
+    }
+    let last = labels[labels.len() - 1];
+    if last.bytes().all(|b| b.is_ascii_digit()) || last.starts_with("0x") {
+        // an address: only the plain dotted quad (decimal / hex / octal shortcuts are how filters get bypassed)
+        let oct: Vec<u8> = labels.iter().filter(|l| !l.is_empty() && l.len() <= 3 && l.bytes().all(|b| b.is_ascii_digit())).filter_map(|l| l.parse().ok()).collect();
+        let quad: [u8; 4] = oct.try_into().map_err(|_| "ip")?;
+        if labels.len() != 4 || private_v4(quad) {
+            return Err("private address");
+        }
+    }
+    let tail = if tail.is_empty() { "/".to_string() } else if tail.starts_with('?') { format!("/{tail}") } else { tail.to_string() };
+    Ok(match port {
+        Some(p) if p != 443 => format!("https://{host}:{p}{tail}"),
+        _ => format!("https://{host}{tail}"),
+    })
+}
+
+/// `host[:port]` of a normalized link: the only part of it that is ever logged.
+fn log_host(url: &str) -> &str {
+    let r = url.strip_prefix("https://").unwrap_or(url);
+    &r[..r.find(['/', '?']).unwrap_or(r.len())]
+}
+
+/// An absolute link for a redirect `Location` (absolute, `//host/..`, `/path` or a relative path) based on `base`.
+fn resolve_location(base: &str, loc: &str) -> Option<String> {
+    let loc = loc.trim();
+    if scheme_of(loc).is_some() {
+        return Some(loc.to_string());
+    }
+    if let Some(r) = loc.strip_prefix("//") {
+        return Some(format!("https://{r}"));
+    }
+    let origin_end = "https://".len() + log_host(base).len();
+    let origin = base.get(..origin_end)?;
+    if loc.starts_with('/') {
+        return Some(format!("{origin}{loc}"));
+    }
+    let path = base.get(origin_end..)?.split(['?', '#']).next()?;
+    let dir = path.rfind('/').map_or("/", |i| &path[..=i]);
+    (!loc.is_empty()).then(|| format!("{origin}{dir}{loc}"))
+}
+
+/// FNV-1a 64: a stable, dependency-free name for the cache files (the link itself is a secret and stays out of file names).
+fn fnv64(s: &str) -> u64 {
+    s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+}
+
+/// `nextevent-<16 hex>.ics` for a normalized link.
+fn cache_name(url: &str) -> String {
+    format!("nextevent-{:016x}.ics", fnv64(url))
+}
+
+fn cache_dir() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(std::env::var_os("APPDATA")?).join("macshell").join("cache"))
+}
+
+/// What the server told us about the cached body (sent back as If-None-Match / If-Modified-Since).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Validators {
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+/// A header value we are willing to send back: printable ASCII, no CR / LF (the value came from a server).
+fn header_safe(v: &str) -> bool {
+    !v.is_empty() && v.len() <= 512 && v.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
+}
+
+impl Validators {
+    fn encode(&self) -> String {
+        format!("{}\n{}\n", self.etag.as_deref().unwrap_or(""), self.last_modified.as_deref().unwrap_or(""))
+    }
+    fn decode(s: &str) -> Validators {
+        let mut l = s.lines().map(|x| x.trim()).map(|x| Some(x.to_string()).filter(|x| header_safe(x)));
+        Validators { etag: l.next().flatten(), last_modified: l.next().flatten() }
+    }
+    /// Request header lines (CRLF-terminated). The validators only describe a body we still have, so callers pass `Default` without a cache.
+    fn request_headers(&self) -> String {
+        let mut h = String::from("Accept: text/calendar, text/plain;q=0.8, */*;q=0.5\r\n");
+        if let Some(e) = self.etag.as_ref().filter(|e| header_safe(e)) {
+            h.push_str(&format!("If-None-Match: {e}\r\n"));
+        }
+        if let Some(m) = self.last_modified.as_ref().filter(|m| header_safe(m)) {
+            h.push_str(&format!("If-Modified-Since: {m}\r\n"));
+        }
+        h
+    }
+}
+
+fn looks_like_ics(b: &[u8]) -> bool {
+    b.windows(15).any(|w| w.eq_ignore_ascii_case(b"BEGIN:VCALENDAR"))
+}
+
+/// temp file + rename: the cache is the old or the new body, never half of one
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) {
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+enum Fetched {
+    Fresh(Vec<u8>, Validators),
+    NotModified,
+}
+
+/// GET with the 15 s / 2 MB limits; redirects are followed by hand (<= 5) and every hop is validated like the first link. `Err` = a short reason
+/// that never contains the link.
+fn fetch_calendar(url: &str, v: &Validators) -> std::result::Result<Fetched, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(FETCH_TIMEOUT_MS as u64);
+    let headers = v.request_headers();
+    let mut cur = url.to_string();
+    for _ in 0..=MAX_HOPS {
+        let left = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
+        if left <= 0 {
+            return Err("timeout".into());
+        }
+        let r = crate::net::http_get_once(&cur, left.min(FETCH_TIMEOUT_MS), MAX_BODY, &headers, Some(deadline))?;
+        match r.status {
+            200..=299 => {
+                let keep = |v: Option<String>| v.filter(|x| header_safe(x));
+                return Ok(Fetched::Fresh(r.body, Validators { etag: keep(r.etag), last_modified: keep(r.last_modified) }));
+            }
+            304 => return Ok(Fetched::NotModified),
+            301 | 302 | 303 | 307 | 308 => {
+                let next = r.location.and_then(|l| resolve_location(&cur, &l)).ok_or("bad redirect")?;
+                cur = normalize_url(&next).map_err(|why| format!("redirect refused ({why})"))?;
+            }
+            st => return Err(format!("http {st}")),
+        }
+    }
+    Err("too many redirects".into())
+}
+
+/// The cached body of `url`, parsed (`Missing` = nothing cached yet).
+fn load_cache(url: &str, utc_off: i32) -> Loaded {
+    let bytes = cache_dir().and_then(|d| std::fs::read(d.join(cache_name(url))).ok()).filter(|b| b.len() <= MAX_BODY).ok_or(Status::Missing)?;
+    Ok(parse_ics(&String::from_utf8_lossy(&bytes), utc_off))
+}
+
+/// Worker for a link: conditional GET; a fresh body replaces the cache, 304 / any failure falls back to the cache (`stale` = the network
+/// did not answer, so the caller retries soon), no cache and no answer = `NetFailed`.
+fn load_url(url: &str, utc_off: i32, stale: &std::sync::atomic::AtomicBool) -> Loaded {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = cache_dir();
+    let body_path = dir.as_ref().map(|d| d.join(cache_name(url)));
+    let meta_path = body_path.as_ref().map(|p| p.with_extension("meta"));
+    let have_cache = body_path.as_ref().is_some_and(|p| p.is_file());
+    let known = if have_cache { meta_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).map(|t| Validators::decode(&t)).unwrap_or_default() } else { Validators::default() };
+    stale.store(false, Relaxed);
+    match fetch_calendar(url, &known) {
+        Ok(Fetched::Fresh(body, v)) if looks_like_ics(&body) => {
+            if let (Some(d), Some(bp), Some(mp)) = (&dir, &body_path, &meta_path) {
+                let _ = std::fs::create_dir_all(d);
+                write_atomic(bp, &body);
+                write_atomic(mp, v.encode().as_bytes());
+            }
+            return Ok(parse_ics(&String::from_utf8_lossy(&body), utc_off));
+        }
+        Ok(Fetched::NotModified) => {
+            if let Ok(ev) = load_cache(url, utc_off) {
+                return Ok(ev);
+            }
+        }
+        Ok(Fetched::Fresh(..)) => {
+            eprintln!("mswidgets: calendar {}: the answer is not an iCalendar file", log_host(url));
+            stale.store(true, Relaxed);
+            return load_cache(url, utc_off).map_err(|_| Status::NotIcs);
+        }
+        Err(why) => eprintln!("mswidgets: calendar {}: {why}", log_host(url)),
+    }
+    stale.store(true, Relaxed);
+    load_cache(url, utc_off).map_err(|_| Status::NetFailed)
+}
+
 // ================================================================ sample (preview)
 
 /// A small ics relative to `now` (local seconds): exercises the real parser in previews.
@@ -426,6 +672,12 @@ enum Status {
     Loading,
     Missing,
     Failed,
+    /// a calendar link that is not acceptable (`https://` or `webcal://` only, no local addresses)
+    BadUrl,
+    /// the first fetch of a link failed and nothing is cached
+    NetFailed,
+    /// the link answered, but not with a calendar
+    NotIcs,
     Ok,
 }
 
@@ -436,7 +688,13 @@ type Loaded = std::result::Result<Vec<Event>, Status>;
 struct NextEvent {
     started: bool,
     ver: u64,
+    /// the setting as typed (path or link)
     path: Option<String>,
+    src: Option<Source>,
+    /// the cached copy of a link has been looked at (the network fetch follows)
+    warm: bool,
+    /// the last fetch of a link only got the cache: retry sooner
+    stale: std::sync::Arc<std::sync::atomic::AtomicBool>,
     events: Vec<Event>,
     status: Option<Status>,
     job: Option<Pending<Loaded>>,
@@ -451,7 +709,7 @@ pub fn register(r: &mut Registry) {
     r.register(WidgetDef {
         type_id: "nextevent",
         name: ("Ближайшее событие", "Next event"),
-        desc: ("События из файла календаря .ics", "Upcoming events from an .ics calendar file"),
+        desc: ("События из файла .ics или по ссылке на календарь", "Upcoming events from an .ics file or a calendar link"),
         group: "calendar",
         icon: Glyph::Calendar,
         sizes: &[Size::S, Size::M, Size::L],
@@ -475,13 +733,30 @@ impl NextEvent {
         self.status.unwrap_or(Status::Unset)
     }
 
+    /// A new setting value (path or link): forget the old events, read again at once.
+    fn set_source(&mut self, raw: Option<String>) {
+        self.src = raw.as_deref().map(source_of);
+        self.path = raw;
+        self.warm = false;
+        self.last_read = 0;
+        self.stale.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.status = Some(match &self.src {
+            None => Status::Unset,
+            Some(Source::BadUrl) => Status::BadUrl,
+            Some(_) => Status::Loading,
+        });
+    }
+
     fn empty(&self, cx: &Cx, st: Status) {
         let b = cx.content();
         let (msg, sub) = match st {
-            Status::Unset => (cx.t("Укажите .ics файл", "Set an .ics file"), cx.t("Нажмите и вставьте путь к календарю", "Click and paste the calendar path")),
+            Status::Unset => (cx.t("Укажите календарь", "Set a calendar"), cx.t("Нажмите и вставьте путь к .ics или ссылку на календарь", "Click and paste an .ics path or a calendar link")),
             Status::Loading => (cx.t("Загрузка…", "Loading…"), ""),
             Status::Missing => (cx.t("Файл не найден", "File not found"), cx.t("Нажмите, чтобы изменить путь", "Click to change the path")),
             Status::Failed => (cx.t("Не удалось прочитать", "Cannot read the file"), cx.t("Нажмите, чтобы изменить путь", "Click to change the path")),
+            Status::BadUrl => (cx.t("Ссылка не подходит", "This link is not accepted"), cx.t("Нужна ссылка https:// или webcal:// на публичный календарь", "Use an https:// or webcal:// link to a public calendar")),
+            Status::NetFailed => (cx.t("Не удалось загрузить календарь", "Cannot load the calendar"), cx.t("Проверьте ссылку и сеть; нажмите, чтобы изменить", "Check the link and the network; click to change it")),
+            Status::NotIcs => (cx.t("Это не календарь", "Not a calendar"), cx.t("Ссылка отвечает не файлом .ics; нажмите, чтобы изменить", "The link does not return an .ics file; click to change it")),
             Status::Ok => (cx.t("Нет событий", "No events"), cx.t("Ближайшие 13 месяцев пусты", "Nothing in the next 13 months")),
         };
         let small = cx.size == Size::S;
@@ -490,7 +765,7 @@ impl NextEvent {
         cx.text(Rect::new(b.x, y + 36.0, b.w, 36.0), msg, Style::new(13.0, 600).center().wrap(), TEXT);
         cx.text(Rect::new(b.x, y + 76.0, b.w, 30.0), sub, Style::CAPTION.center().wrap(), DIM);
         if st == Status::Unset && !small {
-            cx.text(Rect::new(b.x, y + 110.0, b.w, 16.0), "config.json: \"ics\": \"C:\\\\…\\\\calendar.ics\"", Style::CAPTION.center().ellipsis(), FAINT);
+            cx.text(Rect::new(b.x, y + 110.0, b.w, 16.0), "config.json: \"ics\": \"C:\\\\…\\\\calendar.ics\" | \"https://…\"", Style::CAPTION.center().ellipsis(), FAINT);
         }
     }
 
@@ -612,8 +887,7 @@ impl Widget for NextEvent {
                 self.ver += 1;
                 return Tick::Never;
             }
-            self.path = cx.cfg_str("ics").map(clean_path).filter(|p| !p.is_empty());
-            self.status = Some(if self.path.is_some() { Status::Loading } else { Status::Unset });
+            self.set_source(cx.cfg_str("ics").map(clean_path).filter(|p| !p.is_empty()));
             self.ver += 1;
         }
         if cx.preview {
@@ -624,11 +898,9 @@ impl Widget for NextEvent {
                 self.prompt = None;
                 if let Some(s) = r {
                     let s = clean_path(&s);
-                    self.path = Some(s.clone()).filter(|p| !p.is_empty());
+                    self.set_source(Some(s.clone()).filter(|p| !p.is_empty()));
                     self.save_path = Some(s);
                     self.events.clear();
-                    self.status = Some(if self.path.is_some() { Status::Loading } else { Status::Unset });
-                    self.last_read = 0; // read now
                     self.job = None;
                     self.ver += 1;
                 }
@@ -645,6 +917,8 @@ impl Widget for NextEvent {
                         self.events = ev;
                         self.status = Some(Status::Ok);
                     }
+                    // a link with nothing cached yet: stay on "Loading…" until the network answers
+                    Err(Status::Missing) if matches!(self.src, Some(Source::Url(_))) => {}
                     Err(st) => {
                         self.events.clear();
                         self.status = Some(st);
@@ -657,12 +931,28 @@ impl Widget for NextEvent {
                 self.ver += 1;
             }
         }
-        if let (None, Some(path)) = (&self.job, &self.path) {
-            if now - self.last_read >= REFRESH_SECS {
-                self.last_read = now;
-                let (path, off) = (path.clone(), cx.utc_offset_min());
-                self.job = Some(cx.spawn(move || load(&path, off)));
+        if self.job.is_none() {
+            let off = cx.utc_offset_min();
+            match self.src.clone() {
+                Some(Source::Path(path)) if now - self.last_read >= REFRESH_SECS => {
+                    self.last_read = now;
+                    self.job = Some(cx.spawn(move || load(&path, off)));
+                }
+                // a link: the cached copy first (instant, works offline), then the network every 30 min
+                Some(Source::Url(url)) if !self.warm => {
+                    self.warm = true;
+                    self.job = Some(cx.spawn(move || load_cache(&url, off)));
+                }
+                Some(Source::Url(url)) if now - self.last_read >= URL_REFRESH_SECS => {
+                    self.last_read = now;
+                    let stale = self.stale.clone();
+                    self.job = Some(cx.spawn(move || load_url(&url, off, &stale)));
+                }
+                _ => {}
             }
+        }
+        if self.job.is_none() && self.stale.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.last_read = now - (URL_REFRESH_SECS - URL_RETRY_SECS); // only the cache could be shown: look again in 5 min
         }
         let mk = cx.now.minute_key();
         if mk != self.mkey {
@@ -678,7 +968,7 @@ impl Widget for NextEvent {
         }
         if ev.clicked(cx.bounds()) && !cx.preview && self.prompt.is_none() {
             let cur = self.path.clone().unwrap_or_default();
-            self.prompt = Some(cx.prompt_text_ex(cx.t("Путь к файлу .ics", "Path to the .ics file"), &cur, false, r"C:\Users\you\calendar.ics", ""));
+            self.prompt = Some(cx.prompt_text_ex(cx.t("Путь к .ics или ссылка на календарь", "Path to an .ics file or a calendar link"), &cur, false, r"C:\Users\you\calendar.ics  |  https://…", ""));
         }
         false
     }
@@ -822,5 +1112,143 @@ mod tests {
     fn path_cleanup_and_missing_file() {
         assert_eq!(clean_path("  \"C:\\a b\\c.ics\" "), "C:\\a b\\c.ics");
         assert_eq!(load("Z:\\definitely\\missing.ics", 0), Err(Status::Missing));
+    }
+
+    #[test]
+    fn webcal_is_rewritten_to_https() {
+        assert_eq!(normalize_url("webcal://example.com/cal.ics?token=abc").unwrap(), "https://example.com/cal.ics?token=abc");
+        assert_eq!(normalize_url("WEBCAL://Example.COM").unwrap(), "https://example.com/");
+        assert_eq!(normalize_url("webcals://example.com/a#frag").unwrap(), "https://example.com/a");
+        assert_eq!(normalize_url("  https://example.com?x=1  ").unwrap(), "https://example.com/?x=1");
+        assert_eq!(normalize_url("https://example.com:443/x").unwrap(), "https://example.com/x");
+        assert_eq!(normalize_url("https://example.com:8443/x").unwrap(), "https://example.com:8443/x");
+        assert_eq!(normalize_url("https://calendar.google.com/calendar/ical/me%40gmail.com/private-0f3a/basic.ics").unwrap(), "https://calendar.google.com/calendar/ical/me%40gmail.com/private-0f3a/basic.ics");
+    }
+
+    #[test]
+    fn urls_that_must_be_refused() {
+        for bad in [
+            "http://example.com/a.ics",
+            "ftp://example.com/a.ics",
+            "file:///C:/cal.ics",
+            "javascript://example.com/%0aalert(1)",
+            "https://good.com@evil.com/x",
+            "https://user:pw@example.com/",
+            "https://@example.com/",
+            "https://example.com\\@evil.com/",
+            "https://example.com%40evil.com/",
+            "https://exa mple.com/",
+            "https://example.com/a b",
+            "https:///path",
+            "https://",
+            "https://example.com:0/",
+            "https://example.com:99999/",
+            "https://example.com:80a/",
+            "https://пример.рф/",
+            "https://localhost/a.ics",
+            "https://app.localhost/a.ics",
+            "https://nas/a.ics",
+            "https://printer.local/a.ics",
+            "https://host.internal/a.ics",
+            "https://127.0.0.1/a.ics",
+            "https://10.1.2.3/a.ics",
+            "https://172.16.0.9/a.ics",
+            "https://172.31.255.1/a.ics",
+            "https://192.168.0.1/a.ics",
+            "https://169.254.169.254/latest/meta-data",
+            "https://100.64.0.1/a.ics",
+            "https://0.0.0.0/a.ics",
+            "https://224.0.0.1/a.ics",
+            "https://2130706433/a.ics",
+            "https://0x7f.0.0.1/a.ics",
+            "https://127.1/a.ics",
+            "https://[::1]/a.ics",
+            "https://[fe80::1]/a.ics",
+        ] {
+            assert!(normalize_url(bad).is_err(), "{bad} must be refused");
+            assert_eq!(source_of(bad), Source::BadUrl, "{bad}");
+        }
+        assert!(normalize_url(&format!("https://example.com/{}", "a".repeat(2100))).is_err());
+        // public addresses next to the private ranges are fine
+        assert!(normalize_url("https://172.32.0.1/a.ics").is_ok());
+        assert!(normalize_url("https://8.8.8.8/a.ics").is_ok());
+        assert!(normalize_url("https://100.128.0.1/a.ics").is_ok());
+    }
+
+    #[test]
+    fn paths_stay_paths() {
+        assert_eq!(source_of(r"C:\Users\me\cal.ics"), Source::Path(r"C:\Users\me\cal.ics".into()));
+        assert_eq!(source_of(r"\\nas\share\cal.ics"), Source::Path(r"\\nas\share\cal.ics".into()));
+        assert_eq!(source_of("cal.ics"), Source::Path("cal.ics".into()));
+        assert_eq!(source_of("webcal://example.com/c.ics"), Source::Url("https://example.com/c.ics".into()));
+        assert_eq!(source_of("http://example.com/c.ics"), Source::BadUrl);
+    }
+
+    #[test]
+    fn redirects_are_resolved_then_revalidated() {
+        let base = "https://example.com/cal/feed.ics?token=s3cret";
+        assert_eq!(resolve_location(base, "https://cdn.example.net/x.ics").as_deref(), Some("https://cdn.example.net/x.ics"));
+        assert_eq!(resolve_location(base, "//cdn.example.net/x.ics").as_deref(), Some("https://cdn.example.net/x.ics"));
+        assert_eq!(resolve_location(base, "/other.ics?a=1").as_deref(), Some("https://example.com/other.ics?a=1"));
+        assert_eq!(resolve_location(base, "next.ics").as_deref(), Some("https://example.com/cal/next.ics"));
+        assert_eq!(resolve_location("https://example.com:8443", "x.ics").as_deref(), Some("https://example.com:8443/x.ics"));
+        assert_eq!(normalize_url("https://example.com./a").unwrap(), "https://example.com/a", "a trailing dot is dropped");
+        assert_eq!(resolve_location(base, ""), None);
+        // a redirect to http, to localhost or to a private address dies in normalize_url
+        for loc in ["http://example.com/x", "https://localhost/x", "https://192.168.1.1/x", "//169.254.169.254/x"] {
+            let next = resolve_location(base, loc).unwrap();
+            assert!(normalize_url(&next).is_err(), "{loc}");
+        }
+    }
+
+    #[test]
+    fn cache_names_are_stable_and_hide_the_link() {
+        let u = "https://example.com/cal.ics?token=s3cret";
+        let n = cache_name(u);
+        assert_eq!(n, cache_name(u));
+        assert_ne!(n, cache_name("https://example.com/cal.ics?token=other"));
+        assert!(n.starts_with("nextevent-") && n.ends_with(".ics") && n.len() == "nextevent-".len() + 16 + ".ics".len(), "{n}");
+        assert!(n["nextevent-".len()..n.len() - 4].bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!n.contains("example") && !n.contains("s3cret"));
+        assert_eq!(log_host(u), "example.com");
+        assert_eq!(log_host("https://example.com:8443/x?t=1"), "example.com:8443");
+        assert_eq!(log_host("https://example.com?t=1"), "example.com");
+    }
+
+    #[test]
+    fn validators_round_trip_and_headers_are_safe() {
+        let v = Validators { etag: Some("\"abc-123\"".into()), last_modified: Some("Sat, 24 Oct 2026 10:00:00 GMT".into()) };
+        assert_eq!(Validators::decode(&v.encode()), v);
+        let h = v.request_headers();
+        assert!(h.contains("If-None-Match: \"abc-123\"\r\n") && h.contains("If-Modified-Since: Sat, 24 Oct 2026 10:00:00 GMT\r\n"));
+        assert!(h.ends_with("\r\n") && h.starts_with("Accept: text/calendar"));
+        assert_eq!(Validators::default().request_headers().matches("\r\n").count(), 1, "no validators, no conditional headers");
+        assert_eq!(Validators::decode("\n\n"), Validators::default());
+        // a value with a line break would split the header: dropped
+        assert!(!header_safe("a\r\nX-Evil: 1"));
+        assert!(!header_safe(""));
+        assert_eq!(Validators::decode("a\u{7f}b\nok").last_modified.as_deref(), Some("ok"));
+        let evil = Validators { etag: Some("x\r\nHost: evil".into()), last_modified: None };
+        assert_eq!(evil.request_headers().matches("\r\n").count(), 1);
+    }
+
+    #[test]
+    fn calendar_detection() {
+        assert!(looks_like_ics(b"\xef\xbb\xbfBEGIN:VCALENDAR\r\nVERSION:2.0"));
+        assert!(looks_like_ics(b"begin:vcalendar"));
+        assert!(!looks_like_ics(b"<html><body>Sign in</body></html>"));
+        assert!(!looks_like_ics(b""));
+    }
+
+    #[test]
+    fn cached_calendar_is_read_back() {
+        let dir = std::env::temp_dir().join(format!("msw-ne-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(cache_name("https://example.com/x.ics"));
+        write_atomic(&p, ICS.as_bytes());
+        assert!(!p.with_extension("tmp").exists());
+        let ev = parse_ics(&String::from_utf8_lossy(&std::fs::read(&p).unwrap()), 180);
+        assert_eq!(ev.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

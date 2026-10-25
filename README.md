@@ -32,7 +32,7 @@ and roughly 100 MB of RAM and under 10 % of one CPU core while the wallpaper mov
 ## Widgets
 
 Clock, calendar, reminders, music (now playing), batteries, weather, world clock, system monitor, disks, network, processes, notes,
-timer, shortcuts (apps, folders and sites with their own icons), clipboard history, photos, currency rates, crypto prices, quote of the day, next event (from a local `.ics` file), countdown to a date and quick
+timer, shortcuts (apps, folders and sites with their own icons), clipboard history, photos, currency rates, crypto prices, quote of the day, next event (from a local `.ics` file or a calendar subscription link), countdown to a date and quick
 controls. Cards come in S / M / L sizes, snap to a grid, can be dragged, and merge into one blob when they touch.
 
 ## Install
@@ -97,12 +97,21 @@ Everything lives in `%APPDATA%\macshell\config.json` (written by the edit mode; 
 | `widgetsGlass` | glass amount, `0`..`1` (default `0.5`) |
 | `widgetsLook` | the other sliders of the settings panel (only the changed ones) |
 | `widgetsPanels` | where the gallery / settings panel were dragged: `{"gallery":[dx,dy],"settings":[dx,dy]}` (only non-zero ones) |
+| `captureFps` | wallpaper capture rate: `auto` (default: up to 15 fps, backing off to 2 fps while the wallpaper under the cards is still, back to full rate on the first change) or a number `1`..`30` for a fixed rate |
 | `checkUpdates` | `true` = one silent update check at start (default `false`) |
 | `accentMode` | `blue` (default) or `wallpaper` (the dominant hue of the desktop wallpaper, re-read when the wallpaper changes) |
 | `profiles`, `activeProfile` | saved layouts: `{ name: { items: [...], look: {...} } }` and the checked one (the Layouts submenu of the tray) |
 
 Network is used only by the widgets that need it (weather, rates, crypto, quote, site icons of shortcut tiles) and by the update check, which runs only
 when you press "Check for updates" or turn on `checkUpdates` (the installer is downloaded only after you press "Update now"); nothing else phones home.
+Network is used only by the widgets that need it (weather, rates, crypto, quote, site icons of shortcut tiles, the calendar link of Next event) and by the update check, which runs only
+when you press "Check for updates" or turn on `checkUpdates`; nothing else phones home.
+Next event: the card's `ics` setting is a path to an `.ics` file or a subscription link (`https://...` or `webcal://...`, e.g. the "secret address in iCal
+format" of a Google / iCloud / Outlook calendar). A link is fetched only while the card is on the desktop (never in the gallery preview), at most every 30 min,
+at most 2 MB, 15 s timeout; the last good copy is kept in `%APPDATA%\macshell\cache
+extevent-<hash>.ics`, so the card also works offline. Only `https` is
+accepted (`webcal` is rewritten to it); user:password@ forms, `localhost`, `*.local` and private / loopback / link-local addresses are refused. The link is never
+written to any log (only its host), because it usually contains a secret token.
 Advanced knobs are environment variables, for example `MSW_CAPTURE=gdi|dxgi` (older capture paths) and `MSW_TEXT_GAMMA`.
 
 ## Build from source

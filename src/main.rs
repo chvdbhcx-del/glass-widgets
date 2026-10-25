@@ -401,7 +401,7 @@ fn selftest_dupl(fps: u32) -> i32 {
         let items = layout::parse_cards("clock:s@0,0;calendar:s@1,0").unwrap_or_default();
         let specs = cards::specs(&items, 1.0);
         let rects: Vec<RECT> = specs.iter().map(|c| c.rect()).collect();
-        let d = backdrop::DuplBackdrop::new(&gfx, &out, win, &rects, 48, fps)?;
+        let d = backdrop::DuplBackdrop::new(&gfx, &out, win, &rects, 48, backdrop::Rate { fps, auto: false })?;
         let env = cards::SceneEnv { preview: true, hwnd: 0, lang: widget::Lang::Ru, utc_off: 0 };
         let mut scene = cards::Scene::new(&gfx, 420, 250, 1.0, 0.5, backdrop::Backdrop::bitmap(&d), &specs, &env)?;
         backdrop::Backdrop::start(&d);

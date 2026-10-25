@@ -323,7 +323,7 @@ impl AccentMode {
 }
 
 /// The host settings of config.json: `widgetsGlass` 0..1, `widgetsDim`, `widgetsGlassMode` ("plain" = no desktop capture, anything else = live glass),
-/// `widgetsAppearance` ("auto" | "dark" | "light"), `checkUpdates` (bool), `accentMode` ("blue" | "wallpaper").
+/// `widgetsAppearance` ("auto" | "dark" | "light"), `checkUpdates` (bool), `accentMode` ("blue" | "wallpaper"), `captureFps` ("auto" | 1..30).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Settings {
     pub glass: f32,
@@ -334,10 +334,12 @@ pub struct Settings {
     /// `checkUpdates`: one silent update check at start (off unless the user turned it on)
     pub check_updates: bool,
     pub accent: AccentMode,
+    /// `captureFps`: None = auto (15 fps backing off to 2 while the wallpaper is still), Some(n) = a fixed capture rate
+    pub capture_fps: Option<u32>,
 }
 impl Default for Settings {
     fn default() -> Self {
-        Settings { glass: 0.5, dim: Dim::Auto, live: true, appearance: crate::motion::AppearancePref::Dark, check_updates: false, accent: AccentMode::Blue }
+        Settings { glass: 0.5, dim: Dim::Auto, live: true, appearance: crate::motion::AppearancePref::Dark, check_updates: false, accent: AccentMode::Blue, capture_fps: None }
     }
 }
 impl Settings {
@@ -354,6 +356,7 @@ impl Settings {
             appearance: v.get("widgetsAppearance").and_then(|g| g.as_str()).and_then(crate::motion::AppearancePref::parse).unwrap_or_default(),
             check_updates: v.get("checkUpdates").and_then(|g| g.as_bool()).unwrap_or(d.check_updates),
             accent: if v.get("accentMode").and_then(|g| g.as_str()) == Some("wallpaper") { AccentMode::Wallpaper } else { AccentMode::Blue },
+            capture_fps: crate::backdrop::parse_capture_fps(v.get("captureFps")),
         }
     }
 }

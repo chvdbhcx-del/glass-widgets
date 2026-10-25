@@ -373,7 +373,15 @@ fn same_gpu(owner: Option<i64>, output_luid: i64) -> bool {
 
 /// `owner`: LUID of the GPU the UI device lives on. The WGC / duplication textures are shared with that device, which only works on the same GPU;
 /// a monitor on another adapter gets the GDI capture (CPU copy, any monitor) instead.
-unsafe fn make_backdrop(gfx: &Gfx, mon: &Monitor, w: i32, h: i32, live: bool, fps: u32, rects: &[RECT], margin: i32, owner: Option<i64>) -> Box<dyn Backdrop> {
+/// `captureFps` of the settings wins (a fixed rate); else auto, capped by `--backdrop-fps`.
+fn capture_rate(cli_fps: u32, s: &layout::Settings) -> Rate {
+    match s.capture_fps {
+        Some(n) => Rate { fps: n, auto: false },
+        None => Rate { fps: cli_fps, auto: true },
+    }
+}
+
+unsafe fn make_backdrop(gfx: &Gfx, mon: &Monitor, w: i32, h: i32, live: bool, rate: Rate, rects: &[RECT], margin: i32, owner: Option<i64>) -> Box<dyn Backdrop> {
     if live {
         // Graphics Capture of the desktop window is the default (the layer does not see itself, so it can stay visible to screenshots);
         // `MSW_CAPTURE=gdi` selects GDI region capture of the screen (the layer is then excluded from captures), `dxgi` Desktop Duplication
@@ -383,19 +391,19 @@ unsafe fn make_backdrop(gfx: &Gfx, mon: &Monitor, w: i32, h: i32, live: bool, fp
             eprintln!("mswidgets: the monitor is on another GPU than the UI device, using GDI capture");
         }
         if let (true, Some(x), false) = (pick.is_empty() || pick == "wgc", out, gfx.warp) {
-            match WgcBackdrop::new(gfx, x, rects, margin, fps) {
+            match WgcBackdrop::new(gfx, x, rects, margin, rate) {
                 Ok(d) => return Box::new(d),
                 Err(e) => eprintln!("mswidgets: graphics capture unavailable ({e}), trying GDI"),
             }
         }
         if (pick != "dxgi" || (mon.out.is_some() && out.is_none())) && !gfx.warp {
-            match GdiBackdrop::new(gfx, mon.rect, rects, margin, fps) {
+            match GdiBackdrop::new(gfx, mon.rect, rects, margin, rate) {
                 Ok(d) => return Box::new(d),
                 Err(e) => eprintln!("mswidgets: GDI capture unavailable ({e}), trying duplication"),
             }
         }
         if let (Some(x), false) = (out, gfx.warp) {
-            match DuplBackdrop::new(gfx, x, RECT { left: 0, top: 0, right: w, bottom: h }, rects, margin, fps) {
+            match DuplBackdrop::new(gfx, x, RECT { left: 0, top: 0, right: w, bottom: h }, rects, margin, rate) {
                 Ok(d) => return Box::new(d),
                 Err(e) => eprintln!("mswidgets: desktop duplication unavailable ({e}), plain base"),
             }
@@ -463,7 +471,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     )?;
     // backdrop: graphics capture of the wallpaper window, else screen capture, else a plain dark translucent base
     let regions = region_list(&card_rects, None, None);
-    let backdrop = make_backdrop(&gfx, &mon, mw, mh, settings.live, o.fps, &regions, m, gfx_luid);
+    let backdrop = make_backdrop(&gfx, &mon, mw, mh, settings.live, capture_rate(o.fps, &settings), &regions, m, gfx_luid);
     // a backdrop that reads the SCREEN would see the layer itself: keep the window out of every capture then (screenshots miss it);
     // `MSW_NO_EXCLUDE=1` (diagnostics only) skips that
     if backdrop.name() != "desktop-wgc" && std::env::var_os("MSW_NO_EXCLUDE").is_none() && SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_err() {
@@ -845,6 +853,13 @@ fn clipboard_text(hwnd: HWND) -> Option<String> {
 impl App {
     fn now(&self) -> Now {
         self.fixed_time.unwrap_or_else(Now::local)
+    }
+
+    /// The user is about to look at the glass (edit mode, a drag, a look / appearance change): capture at full rate at once.
+    fn boost_capture(&self) {
+        if let Some(b) = &self.backdrop {
+            b.boost();
+        }
     }
 
     fn ext(&self) -> i32 {
@@ -1837,6 +1852,7 @@ impl App {
         let off = if fresh { (c.w / 2, c.h / 2) } else { (x0 - c.x, y0 - c.y) };
         let from = from.or_else(|| self.items.iter().find(|it| it.id == c.id).map(|it| (it.col as i32, it.row as i32)));
         self.drag = Some(Drag { uid, off, cur: (x, y), target: None, fresh, from, vel: (0.0, 0.0) });
+        self.boost_capture();
         self.press = Press::Drag;
         self.springs.remove(&uid);
         let mut xf = self.scene.cards[i].xf;
@@ -2414,6 +2430,7 @@ impl App {
             return;
         }
         self.editing = true;
+        self.boost_capture();
         self.was_fg = false;
         self.reduced = reduced_motion();
         let now = self.now();
@@ -2465,6 +2482,7 @@ impl App {
             return;
         }
         self.editing = false;
+        self.boost_capture();
         self.flush_look_commit();
         self.ui.sfocus = None;
         if self.drag.is_some() {
@@ -2581,6 +2599,7 @@ impl App {
         if (self.ui.glass - g).abs() < 1e-4 {
             return;
         }
+        self.boost_capture();
         self.ui.glass = g;
         if let Err(e) = self.scene.set_glass(&self.gfx, g) {
             eprintln!("mswidgets: glass: {e}");
@@ -2702,6 +2721,7 @@ impl App {
                 let p = ui::Opt::appearance(k);
                 self.ui.appearance = p;
                 self.settings.appearance = p;
+                self.boost_capture();
                 self.scene.set_appearance_pref(p);
                 self.last_anim = Instant::now();
                 self.arm_anim();
@@ -2878,7 +2898,7 @@ impl App {
             }
         }
         let card_rects: Vec<RECT> = rects.iter().map(|&(x, y, w, h)| RECT { left: x, top: y, right: x + w, bottom: y + h }).collect();
-        let bd = make_backdrop(&self.gfx, &mon, mw, mh, self.settings.live, self.fps, &region_list(&card_rects, None, None), m, self.gfx_luid);
+        let bd = make_backdrop(&self.gfx, &mon, mw, mh, self.settings.live, capture_rate(self.fps, &self.settings), &region_list(&card_rects, None, None), m, self.gfx_luid);
         bd.set_hwnd(self.hwnd);
         self.use_dupl = bd.name().starts_with("desktop");
         if let Err(e) = self.scene.reconfigure(&self.gfx, mw, mh, cs, bd.bitmap(), &rects) {
@@ -3013,6 +3033,7 @@ impl App {
         if new.dim != old.dim {
             self.update_dim();
         }
+        self.boost_capture(); // any edit of config.json: look at the glass at full rate for a while
         if new.appearance != old.appearance {
             self.scene.set_appearance_pref(new.appearance);
             self.last_anim = Instant::now();
@@ -3028,7 +3049,7 @@ impl App {
             self.ui.accent_mode = new.accent;
             self.refresh_accent(true);
         }
-        if new.live != old.live {
+        if new.live != old.live || new.capture_fps != old.capture_fps {
             self.ui.live = new.live;
             self.rebuild(true);
         }
@@ -3193,6 +3214,7 @@ impl App {
         println!("  backdrop_batches={} card_redraws={} clock_frames={}", self.st.backdrop_batches, self.st.card_redraws, self.st.clock_frames);
         println!("duplication_frames={acq}");
         println!("duplication_frames_with_gpu_copy={copied}");
+        println!("capture_rate_hz_at_exit={}", self.bd().rate_hz());
         println!("achieved_backdrop_fps={:.1}", self.st.backdrop_batches as f64 / secs);
         println!("achieved_clock_fps={:.1}", self.st.clock_frames as f64 / secs);
         println!("render_cpu_ms_avg={:.3}", self.st.render_ms / frames.max(1) as f64);
