@@ -6,6 +6,8 @@
 
 ![Glass Widgets on a wallpaper](docs/images/hero.png)
 
+Project page: <https://chvdbhcx-del.github.io/glass-widgets/> (source in `docs/index.html`).
+
 Native desktop widgets for Windows 10/11 with a Liquid-Glass look: translucent, refracting cards that float over your wallpaper
 (an animated one too). No WebView, no Electron: one transparent layered window drawn with Direct2D on the GPU, a 0.7 MB installer
 and roughly 100 MB of RAM and under 10 % of one CPU core while the wallpaper moves.
@@ -37,6 +39,17 @@ controls. Cards come in S / M / L sizes, snap to a grid, can be dragged, and mer
 
 Download `GlassWidgets_<version>_x64-setup.exe` from the [releases page](../../releases) and run it. It installs per user (no
 administrator rights) and can start Glass Widgets with Windows. The installer is not code-signed, so SmartScreen may ask you to confirm.
+
+### Install with winget (once the package is accepted)
+
+Not available yet: the package `chvdbhcx-del.GlassWidgets` has not been submitted to [winget-pkgs](https://github.com/microsoft/winget-pkgs), so
+`winget install` will not find it today. `pwsh tools\winget-manifest.ps1` prepares the three manifest files for the latest release (URL and
+SHA256 are read from the GitHub release, output goes to `dist\winget\<version>\`); submitting them is a manual pull request. Once it is accepted,
+this will work:
+
+```
+winget install chvdbhcx-del.GlassWidgets
+```
 
 | Keys | Action |
 | --- | --- |
