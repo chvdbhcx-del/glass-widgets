@@ -487,6 +487,8 @@ pub struct Res {
     brush: ID2D1SolidColorBrush,
     pub(crate) round: ID2D1StrokeStyle,
     fams: [HSTRING; 3],
+    /// the bundled Nunito collection; `None` = system fonts (Segoe UI Variable)
+    coll: Option<IDWriteFontCollection>,
     fmts: RefCell<HashMap<FmtKey, IDWriteTextFormat>>,
     glyphs: RefCell<HashMap<Glyph, Rc<Vec<(ID2D1PathGeometry, icons::Paint)>>>>,
 }
@@ -520,6 +522,16 @@ fn cut_for(size: f32) -> usize {
     }
 }
 
+/// Nunito is lighter and rounder than Segoe: captions get one step more weight so they hold their contrast on glass.
+fn weight_for(size: f32, weight: u16, nunito: bool) -> i32 {
+    let w = weight as i32;
+    if nunito && size <= 12.5 {
+        (w + 100).min(700)
+    } else {
+        w
+    }
+}
+
 /// Size-dependent tracking in px (SF-like): small text opens up a little, large text tightens.
 fn auto_track(size: f32) -> f32 {
     match size {
@@ -545,10 +557,13 @@ impl Res {
                 transformType: D2D1_STROKE_TRANSFORM_TYPE_NORMAL,
             };
             let round: ID2D1StrokeStyle = gfx.d2d.CreateStrokeStyle(&sp, None)?.cast()?;
+            let coll = crate::fonts::collection(&gfx.dw);
+            let fams = if coll.is_some() { std::array::from_fn(|_| HSTRING::from(crate::fonts::FAMILY)) } else { [family(gfx, "Small"), family(gfx, "Text"), family(gfx, "Display")] };
             Ok(Res {
                 brush: gfx.dc.CreateSolidColorBrush(&col(1.0, 1.0, 1.0, 1.0), None)?,
                 round,
-                fams: [family(gfx, "Small"), family(gfx, "Text"), family(gfx, "Display")],
+                fams,
+                coll,
                 fmts: RefCell::new(HashMap::new()),
                 glyphs: RefCell::new(HashMap::new()),
             })
@@ -561,7 +576,7 @@ impl Res {
             return Ok(f.clone());
         }
         unsafe {
-            let f = gfx.dw.CreateTextFormat(&self.fams[cut_for(st.size)], None::<&IDWriteFontCollection>, DWRITE_FONT_WEIGHT(st.weight as i32), DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, st.size, w!("ru-ru"))?;
+            let f = gfx.dw.CreateTextFormat(&self.fams[cut_for(st.size)], self.coll.as_ref(), DWRITE_FONT_WEIGHT(weight_for(st.size, st.weight, self.coll.is_some())), DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, st.size, w!("ru-ru"))?;
             f.SetTextAlignment(match st.align {
                 Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
                 Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,

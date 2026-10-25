@@ -15,6 +15,7 @@ mod autostart;
 mod backdrop;
 mod calib;
 mod cards;
+mod fonts;
 mod gfx;
 mod glass;
 mod grid;
