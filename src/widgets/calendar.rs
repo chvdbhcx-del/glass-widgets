@@ -55,7 +55,7 @@ fn month_block(cx: &Cx, x: f32, y: f32, w: f32, m: &Metrics, view: (i32, u32), t
     if vy != now.y {
         title += &format!(" {vy}");
     }
-    cx.text(Rect::new(x, y, title_w, 18.0), &title, Style::LABEL.size(m.title_size), ACCENT);
+    cx.text(Rect::new(x, y, title_w, 18.0), &title, Style::LABEL.size(m.title_size), accent());
     let sun_first = cx.lang == Lang::En;
     let initials = if sun_first { ["S", "M", "T", "W", "T", "F", "S"] } else { ["П", "В", "С", "Ч", "П", "С", "В"] };
     let cw = w / 7.0;
@@ -98,7 +98,7 @@ impl Widget for Calendar {
             Size::M => {
                 let left = Rect::new(16.0, 16.0, 142.6, 138.0);
                 let wd = weekday_name(cx.lang, now.dow()).to_uppercase();
-                cx.text(Rect::new(left.x, left.y, left.w, 16.0), &wd, Style::LABEL.ellipsis(), ACCENT);
+                cx.text(Rect::new(left.x, left.y, left.w, 16.0), &wd, Style::LABEL.ellipsis(), accent());
                 cx.text(Rect::new(left.x - 2.0, left.y + 17.0, left.w + 8.0, 76.0), &now.d.to_string(), Style::new(76.0, 300).mono().track(-2.3), TEXT);
                 let line = if cx.preview { cx.t("Сегодня 2 напоминания", "2 reminders today") } else { cx.t("Нет событий", "No events") };
                 cx.text(Rect::new(left.x, left.bottom() - 16.0, left.w, 16.0), line, Style::new(12.0, 400), DIM);
@@ -114,7 +114,7 @@ impl Widget for Calendar {
                 }
                 // "Today" strip, anchored to the bottom: separator, header, three rows of 22
                 cx.rect(Rect::new(16.0, 248.0, 324.0, 0.6), FILL);
-                cx.text(Rect::new(16.0, 255.0, 324.0, 15.0), &cx.t("СЕГОДНЯ", "TODAY"), Style::LABEL, ACCENT);
+                cx.text(Rect::new(16.0, 255.0, 324.0, 15.0), &cx.t("СЕГОДНЯ", "TODAY"), Style::LABEL, accent());
                 if cx.preview {
                     let rows = [("Позвонить маме", "18:30", true), ("Купить билеты", "", false), ("Отправить отчёт", "10:00", false)];
                     for (i, (t, tm, over)) in rows.iter().enumerate() {

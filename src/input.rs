@@ -25,7 +25,7 @@ use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::gfx::{col, pt, rf, rr};
-use crate::widget::{Lang, ACCENT};
+use crate::widget::{accent, Lang};
 
 static BUSY: AtomicBool = AtomicBool::new(false);
 
@@ -265,7 +265,7 @@ fn c8(c: (u8, u8, u8), a: f32) -> D2D1_COLOR_F {
     col(c.0 as f32 / 255.0, c.1 as f32 / 255.0, c.2 as f32 / 255.0, a)
 }
 fn acc(a: f32) -> D2D1_COLOR_F {
-    col(ACCENT.r, ACCENT.g, ACCENT.b, a)
+    col(accent().r, accent().g, accent().b, a)
 }
 fn white(a: f32) -> D2D1_COLOR_F {
     col(1.0, 1.0, 1.0, a)

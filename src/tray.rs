@@ -18,6 +18,10 @@ pub enum TrayCmd {
     Edit,
     ToggleVisible,
     ToggleAutostart,
+    /// "Layouts" submenu: switch to the n-th saved profile (the list in `MenuState::profiles`)
+    Profile(usize),
+    SaveProfile,
+    DeleteProfile,
     Quit,
 }
 
@@ -27,6 +31,9 @@ pub struct MenuState {
     pub editing: bool,
     pub hidden: bool,
     pub autostart: bool,
+    /// saved layout profiles (config `profiles`) and the checked one (`activeProfile`)
+    pub profiles: Vec<String>,
+    pub active: Option<usize>,
 }
 
 /// The id of the broadcast Explorer sends after it (re)creates the taskbar: the icon must be added again.
@@ -65,6 +72,13 @@ const C_EDIT: usize = 2;
 const C_VISIBLE: usize = 3;
 const C_AUTOSTART: usize = 4;
 const C_QUIT: usize = 5;
+const C_SAVE_PROFILE: usize = 6;
+/// the "Layouts" submenu entry of the main menu (a popup, no command id of its own)
+const C_LAYOUTS: usize = 8;
+const C_DELETE_PROFILE: usize = 7;
+/// + the index of the profile; at most `MAX_PROFILES` are listed
+const C_PROFILE: usize = 100;
+const MAX_PROFILES: usize = 40;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -75,10 +89,25 @@ fn wide(s: &str) -> Vec<u16> {
 pub unsafe fn run_menu(hwnd: HWND, st: &MenuState, foreground: impl Fn(HWND)) -> TrayCmd {
     let t = |ru: &'static str, en: &'static str| wide(st.lang.pick(ru, en));
     let Ok(menu) = CreatePopupMenu() else { return TrayCmd::None };
+    // the "Layouts" submenu: the saved profiles (check mark on the active one), then save / delete
+    let layouts = CreatePopupMenu().ok();
+    if let Some(sub) = layouts {
+        for (i, name) in st.profiles.iter().take(MAX_PROFILES).enumerate() {
+            let flags = MF_STRING | if st.active == Some(i) { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(sub, flags, C_PROFILE + i, PCWSTR(wide(&name.replace('&', "&&")).as_ptr()));
+        }
+        if !st.profiles.is_empty() {
+            let _ = AppendMenuW(sub, MF_SEPARATOR, 0, PCWSTR::null());
+        }
+        let _ = AppendMenuW(sub, MF_STRING, C_SAVE_PROFILE, PCWSTR(t("Сохранить текущий макет как…", "Save current layout as…").as_ptr()));
+        let del = MF_STRING | if st.active.is_some() { MF_ENABLED } else { MF_GRAYED };
+        let _ = AppendMenuW(sub, del, C_DELETE_PROFILE, PCWSTR(t("Удалить текущий макет", "Delete current layout").as_ptr()));
+    }
     let items = [
         (C_SETTINGS, t("Настройки…", "Settings…"), false),
         (C_EDIT, if st.editing { t("Готово", "Done") } else { t("Изменить виджеты…", "Edit Widgets…") }, false),
         (C_VISIBLE, if st.hidden { t("Показать виджеты", "Show Widgets") } else { t("Скрыть виджеты", "Hide Widgets") }, false),
+        (C_LAYOUTS, t("Макеты", "Layouts"), false),
         (0, Vec::new(), false),
         (C_AUTOSTART, t("Запускать вместе с Windows", "Start with Windows"), st.autostart),
         (0, Vec::new(), false),
@@ -87,6 +116,10 @@ pub unsafe fn run_menu(hwnd: HWND, st: &MenuState, foreground: impl Fn(HWND)) ->
     for (id, label, checked) in &items {
         if *id == 0 {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        } else if *id == C_LAYOUTS {
+            if let Some(sub) = layouts {
+                let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(label.as_ptr()));
+            }
         } else {
             let flags = MF_STRING | if *checked { MF_CHECKED } else { MF_UNCHECKED };
             let _ = AppendMenuW(menu, flags, *id, PCWSTR(label.as_ptr()));
@@ -98,13 +131,16 @@ pub unsafe fn run_menu(hwnd: HWND, st: &MenuState, foreground: impl Fn(HWND)) ->
     foreground(hwnd);
     let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_BOTTOMALIGN, p.x, p.y, 0, hwnd, None).0 as usize;
     let _ = PostMessageW(hwnd, WM_NULL, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
-    let _ = DestroyMenu(menu);
+    let _ = DestroyMenu(menu); // destroys the attached submenu too
     match cmd {
         C_SETTINGS => TrayCmd::Settings,
         C_EDIT => TrayCmd::Edit,
         C_VISIBLE => TrayCmd::ToggleVisible,
         C_AUTOSTART => TrayCmd::ToggleAutostart,
+        C_SAVE_PROFILE => TrayCmd::SaveProfile,
+        C_DELETE_PROFILE => TrayCmd::DeleteProfile,
         C_QUIT => TrayCmd::Quit,
+        c if (C_PROFILE..C_PROFILE + MAX_PROFILES).contains(&c) => TrayCmd::Profile(c - C_PROFILE),
         _ => TrayCmd::None,
     }
 }

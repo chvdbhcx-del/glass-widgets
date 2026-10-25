@@ -736,7 +736,7 @@ impl Widget for Controls {
         let ru = cx.lang == Lang::Ru;
         let lay = self.lay(cx.size);
         if cx.size == Size::L {
-            cx.text(Rect::new(16.0, 16.0, 324.0, 18.0), cx.t("БЫСТРЫЕ ДЕЙСТВИЯ", "QUICK ACTIONS"), Style::LABEL, ACCENT);
+            cx.text(Rect::new(16.0, 16.0, 324.0, 18.0), cx.t("БЫСТРЫЕ ДЕЙСТВИЯ", "QUICK ACTIONS"), Style::LABEL, accent());
         }
         if cx.size != Size::S && !self.ready() {
             cx.text(cx.bounds(), "…", Style::new(20.0, 300).center(), FAINT);

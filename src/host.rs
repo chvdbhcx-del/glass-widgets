@@ -15,6 +15,7 @@ use crate::gfx::*;
 use crate::grid;
 use crate::layout;
 use crate::motion::{self, MatState};
+use crate::layout::AccentMode;
 use crate::tray::{self, TrayCmd};
 use crate::ui::{self, Hit, Ui};
 use crate::widget::{Button, Lang, MouseKind, Now, Rect, Size, WM_WIDGET};
@@ -37,6 +38,11 @@ const WM_MOUSELEAVE: u32 = 0x02A3; // Win32_UI_Controls in the windows crate; no
 const WM_DPICHANGED: u32 = 0x02E0;
 /// posted by the mouse handler: run the context menu of card `wparam` at screen point `lparam` (outside of the App borrow)
 const WM_MENU: u32 = WM_APP + 3;
+/// posted by the "Save current layout as..." prompt thread when the user typed a name (the name waits in `PROFILE_NAME`)
+const WM_PROFILE_NAME: u32 = WM_APP + 20;
+/// the longest layout name
+const PROFILE_NAME_MAX: usize = 40;
+static PROFILE_NAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 const T_HIT: usize = 1;
 const T_GUARD: usize = 2;
 const T_TICK: usize = 3;
@@ -229,6 +235,8 @@ struct App {
     look_dirty: bool,
     look_last: Instant,
     settings_back: bool,
+    /// `accentMode` "wallpaper": the wallpaper file (and its time) the accent was taken from; a change recomputes it
+    accent_key: Option<(String, Option<SystemTime>)>,
     st: Stats,
     bench: Option<u32>,
     t0: Instant,
@@ -354,6 +362,9 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     };
     let s = o.scale.unwrap_or(GetDpiForSystem() as f32 / 96.0);
     let settings = layout::read_settings();
+    // the accent colour is needed before the first card is recorded
+    let (accent_rgb, accent_key) = resolve_accent(if o.no_config { AccentMode::Blue } else { settings.accent });
+    crate::widget::set_accent(accent_rgb);
     // the look: defaults -> glass.json (the process-wide base) -> `widgetsLook` of config.json; its `card_k` scales the cards (not the host UI)
     let look_base = crate::glass::global_params();
     let look_cfg = if o.no_config { serde_json::json!({}) } else { layout::read_look() };
@@ -421,6 +432,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     ui.base = look_base;
     ui.appearance = settings.appearance;
     ui.dim_mode = settings.dim;
+    ui.accent_mode = settings.accent;
 
     // premultiplied BGRA DIB the layered window is fed from (only the dirty rect is copied per frame)
     let screen = GetDC(None);
@@ -485,6 +497,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         look_dirty: false,
         look_last: Instant::now() - Duration::from_secs(1),
         settings_back: false,
+        accent_key,
         st: Stats::default(),
         bench: o.bench,
         t0: Instant::now(),
@@ -593,6 +606,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if msg == WM_SYSKEYDOWN {
                 return DefWindowProcW(hwnd, msg, wp, lp);
             }
+            LRESULT(0)
+        }
+        WM_PROFILE_NAME => {
+            with_app(|app| app.profile_named());
             LRESULT(0)
         }
         WM_MENU => {
@@ -791,7 +808,10 @@ impl App {
             (_, T_GUARD) => self.guard(),
             (_, T_ANIM) => self.anim_step(),
             (_, T_UI) => self.ui_timer(),
-            (_, T_CFG) => self.poll_config(),
+            (_, T_CFG) => {
+                self.poll_config();
+                self.refresh_accent(false); // a new wallpaper
+            }
             (_, T_LOOK) => {
                 let _ = KillTimer(self.hwnd, T_LOOK);
                 if self.look_dirty {
@@ -2046,7 +2066,10 @@ impl App {
     }
 
     fn tray_state(&self) -> tray::MenuState {
-        tray::MenuState { lang: self.ui.lang, editing: self.editing, hidden: self.user_hidden, autostart: crate::autostart::enabled() }
+        let root = layout::read_config();
+        let profiles = layout::profile_names(&root);
+        let active = layout::active_profile(&root).and_then(|a| profiles.iter().position(|p| *p == a));
+        tray::MenuState { lang: self.ui.lang, editing: self.editing, hidden: self.user_hidden, autostart: crate::autostart::enabled(), profiles, active }
     }
 
     /// A tray click / menu choice.
@@ -2074,6 +2097,9 @@ impl App {
                     self.show_toast(format!("{}: {e}", self.ui.lang.pick("Автозапуск не изменён", "Autostart not changed")));
                 }
             }
+            TrayCmd::Profile(i) => self.switch_profile(i),
+            TrayCmd::SaveProfile => self.ask_profile_name(),
+            TrayCmd::DeleteProfile => self.delete_profile(),
             TrayCmd::Quit => {
                 let _ = DestroyWindow(self.hwnd);
             }
@@ -2110,6 +2136,7 @@ impl App {
         self.ui.appearance = self.settings.appearance;
         self.ui.dim_mode = self.settings.dim;
         self.ui.live = self.settings.live;
+        self.ui.accent_mode = self.settings.accent;
         self.ui.autostart = crate::autostart::enabled();
     }
 
@@ -2446,6 +2473,13 @@ impl App {
                 self.update_dim(); // takes effect when the panel closes (the desk is not dimmed while editing)
             }
             ui::Opt::Source => self.set_live(k == 0),
+            ui::Opt::Accent => {
+                let m = ui::Opt::accent(k);
+                self.ui.accent_mode = m;
+                self.settings.accent = m;
+                self.write_setting("accentMode", serde_json::json!(m.key()));
+                self.refresh_accent(true);
+            }
         }
         if let Some(d) = self.hover_dirty(Hit::Panel) {
             self.frame(d);
@@ -2587,6 +2621,10 @@ impl App {
         }
         self.ui.appearance = new.appearance;
         self.ui.dim_mode = new.dim;
+        if new.accent != old.accent {
+            self.ui.accent_mode = new.accent;
+            self.refresh_accent(true);
+        }
         if new.live != old.live {
             self.ui.live = new.live;
             self.rebuild(true);
@@ -2749,6 +2787,148 @@ impl App {
         println!("render_cpu_ms_avg={:.3}", self.st.render_ms / frames.max(1) as f64);
         println!("present_cpu_ms_avg={:.3}", self.st.present_ms / frames.max(1) as f64);
         println!("luminance_probes={}", self.st.lum_reads);
+    }
+}
+
+// ---------------------------------------------------------------- accent from the wallpaper, layout profiles
+
+/// The accent for `mode` (`None` = the default blue) and the wallpaper file it was taken from.
+fn resolve_accent(mode: AccentMode) -> (Option<[u8; 3]>, Option<(String, Option<SystemTime>)>) {
+    if mode != AccentMode::Wallpaper {
+        return (None, None);
+    }
+    let key = crate::accent::wallpaper_key();
+    (key.as_ref().and_then(|k| crate::accent::from_file(&k.0)), key)
+}
+
+impl App {
+    /// `accentMode`: take the accent from the wallpaper (again when the wallpaper file changed; `force` = the mode itself changed) or go back to blue,
+    /// and record every card again when the colour is different. Runs on the 2 s config poll: one SystemParametersInfo call while nothing changed.
+    unsafe fn refresh_accent(&mut self, force: bool) {
+        if !self.visible && !force {
+            return;
+        }
+        let rgb = if self.settings.accent == AccentMode::Wallpaper {
+            let key = crate::accent::wallpaper_key();
+            if !force && key == self.accent_key {
+                return;
+            }
+            let rgb = key.as_ref().and_then(|k| crate::accent::from_file(&k.0));
+            self.accent_key = key;
+            rgb
+        } else {
+            self.accent_key = None;
+            None
+        };
+        if crate::widget::set_accent(rgb) {
+            self.scene.invalidate_all();
+            let now = self.now();
+            for i in 0..self.scene.len() {
+                let _ = self.scene.render_card(&self.gfx, i, &now);
+            }
+            let d = self.all_dirty();
+            self.frame(d);
+        }
+    }
+
+    /// A message for the user: a toast while the panels are up (the toast lives on the whole-monitor canvas), else the log.
+    unsafe fn notify(&mut self, msg: String) {
+        if self.ui.edit {
+            self.show_toast(msg);
+        } else {
+            eprintln!("mswidgets: {msg}");
+        }
+    }
+
+    /// Tray "Layouts" > profile `i` (index into the sorted list the menu showed): the current desk goes back into the active profile, the chosen one is loaded.
+    unsafe fn switch_profile(&mut self, i: usize) {
+        let names = layout::profile_names(&layout::read_config());
+        let Some(name) = names.get(i).cloned() else { return };
+        if self.drag.is_some() {
+            self.end_drag();
+        }
+        let stash = self.ui.lang.pick("Без имени", "Unsaved");
+        if let Err(e) = layout::profile_op(|r| layout::profile_switch(r, &name, stash)) {
+            return self.notify(format!("{}: {e}", self.ui.lang.pick("Макет не загружен", "Layout not loaded")));
+        }
+        self.note_own_write();
+        // the new desk: items + look from the file, every card replaced (a card of the same id may have another size / cfg in the new layout)
+        let root = layout::read_config();
+        self.items = layout::items_from_value(&root);
+        self.look_cfg = layout::look_from_value(&root);
+        self.ui.look = crate::glass::apply_look(&self.look_base, &self.look_cfg);
+        let now = self.now();
+        self.leave(&now);
+        self.hot = None;
+        self.pressed = None;
+        self.press = Press::None;
+        self.ui.hover = Hit::None;
+        self.ui.press = Hit::None;
+        while self.scene.len() > 0 {
+            self.scene.remove_card(0);
+        }
+        self.pops.clear();
+        self.springs.clear();
+        self.apply_look_now(); // the glass parameters first: the new cards are built with them
+        self.rebuild(true); // also the card scale of the new look: a new grid, the cards come back from `items`
+        if !self.reduced {
+            let t = Instant::now();
+            for i in 0..self.scene.len() {
+                let uid = self.scene.cards[i].uid;
+                self.pops.insert(uid, Pop { t0: t + Duration::from_millis(60 * i as u64), out: false });
+                self.scene.set_xf(i, mat_xf(&motion::materialize(0.0, false, false), 0.0, 0.0));
+            }
+            self.last_anim = t;
+            self.arm_anim();
+        }
+        if !self.ui.edit && !self.want_full() {
+            SetTimer(self.hwnd, T_SHRINK, 400, None);
+        }
+    }
+
+    /// Tray "Save current layout as...": the prompt runs on its own thread (it has a message loop); the name comes back as `WM_PROFILE_NAME`.
+    unsafe fn ask_profile_name(&mut self) {
+        let (lang, hwnd) = (self.ui.lang, self.hwnd.0 as isize);
+        let _ = std::thread::Builder::new().name("profile-name".into()).spawn(move || {
+            let mut o = crate::input::PromptOpts::new(lang.pick("Название макета", "Layout name"), "", false);
+            (o.placeholder, o.ok_label, o.lang) = (lang.pick("Например: Работа", "e.g. Work").to_string(), lang.pick("Сохранить", "Save").to_string(), lang);
+            if let Some(name) = crate::input::prompt_ex(o) {
+                if let Ok(mut g) = PROFILE_NAME.lock() {
+                    *g = Some(name);
+                    let _ = PostMessageW(HWND(hwnd as *mut _), WM_PROFILE_NAME, WPARAM(0), LPARAM(0));
+                }
+            }
+        });
+    }
+
+    /// The prompt answered: the desk (cards + look) is saved as that profile and becomes the active one.
+    unsafe fn profile_named(&mut self) {
+        let Some(name) = PROFILE_NAME.lock().ok().and_then(|mut g| g.take()) else { return };
+        let name: String = name.trim().chars().take(PROFILE_NAME_MAX).collect();
+        if name.is_empty() {
+            return;
+        }
+        match layout::profile_op(|r| layout::profile_save(r, &name)) {
+            Ok(()) => {
+                self.note_own_write();
+                let msg = format!("{} «{name}»", self.ui.lang.pick("Макет сохранён:", "Layout saved:"));
+                self.notify(msg);
+            }
+            Err(e) => self.notify(format!("{}: {e}", self.ui.lang.pick("Макет не сохранён", "Layout not saved"))),
+        }
+    }
+
+    /// Tray "Delete current layout": the active profile is forgotten, the desk stays as it is.
+    unsafe fn delete_profile(&mut self) {
+        let mut gone = String::new();
+        match layout::profile_op(|r| layout::profile_delete_active(r).map(|n| gone = n)) {
+            Ok(()) => {
+                self.note_own_write();
+                let msg = format!("{} «{gone}»", self.ui.lang.pick("Макет удалён:", "Layout deleted:"));
+                self.notify(msg);
+            }
+            Err(e) => self.notify(format!("{}: {e}", self.ui.lang.pick("Макет не удалён", "Layout not deleted"))),
+        }
     }
 }
 
