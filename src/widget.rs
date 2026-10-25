@@ -371,7 +371,7 @@ pub const TEXT: Color = Color::rgba(1.0, 1.0, 1.0, 0.96);
 pub const DIM: Color = Color::rgba(1.0, 1.0, 1.0, 0.70);
 /// secondary text that must stay readable on bright glass: titles of cards, units next to a big number
 pub const SUBTLE: Color = Color::rgba(1.0, 1.0, 1.0, 0.80);
-pub const FAINT: Color = Color::rgba(1.0, 1.0, 1.0, 0.38);
+pub const FAINT: Color = Color::rgba(1.0, 1.0, 1.0, 0.50);
 /// subtle fills, ring tracks, bar tracks, separators
 pub const FILL: Color = Color::rgba(1.0, 1.0, 1.0, 0.18);
 pub const HAIR: Color = Color::rgba(1.0, 1.0, 1.0, 0.14);
@@ -948,7 +948,9 @@ impl<'a> Cx<'a> {
             return;
         }
         if let Ok(l) = self.layout(s, st, r.w, r.h) {
-            unsafe { self.dc.DrawTextLayout(pt(r.x, r.y), &l, self.brush(c), D2D1_DRAW_TEXT_OPTIONS_NONE) };
+            // `MSW_TEXT_SNAP=1`: the text origin on whole pixels, so stems do not straddle pixel boundaries (needs an upright, unscaled card)
+            let (x, y) = if std::env::var_os("MSW_TEXT_SNAP").is_some() { (r.x.round(), r.y.round()) } else { (r.x, r.y) };
+            unsafe { self.dc.DrawTextLayout(pt(x, y), &l, self.brush(c), D2D1_DRAW_TEXT_OPTIONS_NONE) };
         }
     }
     /// Natural (width, height) of `s` in this style; `max_w` only matters for wrapped styles.
