@@ -24,6 +24,101 @@ pub fn http_get_json(url: &str, timeout_ms: i32) -> Result<serde_json::Value, St
     serde_json::from_slice(&b).map_err(|e| format!("json: {e}"))
 }
 
+/// Redirect hops `download` follows (GitHub release asset: github.com -> a CDN host, one or two hops).
+const MAX_HOPS: usize = 4;
+
+/// GET `url` (HTTPS only) into the file `dest`, at most `cap` bytes. Redirects are followed by hand and every target (the first URL
+/// included) must pass `allow`, so a redirect can never leave the allowed hosts. `progress(bytes so far, Content-Length)` is called per
+/// chunk. On `Err` the file may be partial: the caller deletes it.
+pub fn download(url: &str, dest: &std::path::Path, cap: u64, allow: fn(&str) -> bool, mut progress: impl FnMut(u64, Option<u64>)) -> Result<(), String> {
+    let mut url = url.to_string();
+    for _ in 0..=MAX_HOPS {
+        if !allow(&url) {
+            return Err(format!("address not allowed: {url}"));
+        }
+        match download_once(&url, dest, cap, &mut progress)? {
+            None => return Ok(()),
+            Some(next) => url = next,
+        }
+    }
+    Err("too many redirects".into())
+}
+
+/// One request: `Ok(None)` = the body was saved, `Ok(Some(url))` = a redirect to `url`.
+fn download_once(url: &str, dest: &std::path::Path, cap: u64, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Option<String>, String> {
+    use std::io::Write;
+    let (https, host, port, path) = split(url).ok_or_else(|| format!("bad url: {url}"))?;
+    if !https {
+        return Err("https only".into());
+    }
+    unsafe {
+        let ses = WinHttpOpen(w!("macshell-widgets/0.1"), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), 0);
+        if ses.is_null() {
+            return Err("WinHttpOpen failed".into());
+        }
+        let _ = WinHttpSetTimeouts(ses, 15_000, 15_000, 15_000, 15_000);
+        let (h, p) = (wide(&host), wide(&path));
+        let con = WinHttpConnect(ses, PCWSTR(h.as_ptr()), port, 0);
+        let req = if con.is_null() { std::ptr::null_mut() } else { WinHttpOpenRequest(con, w!("GET"), PCWSTR(p.as_ptr()), PCWSTR::null(), PCWSTR::null(), std::ptr::null(), WINHTTP_FLAG_SECURE) };
+        let out = (|| -> Result<Option<String>, String> {
+            if req.is_null() {
+                return Err("connect failed".into());
+            }
+            let never = WINHTTP_OPTION_REDIRECT_POLICY_NEVER.to_ne_bytes();
+            WinHttpSetOption(Some(req as *const c_void), WINHTTP_OPTION_REDIRECT_POLICY, Some(&never)).map_err(|e| format!("option: {e}"))?;
+            WinHttpSendRequest(req, None, None, 0, 0, 0).map_err(|e| format!("send: {e}"))?;
+            WinHttpReceiveResponse(req, std::ptr::null_mut()).map_err(|e| format!("receive: {e}"))?;
+            let num = |what: u32| {
+                let (mut v, mut len) = (0u32, 4u32);
+                WinHttpQueryHeaders(req, what | WINHTTP_QUERY_FLAG_NUMBER, PCWSTR::null(), Some(&mut v as *mut u32 as *mut c_void), &mut len, std::ptr::null_mut()).ok().map(|_| v)
+            };
+            let status = num(WINHTTP_QUERY_STATUS_CODE).unwrap_or(0);
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                let mut buf = [0u16; 2048];
+                let mut len = (buf.len() * 2) as u32;
+                WinHttpQueryHeaders(req, WINHTTP_QUERY_LOCATION, PCWSTR::null(), Some(buf.as_mut_ptr() as *mut c_void), &mut len, std::ptr::null_mut()).map_err(|e| format!("location: {e}"))?;
+                return Ok(Some(String::from_utf16_lossy(&buf[..len as usize / 2])));
+            }
+            if status != 200 {
+                return Err(format!("http {status}"));
+            }
+            let total = num(WINHTTP_QUERY_CONTENT_LENGTH).map(u64::from);
+            if total.is_some_and(|t| t > cap) {
+                return Err("file too large".into());
+            }
+            let mut f = std::fs::File::create(dest).map_err(|e| format!("create: {e}"))?;
+            let mut got_total = 0u64;
+            let mut buf = vec![0u8; 64 << 10];
+            loop {
+                let mut got = 0u32;
+                WinHttpReadData(req, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut got).map_err(|e| format!("read: {e}"))?;
+                if got == 0 {
+                    break;
+                }
+                got_total += got as u64;
+                if got_total > cap {
+                    return Err("file too large".into());
+                }
+                f.write_all(&buf[..got as usize]).map_err(|e| format!("write: {e}"))?;
+                progress(got_total, total);
+            }
+            if total.is_some_and(|t| t != got_total) {
+                return Err("download cut short".into());
+            }
+            f.flush().map_err(|e| format!("write: {e}"))?;
+            Ok(None)
+        })();
+        if !req.is_null() {
+            let _ = WinHttpCloseHandle(req);
+        }
+        if !con.is_null() {
+            let _ = WinHttpCloseHandle(con);
+        }
+        let _ = WinHttpCloseHandle(ses);
+        out
+    }
+}
+
 fn split(url: &str) -> Option<(bool, String, u16, String)> {
     let (https, rest) = if let Some(r) = url.strip_prefix("https://") { (true, r) } else { (false, url.strip_prefix("http://")?) };
     let (hp, path) = match rest.find('/') {

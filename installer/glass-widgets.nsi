@@ -28,6 +28,10 @@ SetCompressor /SOLID lzma
 BrandingText "${NAME} ${VERSION}"
 
 !include MUI2.nsh
+!include LogicLib.nsh
+!include FileFunc.nsh
+!insertmacro GetParameters
+!insertmacro GetOptions
 Icon "icon.ico"
 UninstallIcon "icon.ico"
 !define MUI_ICON "icon.ico"
@@ -114,6 +118,14 @@ Section "$(SEC_MAIN)" SecMain
   WriteRegStr HKCU "${UNKEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   WriteRegDWORD HKCU "${UNKEY}" "NoModify" 1
   WriteRegDWORD HKCU "${UNKEY}" "NoRepair" 1
+  ; the app's one-click update runs "setup.exe /S /UPDATE": a silent install that was started that way starts the new version (a plain /S install does not)
+  ${If} ${Silent}
+    ${GetParameters} $R0
+    ${GetOptions} $R0 "/UPDATE" $R1
+    ${IfNot} ${Errors}
+      Exec '"$INSTDIR\${EXE}"'
+    ${EndIf}
+  ${EndIf}
 SectionEnd
 
 ; the optional ones are unticked: a desktop icon and autostart are the user's choice

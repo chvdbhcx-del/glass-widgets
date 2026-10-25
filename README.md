@@ -71,13 +71,16 @@ the settings panel; right click shows a menu: **Settings**, **Edit Widgets**, **
 
 The panel has sliders that change the look of the widgets live: glass amount, blur, refraction, chromatic fringe, saturation, brightness,
 frosting, highlights, glow, corner roundness and card size. It also switches dark / light / auto glass, dimming, live or plain glass,
-autostart and the accent colour of card titles (blue, or taken from the wallpaper). "Reset look" brings everything back to the defaults. Drag the panel (or the gallery) by an empty spot: it remembers
+autostart and the accent colour (blue, or taken from the wallpaper) of card titles and of the panels' own buttons and focus rings. "Reset look" brings everything back to the defaults. Drag the panel (or the gallery) by an empty spot: it remembers
 where you left it. The sliders also work from the keyboard (`Up` / `Down` / `Tab` pick one, `Left` / `Right` change it by 1 %, with
 `Shift` by 10 %, `Home` / `End` jump, `Backspace` resets it) and with the mouse wheel.
 
-**Updates.** "Check for updates" asks GitHub once for the latest release and offers a **Download** button that opens the release page
-in your browser. Nothing is downloaded or installed by the app. "Check for updates on start" (off by default) does the same check silently
-when Glass Widgets starts and shows a small notice if a newer version exists.
+**Updates.** "Check for updates" asks GitHub once for the latest release. If a newer version exists you get **Update now** and
+**Release page** (opens the page in your browser). "Update now" downloads the installer of that release (HTTPS, from github.com only,
+at most 20 MB) into `%TEMP%\GlassWidgets-update`, checks its SHA-256 against the checksum GitHub publishes for the file, and only if it matches runs it
+silently (`/S`): the installer closes Glass Widgets, replaces it and starts the new version again. If the checksum is missing or does not match,
+the file is deleted and nothing is run. Nothing is downloaded or installed unless you press the button. "Check for updates on start"
+(off by default) only does the check, silently, and shows a small notice if a newer version exists.
 
 ## Settings file
 
@@ -99,7 +102,7 @@ Everything lives in `%APPDATA%\macshell\config.json` (written by the edit mode; 
 | `profiles`, `activeProfile` | saved layouts: `{ name: { items: [...], look: {...} } }` and the checked one (the Layouts submenu of the tray) |
 
 Network is used only by the widgets that need it (weather, rates, crypto, quote, site icons of shortcut tiles) and by the update check, which runs only
-when you press "Check for updates" or turn on `checkUpdates`; nothing else phones home.
+when you press "Check for updates" or turn on `checkUpdates` (the installer is downloaded only after you press "Update now"); nothing else phones home.
 Advanced knobs are environment variables, for example `MSW_CAPTURE=gdi|dxgi` (older capture paths) and `MSW_TEXT_GAMMA`.
 
 ## Build from source
