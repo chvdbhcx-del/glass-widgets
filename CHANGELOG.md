@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] - 2026-10-25
 
 ### Added
 - Accent colour of card titles from the wallpaper (settings: Accent, Blue / Wallpaper; `accentMode`), re-read when the wallpaper changes.
