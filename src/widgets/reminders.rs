@@ -374,13 +374,15 @@ struct Lay {
     lines: usize,
     inline_due: bool,
     sep: bool,
+    /// a title that does not fit one line steps down 13 -> 12 px, then takes two 11 px lines (the row is tall enough)
+    squeeze: bool,
 }
 impl Lay {
     fn of(s: Size) -> Lay {
         match s {
-            Size::S => Lay { head_h: 28.0, rows: 3, row_h: 36.0, lines: 2, inline_due: false, sep: false },
-            Size::M => Lay { head_h: 28.0, rows: 4, row_h: 27.5, lines: 1, inline_due: true, sep: false },
-            Size::L => Lay { head_h: 36.0, rows: 7, row_h: 36.0, lines: 2, inline_due: true, sep: true },
+            Size::S => Lay { head_h: 28.0, rows: 3, row_h: 36.0, lines: 2, inline_due: false, sep: false, squeeze: false },
+            Size::M => Lay { head_h: 28.0, rows: 4, row_h: 27.5, lines: 1, inline_due: true, sep: false, squeeze: true },
+            Size::L => Lay { head_h: 36.0, rows: 7, row_h: 36.0, lines: 2, inline_due: true, sep: true, squeeze: false },
         }
     }
     fn list(&self, c: Rect) -> Rect {
@@ -406,6 +408,8 @@ struct RowGeo {
     /// (label, overdue, rect)
     due: Option<(String, bool, Rect)>,
     inline: bool,
+    /// title font size (13, or less when a squeezed row had to shrink)
+    size: f32,
 }
 
 const CIRCLE: Color = Color::rgba(1.0, 1.0, 1.0, 0.6);
@@ -419,15 +423,27 @@ fn row_geo(cx: &Cx, lay: &Lay, row: Rect, text: &str, due: Option<(String, bool)
     };
     let tw = (row.w - 22.0 - due_w - if due_w > 0.0 { 6.0 } else { 0.0 }).max(10.0);
     let stacked = due.is_some() && !lay.inline_due;
-    let lines = wrap_lines(text, if stacked { 1 } else { lay.lines }, tw, &|s| cx.measure(s, Style::BODY, 0.0).0);
-    let (lh, dh) = (16.0, if stacked { 14.0 } else { 0.0 });
+    let mut size = 13.0;
+    let mut lines = wrap_lines(text, if stacked { 1 } else { lay.lines }, tw, &|s| cx.measure(s, Style::BODY, 0.0).0);
+    if lay.squeeze && !stacked {
+        let one = |z: f32| cx.measure(text, Style::BODY.size(z), 0.0).0 <= tw;
+        if one(13.0) {
+        } else if one(12.0) {
+            size = 12.0;
+            lines = vec![text.to_string()];
+        } else {
+            size = 11.0;
+            lines = wrap_lines(text, 2, tw, &|s| cx.measure(s, Style::BODY.size(11.0), 0.0).0);
+        }
+    }
+    let (lh, dh) = (if size < 11.5 && lines.len() > 1 { 12.5 } else { 16.0 }, if stacked { 14.0 } else { 0.0 });
     let y0 = row.cy() - (lines.len() as f32 * lh + dh) / 2.0;
     let n = lines.len() as f32;
     let rects: Vec<(String, Rect, f32)> = lines
         .into_iter()
         .enumerate()
         .map(|(k, s)| {
-            let w = cx.measure(&s, Style::BODY, 0.0).0;
+            let w = cx.measure(&s, Style::BODY.size(size), 0.0).0;
             (s, Rect::new(tx, y0 + k as f32 * lh, tw, lh), w)
         })
         .collect();
@@ -435,7 +451,7 @@ fn row_geo(cx: &Cx, lay: &Lay, row: Rect, text: &str, due: Option<(String, bool)
         let r = if lay.inline_due { Rect::new(row.right() - due_w, row.y, due_w, row.h) } else { Rect::new(tx, y0 + n * lh, tw, dh) };
         (s, over, r)
     });
-    RowGeo { c: (row.x + 6.0, y0 + lh / 2.0), lines: rects, due, inline: lay.inline_due }
+    RowGeo { c: (row.x + 6.0, y0 + lh / 2.0), lines: rects, due, inline: lay.inline_due, size }
 }
 
 fn due_style(inline: bool, over: bool) -> Style {
@@ -611,7 +627,7 @@ impl Widget for Reminders {
             let g = row_geo(cx, &lay, row, &it.text, it.due_ms.map(|d| due_label(d, nm, off, cx.lang)));
             cx.circle_stroke(g.c, CIRCLE_R, 1.5, CIRCLE);
             for (s, r, _) in &g.lines {
-                cx.text(*r, s, Style::BODY.ellipsis(), TEXT);
+                cx.text(*r, s, Style::BODY.size(g.size).ellipsis(), TEXT);
             }
             if let Some((s, over, r)) = &g.due {
                 cx.text(*r, s, due_style(g.inline, *over), if *over { RED } else { DIM });
@@ -639,7 +655,7 @@ impl Widget for Reminders {
                 cx.icon(Glyph::Check, Rect::new(g.c.0 - 6.5, g.c.1 - 6.5, 13.0, 13.0), WHITE.fade(fade * fill));
             }
             for (s, r, w) in &g.lines {
-                cx.text(*r, s, Style::BODY.ellipsis(), TEXT.fade(fade * (1.0 - 0.45 * sp)));
+                cx.text(*r, s, Style::BODY.size(g.size).ellipsis(), TEXT.fade(fade * (1.0 - 0.45 * sp)));
                 cx.line((r.x, r.cy() + 0.5), (r.x + w * sp, r.cy() + 0.5), 1.3, DIM.fade(fade));
             }
             if let Some((s, over, r)) = &g.due {

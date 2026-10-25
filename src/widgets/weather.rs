@@ -157,7 +157,7 @@ fn wmo(code: u8, day: bool) -> (Kind, &'static str, &'static str) {
         0 if day => (Kind::Clear, "Солнечно", "Sunny"),
         0 => (Kind::Clear, "Ясно", "Clear"),
         1 => (Kind::Partly, "Малооблачно", "Mostly clear"),
-        2 => (Kind::Partly, "Облачно с прояснениями", "Partly cloudy"),
+        2 => (Kind::Partly, "Облачно с просветами", "Partly cloudy"),
         3 => (Kind::Cloud, "Пасмурно", "Overcast"),
         45 | 48 => (Kind::Fog, "Туман", "Fog"),
         51 | 53 | 55 => (Kind::Rain, "Морось", "Drizzle"),
@@ -175,7 +175,7 @@ fn wmo(code: u8, day: bool) -> (Kind, &'static str, &'static str) {
         82 => (Kind::Rain, "Сильный ливень", "Heavy showers"),
         85 | 86 => (Kind::Snow, "Снегопад", "Snow showers"),
         95 => (Kind::Storm, "Гроза", "Thunderstorm"),
-        96 | 99 => (Kind::Storm, "Гроза с градом", "Thunderstorm with hail"),
+        96 | 99 => (Kind::Storm, "Гроза с градом", "Storm with hail"),
         _ => (Kind::Cloud, "Нет данных", "No data"),
     }
 }
@@ -592,6 +592,9 @@ impl Widget for Weather {
             if !self.started {
                 self.started = true;
                 self.load_sample(&cx.now);
+                if let (Some(c), Some(wx)) = (cx.cfg_f64("sample_code"), self.wx.as_mut()) {
+                    wx.code = c as u8; // preview only: check how every condition text fits
+                }
                 self.ver += 1;
             }
             return Tick::Never;

@@ -21,7 +21,7 @@ and roughly 100 MB of RAM and under 10 % of one CPU core while the wallpaper mov
 - **Live wallpapers work**: the glass reads the wallpaper window itself, so it follows videos and animated wallpapers.
 - **Visible to screenshots and screen recorders**: the layer never captures itself.
 - **Light**: about 100 MB of RAM and under 10 % of one core with an animated wallpaper.
-- **Private**: the network is used only by the widgets that need it (weather, rates, quote, site icons); no telemetry.
+- **Private**: the network is used only by the widgets that need it (weather, rates, crypto, quote, site icons); no telemetry.
 
 | Dark glass, edit mode and the widget gallery (`Ctrl+Alt+W`) | Light glass |
 | --- | --- |
@@ -30,7 +30,7 @@ and roughly 100 MB of RAM and under 10 % of one CPU core while the wallpaper mov
 ## Widgets
 
 Clock, calendar, reminders, music (now playing), batteries, weather, world clock, system monitor, disks, network, processes, notes,
-timer, shortcuts (apps, folders and sites with their own icons), clipboard history, photos, currency rates, quote of the day and quick
+timer, shortcuts (apps, folders and sites with their own icons), clipboard history, photos, currency rates, crypto prices, quote of the day, next event (from a local `.ics` file), countdown to a date and quick
 controls. Cards come in S / M / L sizes, snap to a grid, can be dragged, and merge into one blob when they touch.
 
 ## Install
@@ -83,7 +83,7 @@ Everything lives in `%APPDATA%\macshell\config.json` (written by the edit mode; 
 | `accentMode` | `blue` (default) or `wallpaper` (the dominant hue of the desktop wallpaper, re-read when the wallpaper changes) |
 | `profiles`, `activeProfile` | saved layouts: `{ name: { items: [...], look: {...} } }` and the checked one (the Layouts submenu of the tray) |
 
-Network is used only by the widgets that need it (weather, rates, quote, site icons of shortcut tiles) and by the update check, which runs only
+Network is used only by the widgets that need it (weather, rates, crypto, quote, site icons of shortcut tiles) and by the update check, which runs only
 when you press "Check for updates" or turn on `checkUpdates`; nothing else phones home.
 Advanced knobs are environment variables, for example `MSW_CAPTURE=gdi|dxgi` (older capture paths) and `MSW_TEXT_GAMMA`.
 

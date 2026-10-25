@@ -15,15 +15,15 @@ const CRYPTO_URL: &str = "https://api.coingecko.com/api/v3/simple/price?vs_curre
 const REFRESH_SECS: i64 = 600;
 const RETRY_SECS: i64 = 120;
 /// history window and cap
-const KEEP_SECS: i64 = 25 * 3600;
-const KEEP_MAX: usize = 200;
+pub(crate) const KEEP_SECS: i64 = 25 * 3600;
+pub(crate) const KEEP_MAX: usize = 200;
 const MAX_PAIRS: usize = 4;
 /// deeper than the palette green/red: white text stays legible on any backdrop
-const GREEN_D: Color = Color::rgb8(31, 158, 66);
-const RED_D: Color = Color::rgb8(224, 58, 48);
+pub(crate) const GREEN_D: Color = Color::rgb8(31, 158, 66);
+pub(crate) const RED_D: Color = Color::rgb8(224, 58, 48);
 const DEFAULT_PAIRS: [&str; 4] = ["USD/RUB", "EUR/RUB", "BTC/USD", "ETH/USD"];
 /// (ticker, CoinGecko id)
-const CRYPTO: &[(&str, &str)] = &[
+pub(crate) const CRYPTO: &[(&str, &str)] = &[
     ("BTC", "bitcoin"),
     ("ETH", "ethereum"),
     ("SOL", "solana"),
@@ -145,7 +145,7 @@ fn group_digits(int: &str) -> String {
 }
 
 /// 67 412 / 100,41 / 0,0123 (decimals shrink as the value grows)
-fn fmt_value(v: f64, ru: bool) -> String {
+pub(crate) fn fmt_value(v: f64, ru: bool) -> String {
     let dec = if v >= 1000.0 {
         0
     } else if v >= 1.0 {
@@ -166,7 +166,7 @@ fn fmt_value(v: f64, ru: bool) -> String {
 }
 
 /// "+1,24%" / "−0,18%"
-fn fmt_pct(c: f64, ru: bool) -> String {
+pub(crate) fn fmt_pct(c: f64, ru: bool) -> String {
     let s = format!("{:.2}", c.abs());
     let s = if ru { s.replace('.', ",") } else { s };
     let sign = if c < -0.004 {
@@ -180,7 +180,7 @@ fn fmt_pct(c: f64, ru: bool) -> String {
 }
 
 /// (colour, arrow glyph) of a change; flat = dim without an arrow
-fn change_look(c: f64) -> (Color, Option<Glyph>) {
+pub(crate) fn change_look(c: f64) -> (Color, Option<Glyph>) {
     if c > 0.004 {
         (GREEN, Some(Glyph::NetUp))
     } else if c < -0.004 {
@@ -190,9 +190,9 @@ fn change_look(c: f64) -> (Color, Option<Glyph>) {
     }
 }
 
-type Hist = Vec<(i64, f64)>;
+pub(crate) type Hist = Vec<(i64, f64)>;
 
-fn push_sample(h: &mut Hist, t: i64, v: f64) {
+pub(crate) fn push_sample(h: &mut Hist, t: i64, v: f64) {
     h.push((t, v));
     h.retain(|s| t - s.0 <= KEEP_SECS);
     if h.len() > KEEP_MAX {
@@ -202,7 +202,7 @@ fn push_sample(h: &mut Hist, t: i64, v: f64) {
 }
 
 /// at most `max` evenly spaced points, always ending with the newest sample
-fn spark(h: &[(i64, f64)], max: usize) -> Vec<f32> {
+pub(crate) fn spark(h: &[(i64, f64)], max: usize) -> Vec<f32> {
     if h.len() <= max {
         return h.iter().map(|s| s.1 as f32).collect();
     }
@@ -467,7 +467,7 @@ impl Rates {
         }
         let vt = self.value_text(cx, row.value);
         let mut size = 40.0f32;
-        while size > 22.0 && cx.measure(&vt, Style::new(size, 300), 0.0).0 > c.w {
+        while size > 22.0 && cx.measure(&vt, Style::new(size, 300).mono(), 0.0).0 > c.w {
             size -= 2.0;
         }
         cx.text(Rect::new(c.x, c.y + 22.0, c.w, 50.0), &vt, Style::new(size, 300).mono().ellipsis(), TEXT);
@@ -493,7 +493,7 @@ impl Rates {
             let vt = self.value_text(cx, row.value);
             let vw = cell.w - 62.0;
             let mut size = 22.0f32;
-            while size > 14.0 && cx.measure(&vt, Style::new(size, 300), 0.0).0 > vw {
+            while size > 14.0 && cx.measure(&vt, Style::new(size, 300).mono(), 0.0).0 > vw {
                 size -= 1.0;
             }
             cx.text(Rect::new(cell.x, cell.y + 19.0, vw, 28.0), &vt, Style::new(size, 300).mono().ellipsis(), TEXT);
@@ -516,7 +516,7 @@ impl Rates {
             let vt = self.value_text(cx, row.value);
             let vw = r.w - 204.0;
             let mut size = 24.0f32;
-            while size > 14.0 && cx.measure(&vt, Style::new(size, 300), 0.0).0 > vw {
+            while size > 14.0 && cx.measure(&vt, Style::new(size, 300).mono(), 0.0).0 > vw {
                 size -= 1.0;
             }
             cx.text(Rect::new(r.x + 204.0, r.y, vw, rh), &vt, Style::new(size, 300).mono().right().ellipsis(), TEXT);
