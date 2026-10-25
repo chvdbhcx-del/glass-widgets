@@ -239,6 +239,9 @@ pub struct Ui {
     pub appearance: AppearancePref,
     pub dim_mode: Dim,
     pub autostart: bool,
+    /// how far the gallery / the settings panel were dragged from where they open, logical px
+    pub gal_off: (f32, f32),
+    pub set_off: (f32, f32),
     groups: Vec<Group>,
     pv: HashMap<(&'static str, Size), Pv>,
     pv_bd: HashMap<(i32, i32), ID2D1Bitmap1>,
@@ -401,6 +404,8 @@ impl Ui {
             appearance: AppearancePref::default(),
             dim_mode: Dim::Auto,
             autostart: false,
+            gal_off: (0.0, 0.0),
+            set_off: (0.0, 0.0),
             groups,
             pv: HashMap::new(),
             pv_bd: HashMap::new(),
@@ -506,29 +511,54 @@ impl Ui {
         }
     }
 
-    pub fn gallery_rect(&self) -> Rect {
+    /// Where the gallery opens: bottom left, with room under it for the settings strip.
+    fn gallery_home(&self) -> Rect {
         let w = PANEL_W.min(self.mw * 0.88);
         let h = PANEL_H.min(self.mh * 0.72);
-        Rect::new((self.mw * 0.06).min(self.mw - w - 8.0).max(0.0), self.mh - self.mh * 0.06 - h, w, h)
+        Rect::new((self.mw * 0.06).min(self.mw - w - 8.0).max(0.0), self.mh - (self.mh * 0.03).max(10.0) - TB_H - 12.0 - h, w, h)
     }
 
-    /// The settings panel sits at the right edge, vertically centred: the cards (top left of the desk) stay visible to judge the look.
-    pub fn settings_rect(&self) -> Rect {
+    /// Keeps a dragged panel on the screen.
+    fn on_screen(&self, r: Rect, off: (f32, f32)) -> Rect {
+        let x = (r.x + off.0).clamp(8.0_f32.min(self.mw - r.w), (self.mw - r.w - 8.0).max(8.0));
+        let y = (r.y + off.1).clamp(8.0_f32.min(self.mh - r.h), (self.mh - r.h - 8.0).max(8.0));
+        Rect::new(x, y, r.w, r.h)
+    }
+
+    pub fn gallery_rect(&self) -> Rect {
+        self.on_screen(self.gallery_home(), self.gal_off)
+    }
+
+    /// The settings panel opens at the right edge, vertically centred: the cards (top left of the desk) stay visible to judge the look.
+    fn settings_home(&self) -> Rect {
         let w = SET_W.min(self.mw - 16.0);
         let h = (SET_TOP + (1 + LOOK.len()) as f32 * SET_ROW + 14.0 + SET_FOOT).min(self.mh - 24.0);
         Rect::new((self.mw - w - (self.mw * 0.04).max(8.0)).max(8.0), ((self.mh - h) / 2.0).max(8.0), w, h)
     }
 
-    /// The settings strip sits at the bottom, right of the gallery and level with its lower edge: clear of the card grid and of the top bar.
+    pub fn settings_rect(&self) -> Rect {
+        self.on_screen(self.settings_home(), self.set_off)
+    }
+
+    /// Drag the open panel (the settings panel while it is up, else the gallery) so that its top left is at (x, y), logical px.
+    pub fn move_panel(&mut self, x: f32, y: f32) {
+        let home = if self.settings { self.settings_home() } else { self.gallery_home() };
+        let r = self.on_screen(Rect::new(x, y, home.w, home.h), (0.0, 0.0));
+        let off = (r.x - home.x, r.y - home.y);
+        if self.settings {
+            self.set_off = off;
+        } else {
+            self.gal_off = off;
+        }
+    }
+
+    /// The settings strip sits right under the gallery and follows it; with no room below (the gallery was dragged down) it goes above.
     pub fn toolbar_rect(&self) -> Rect {
         let w = TB_W.min(self.mw - 16.0);
         let p = self.gallery_rect();
-        if p.right() + 24.0 + w + 16.0 <= self.mw {
-            Rect::new(p.right() + 24.0, p.bottom() - TB_H, w, TB_H)
-        } else {
-            // a narrow screen: the strip sits right above the gallery instead
-            Rect::new(p.x, (p.y - TB_H - 12.0).max(8.0), w, TB_H)
-        }
+        let x = (p.x + (p.w - w) / 2.0).clamp(8.0, (self.mw - w - 8.0).max(8.0));
+        let y = if p.bottom() + 12.0 + TB_H <= self.mh - 6.0 { p.bottom() + 12.0 } else { (p.y - TB_H - 12.0).max(8.0) };
+        Rect::new(x, y, w, TB_H)
     }
 
     /// Glass slider value for a pointer at canvas px `x`.
@@ -1463,9 +1493,32 @@ mod tests {
         let ui = Ui::new(Lang::Ru, 1.0, 1920.0, 1080.0);
         let p = ui.panel_rect();
         assert_eq!((p.w, p.h), (780.0, 430.0));
-        assert!((p.x - 115.2).abs() < 0.1 && (p.bottom() - (1080.0 - 64.8)).abs() < 0.1);
+        assert!((p.x - 115.2).abs() < 0.1 && (p.bottom() - (1080.0 - 32.4 - 40.0 - 12.0)).abs() < 0.1);
+        // the strip sits right under the panel, centred on it
+        let t = ui.toolbar_rect();
+        assert!((t.y - (p.bottom() + 12.0)).abs() < 0.1 && (t.cx() - p.cx()).abs() < 0.1 && t.bottom() <= 1080.0);
         let small = Ui::new(Lang::Ru, 1.0, 800.0, 500.0).panel_rect();
         assert!(small.w <= 800.0 * 0.88 + 0.01 && small.h <= 360.1 && small.right() <= 800.0);
+    }
+
+    #[test]
+    fn panels_drag_and_stay_on_screen() {
+        let mut ui = Ui::new(Lang::Ru, 1.0, 1920.0, 1080.0);
+        let home = ui.panel_rect();
+        ui.move_panel(home.x + 100.0, home.y - 50.0);
+        let p = ui.panel_rect();
+        assert!((p.x - (home.x + 100.0)).abs() < 0.1 && (p.y - (home.y - 50.0)).abs() < 0.1);
+        assert!((ui.toolbar_rect().y - (p.bottom() + 12.0)).abs() < 0.1);
+        // far off the screen: clamped, and the strip flips above the panel when there is no room below
+        ui.move_panel(5000.0, 5000.0);
+        let p = ui.panel_rect();
+        assert!(p.right() <= 1920.0 && p.bottom() <= 1080.0);
+        assert!(ui.toolbar_rect().bottom() <= p.y);
+        // the settings panel has its own position
+        ui.settings = true;
+        let s0 = ui.panel_rect();
+        ui.move_panel(10.0, 10.0);
+        assert!(ui.panel_rect().x < s0.x && ui.gallery_rect().y == p.y);
     }
 
     /// The hit map of edit mode on a real scene: card body, "−" button, gallery controls, previews, settings strip, empty desk.

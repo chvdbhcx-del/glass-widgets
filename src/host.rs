@@ -134,6 +134,9 @@ enum Press {
     Drag,
     /// pressed on a gallery preview
     Preview { k: usize, x: i32, y: i32 },
+    /// pressed on an empty part of the gallery / settings panel: dragging it. (x, y) = the pointer at the press (canvas px), (ox, oy) =
+    /// the panel's top left then (logical px)
+    Move { x: i32, y: i32, ox: f32, oy: f32 },
     /// pressed on a UI control (acts on release when still over it)
     Ui(Hit),
 }
@@ -1358,6 +1361,15 @@ impl App {
                         self.set_look_slider(i, t);
                         return;
                     }
+                    Press::Move { x: x0, y: y0, ox, oy } => {
+                        let old = self.ui.dirty_rect(&self.scene);
+                        self.ui.move_panel(ox + (x - x0) as f32 / self.s, oy + (y - y0) as f32 / self.s);
+                        self.ui.sync_panels(&mut self.scene, &self.gfx);
+                        if let (Some(a), Some(b)) = (old, self.ui.dirty_rect(&self.scene)) {
+                            self.frame(union(a, b));
+                        }
+                        return;
+                    }
                     _ => {}
                 }
                 self.set_hover(hit);
@@ -1389,6 +1401,12 @@ impl App {
                     Hit::Look(i, t) => {
                         self.press = Press::Ui(hit);
                         self.set_look_slider(i, t);
+                    }
+                    Hit::Panel => {
+                        // an empty part of the panel is a handle: drag the whole panel
+                        let p = self.ui.panel_rect();
+                        self.press = Press::Move { x, y, ox: p.x, oy: p.y };
+                        self.ui.st.focus = false;
                     }
                     Hit::None if self.ui.settings => self.press = Press::Ui(Hit::None), // a click outside the panel closes it on release
                     Hit::None => self.ui.st.focus = false,
