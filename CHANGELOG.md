@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.5] - 2026-10-25
+
+### Fixed
+- Edit mode: the jiggle of the cards was jerky. It ran at 10 fps once the gallery had opened, started at full strength on the first frame and stopped dead when the settings opened. It now runs at 30 fps and swells in and fades out in 0.4 s.
+
 ## [0.5.4] - 2026-10-25
 
 ### Changed

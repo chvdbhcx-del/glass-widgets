@@ -5,7 +5,7 @@
 //! Idle behaviour: the UI thread sits in GetMessage (kernel wait, same as MsgWaitForMultipleObjects with no handles).
 //! Wake-ups: WM_BACKDROP (only when the wallpaper pixels behind a card changed, <= --backdrop-fps), a widget schedule timer ONLY
 //! while something animates, a 100 ms cursor poll (16 ms near a card), a 500 ms fullscreen guard, a 2 s config.json poll and a 30 s day
-//! check. Edit mode adds a 100 ms jiggle timer (16 ms while a card moves) and a 200 ms gallery timer; none of them runs outside edit mode.
+//! check. Edit mode adds a 33 ms jiggle timer (16 ms while a card moves) and a 200 ms gallery timer; none of them runs outside edit mode.
 //!
 //! Coordinates: the scene canvas is the monitor (card px = monitor px); the layered window only covers `win`, the bounding box of the
 //! cards, and grows to the whole monitor while a card is dragged / settling and in edit mode.
@@ -229,6 +229,8 @@ struct App {
     prev_fg: HWND,
     reduced: bool,
     t_edit: Instant,
+    /// 0..1 strength of the edit-mode jiggle (eased in and out)
+    jig_amp: f32,
     last_anim: Instant,
     anim_period: u32,
     ui_tick: u32,
@@ -567,6 +569,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         prev_fg: HWND::default(),
         reduced: reduced0,
         t_edit: Instant::now(),
+        jig_amp: 0.0,
         last_anim: Instant::now(),
         anim_period: 0,
         ui_tick: 0,
@@ -2102,14 +2105,16 @@ impl App {
             || self.scene.cards.iter().any(|c| c.xf.lift > 0.0)
             || self.scene.fx_busy()
             || self.ui.away > 0.0
+            || self.jig_amp > 0.0 && !(self.ui.edit && !self.ui.settings && self.editing && !self.reduced)
+            || self.jig_amp < 1.0 && self.ui.edit && !self.ui.settings && self.editing && !self.reduced
     }
 
-    /// One timer drives every animation: 16 ms while something moves, 100 ms for the jiggle of a resting edit mode, off otherwise.
+    /// One timer drives every animation: 16 ms while something moves, 33 ms for the jiggle of a resting edit mode, off otherwise.
     unsafe fn arm_anim(&mut self) {
         let period = if self.anim_busy() {
             16
         } else if self.ui.edit && !self.ui.settings && !self.reduced {
-            100
+            33 // the jiggle period is 0.8 s: 100 ms steps moved a big card's edge by 2-3 px per frame
         } else {
             0
         };
@@ -2263,12 +2268,15 @@ impl App {
 
         // per-card visual transform: jiggle, lift, pop
         let jig_t = t.saturating_duration_since(self.t_edit).as_secs_f32();
-        let edit_on = self.ui.edit && !self.ui.settings && self.editing && !self.reduced;
+        // the jiggle swells in and fades out (leaving edit mode, opening the settings) instead of snapping on and off
+        let want_jig = if self.ui.edit && !self.ui.settings && self.editing && !self.reduced { 1.0 } else { 0.0 };
+        self.jig_amp = if self.reduced { want_jig } else { step_toward(self.jig_amp, want_jig, dt / 0.4) };
+        let amp = self.jig_amp * self.jig_amp * (3.0 - 2.0 * self.jig_amp);
         for i in 0..self.scene.len() {
             let c = &self.scene.cards[i];
             let dragging = self.drag.as_ref().is_some_and(|d| d.uid == c.uid);
             let lift = if dragging { (c.xf.lift + dt / 0.12).min(1.0) } else { (c.xf.lift - dt / 0.18).max(0.0) };
-            let rot = if edit_on && !dragging { ui::jiggle(i, jig_t) } else { 0.0 };
+            let rot = if amp > 0.0 && !dragging { ui::jiggle(i, jig_t) * amp } else { 0.0 };
             let xf = match self.pops.get(&c.uid) {
                 Some(p) => mat_xf(&p.at(t, reduced), rot, lift),
                 None => Xf { rot, scale: 1.0 + 0.03 * lift, alpha: 1.0, lift, blur: 0.0, sweep: -1.0 },
