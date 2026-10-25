@@ -1,6 +1,6 @@
 [package]
 name = "mswidgets"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 description = "Glass Widgets: native (no WebView) Direct2D desktop widgets for Windows with a Liquid-Glass look"
 license = "MIT"

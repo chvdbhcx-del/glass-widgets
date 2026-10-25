@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.3] - 2026-10-25
+
+### Changed
+- Calendar: the circle of today in the S grid has radius 9 and the digits sit in its middle (the ink was half a pixel right and down of the centre).
+
 ## [0.5.2] - 2026-10-25
 
 ### Changed

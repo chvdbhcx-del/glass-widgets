@@ -39,7 +39,7 @@ struct Metrics {
     num_cy: f32,
     title_size: f32,
 }
-const MS: Metrics = Metrics { head: 22.0, dow_h: 15.0, dow_size: 10.0, row: 17.0, num_size: 11.0, circ: 9.5, num_cy: 8.5, title_size: 12.0 };
+const MS: Metrics = Metrics { head: 22.0, dow_h: 15.0, dow_size: 10.0, row: 17.0, num_size: 11.0, circ: 9.0, num_cy: 8.5, title_size: 12.0 };
 const ML: Metrics = Metrics { head: 30.0, dow_h: 20.0, dow_size: 12.0, row: 28.0, num_size: 15.0, circ: 14.0, num_cy: 12.5, title_size: 13.0 };
 
 fn view_month(now: &Now, offset: i32) -> (i32, u32) {
@@ -75,7 +75,9 @@ fn month_block(cx: &Cx, x: f32, y: f32, w: f32, m: &Metrics, view: (i32, u32), t
         let st = Style::new(m.num_size, 500).center();
         if current && day == now.d {
             cx.circle((ccx, ccy), m.circ, TEXT);
-            cx.text(cell, &num, st.weight(700), INK);
+            // the ink of the digits sits about half a pixel right of / below the middle of its text box (measured on the rendered disk): nudge it back
+            let nudge = if m.num_size < 13.0 { (-0.35, -0.3) } else { (-0.35, -0.35) }; // measured on the rendered discs
+            cx.text(Rect::new(cell.x + nudge.0, cell.y + nudge.1, cell.w, cell.h), &num, st.weight(700), INK);
         } else {
             let past = (vy, vm, day) < (now.y, now.mo, now.d);
             // like Apple's calendar: past days and the weekend columns are dimmer
