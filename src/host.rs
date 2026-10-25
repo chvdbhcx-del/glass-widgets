@@ -1,0 +1,2493 @@
+//! The one top-level layered window, timers, presenting, click-through toggling, fullscreen guard, `--bench` and everything about
+//! arranging the desk: drag & drop with a spring settle, the context menu, edit mode (jiggle, "−", dim, settings strip), the gallery
+//! ("Edit Widgets" with live previews and a search box) and persistence of the layout / settings.
+//!
+//! Idle behaviour: the UI thread sits in GetMessage (kernel wait, same as MsgWaitForMultipleObjects with no handles).
+//! Wake-ups: WM_BACKDROP (only when the wallpaper pixels behind a card changed, <= --backdrop-fps), a widget schedule timer ONLY
+//! while something animates, a 100 ms cursor poll (16 ms near a card), a 500 ms fullscreen guard, a 2 s config.json poll and a 30 s day
+//! check. Edit mode adds a 100 ms jiggle timer (16 ms while a card moves) and a 200 ms gallery timer; none of them runs outside edit mode.
+//!
+//! Coordinates: the scene canvas is the monitor (card px = monitor px); the layered window only covers `win`, the bounding box of the
+//! cards, and grows to the whole monitor while a card is dragged / settling and in edit mode.
+use crate::backdrop::*;
+use crate::cards::*;
+use crate::gfx::*;
+use crate::grid;
+use crate::layout;
+use crate::motion::{self, MatState};
+use crate::ui::{self, Hit, Ui};
+use crate::widget::{Button, Lang, MouseKind, Now, Rect, Size, WM_WIDGET};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::time::{Duration, Instant, SystemTime};
+use windows::core::{w, Result, PCWSTR};
+use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcess, GetCurrentThreadId, GetProcessTimes};
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+const WM_MOUSELEAVE: u32 = 0x02A3; // Win32_UI_Controls in the windows crate; not worth the feature
+const WM_DPICHANGED: u32 = 0x02E0;
+/// posted by the mouse handler: run the context menu of card `wparam` at screen point `lparam` (outside of the App borrow)
+const WM_MENU: u32 = WM_APP + 3;
+const T_HIT: usize = 1;
+const T_GUARD: usize = 2;
+const T_TICK: usize = 3;
+const T_DAY: usize = 4;
+const T_BENCH: usize = 5;
+const T_ANIM: usize = 6;
+const T_UI: usize = 7;
+const T_CFG: usize = 8;
+const T_SHRINK: usize = 9;
+const T_TOAST: usize = 10;
+const T_REPLACE: usize = 11;
+const NEAR_PX: i32 = 8;
+/// bits 62 / 63 of the backdrop dirty mask belong to the gallery panel and the settings strip
+const BIT_GALLERY: u64 = 1 << 62;
+const BIT_TOOLBAR: u64 = 1 << 63;
+const MAX_CARDS: usize = 62;
+const DRAG_PX: i32 = 5;
+const DIM_ALPHA: f32 = 0.28;
+
+pub struct Opts {
+    pub appearance: Option<crate::motion::AppearancePref>,
+    pub fps: u32,
+    pub bench: Option<u32>,
+    pub scale: Option<f32>,
+    pub no_config: bool,
+    pub time: Option<Now>,
+    pub no_hotkeys: bool,
+}
+
+#[derive(Default)]
+struct Stats {
+    backdrop_batches: u64,
+    card_redraws: u64,
+    clock_frames: u64,
+    present_ms: f64,
+    render_ms: f64,
+    lum_reads: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Spring {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    tx: f32,
+    ty: f32,
+}
+impl Spring {
+    /// One integration step (semi-implicit Euler, two substeps); true when it came to rest on the target.
+    fn step(&mut self, dt: f32) -> bool {
+        const K: f32 = 420.0;
+        const C: f32 = 30.0;
+        let h = dt / 2.0;
+        for _ in 0..2 {
+            self.vx += (K * (self.tx - self.x) - C * self.vx) * h;
+            self.vy += (K * (self.ty - self.y) - C * self.vy) * h;
+            self.x += self.vx * h;
+            self.y += self.vy * h;
+        }
+        let done = (self.tx - self.x).abs() < 0.4 && (self.ty - self.y).abs() < 0.4 && self.vx.abs() < 14.0 && self.vy.abs() < 14.0;
+        if done {
+            self.x = self.tx;
+            self.y = self.ty;
+        }
+        done
+    }
+}
+
+/// A card that materialises (condenses out of blur, rim sweep) or dematerialises; `t0` may lie in the future (staggered start-up).
+#[derive(Clone, Copy)]
+struct Pop {
+    t0: Instant,
+    out: bool,
+}
+impl Pop {
+    fn at(&self, now: Instant, reduced: bool) -> MatState {
+        motion::materialize(now.saturating_duration_since(self.t0).as_secs_f32(), self.out, reduced)
+    }
+}
+
+
+
+#[derive(Clone, Copy, PartialEq)]
+enum Press {
+    None,
+    /// a widget got the press (it reported a change): no drag
+    Widget(usize),
+    /// pressed on a card, not yet moved far enough to drag
+    Cand { uid: usize, x: i32, y: i32 },
+    Drag,
+    /// pressed on a gallery preview
+    Preview { k: usize, x: i32, y: i32 },
+    /// pressed on a UI control (acts on release when still over it)
+    Ui(Hit),
+}
+
+struct Drag {
+    uid: usize,
+    /// pointer offset inside the card, px
+    off: (i32, i32),
+    /// pointer, monitor px
+    cur: (i32, i32),
+    /// the free cell the card would land in
+    target: Option<grid::Place>,
+    /// the card was created by the gallery for this drag (removed again when dropped nowhere)
+    fresh: bool,
+    /// cell the card came from (None for a fresh card)
+    from: Option<(i32, i32)>,
+    /// card velocity px/s (low-passed): drives the light inertia
+    vel: (f32, f32),
+}
+
+struct MenuReq {
+    uid: usize,
+    x: i32,
+    y: i32,
+    sizes: Vec<Size>,
+    cur: Size,
+    editing: bool,
+    lang: Lang,
+}
+
+struct App {
+    gfx: Gfx,
+    scene: Scene,
+    ui: Ui,
+    backdrop: Option<Box<dyn Backdrop>>,
+    hwnd: HWND,
+    mem_dc: HDC,
+    dib: HBITMAP,
+    bits: *mut u8,
+    mon: RECT,  // monitor, desktop px
+    work: RECT, // work area, desktop px
+    s: f32,
+    dims: grid::Dims,
+    win: RECT, // window rect inside the canvas (monitor px)
+    win_dirty: bool,
+    items: Vec<layout::Item>, // the stored layout (shown cards + the ones without room)
+    settings: layout::Settings,
+    cfg_mtime: Option<SystemTime>,
+    own_write: bool,
+    hot: Option<usize>,     // card under the cursor (mouse events)
+    pressed: Option<usize>, // card that owns a pressed button (mouse capture)
+    press: Press,
+    drag: Option<Drag>,
+    springs: HashMap<usize, Spring>,
+    pops: HashMap<usize, Pop>,
+    tracking: bool,
+    interactive: bool,
+    near: bool,
+    visible: bool,
+    first_present: bool,
+    last_lum: Instant,
+    last_day: u32,
+    guard_n: u32,
+    fixed_time: Option<Now>,
+    fps: u32,
+    use_dupl: bool,
+    // edit mode
+    editing: bool,
+    gal_t: f32,
+    dim_t: f32,
+    prev_fg: HWND,
+    reduced: bool,
+    t_edit: Instant,
+    last_anim: Instant,
+    anim_period: u32,
+    ui_tick: u32,
+    esc_down: bool,
+    in_menu: bool,
+    app_front: bool,
+    /// the layer has been the foreground window at least once in this edit session (else no auto-exit on focus loss)
+    was_fg: bool,
+    st: Stats,
+    bench: Option<u32>,
+    t0: Instant,
+    cpu0: u64,
+    cpu_mark: Option<(Instant, u64)>,
+}
+
+thread_local! { static APP: RefCell<Option<App>> = const { RefCell::new(None) }; }
+
+pub fn run(o: Opts) -> i32 {
+    match unsafe { setup(&o) } {
+        Ok(()) => {
+            unsafe {
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            APP.with(|a| a.borrow_mut().take()); // stops the capture thread
+            0
+        }
+        Err(e) => {
+            eprintln!("mswidgets: start failed: {e}");
+            1
+        }
+    }
+}
+
+fn reduced_motion() -> bool {
+    unsafe {
+        let mut on = BOOL(1);
+        let ok = SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut BOOL as *mut std::ffi::c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).is_ok();
+        ok && !on.as_bool()
+    }
+}
+
+struct Monitor {
+    out: Option<OutputInfo>,
+    rect: RECT,
+    work: RECT,
+}
+
+unsafe fn monitor() -> Monitor {
+    let out = find_primary_output();
+    let rect = match &out {
+        Some(x) => x.rect,
+        None => RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) },
+    };
+    let mut work = rect;
+    let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut work as *mut RECT as *mut std::ffi::c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+    Monitor { out, rect, work }
+}
+
+fn grid_dims(mon: &RECT, work: &RECT, s: f32) -> grid::Dims {
+    grid::dims((mon.right - mon.left) as f32 / s, (work.bottom - mon.top) as f32 / s)
+}
+
+/// Lay the stored items out on the grid: every item that has room gets a CardSpec (items without room stay stored, not drawn);
+/// the stored col / row are updated to what is shown.
+fn place_items(items: &mut [layout::Item], dims: &grid::Dims, s: f32) -> Vec<CardSpec> {
+    let res = grid::resolve_all(dims, &items.iter().map(|i| (i.size, i.col as i32, i.row as i32)).collect::<Vec<_>>());
+    let mut out = Vec::new();
+    for (it, p) in items.iter_mut().zip(res) {
+        let Some(p) = p else { continue };
+        if out.len() >= MAX_CARDS {
+            break;
+        }
+        it.col = p.col as u32;
+        it.row = p.row as u32;
+        let (x, y, w, h) = cell_rect(it.size, p.col, p.row, s);
+        out.push(CardSpec { id: it.id.clone(), type_id: it.type_id.clone(), size: it.size, cfg: it.cfg.clone(), x, y, w, h });
+    }
+    out
+}
+
+unsafe fn make_backdrop(gfx: &Gfx, mon: &Monitor, w: i32, h: i32, live: bool, fps: u32, rects: &[RECT], margin: i32) -> Box<dyn Backdrop> {
+    if live {
+        // Graphics Capture of the desktop window is the default (the layer does not see itself, so it can stay visible to screenshots);
+        // `MSW_CAPTURE=gdi` selects GDI region capture of the screen (the layer is then excluded from captures), `dxgi` Desktop Duplication
+        let pick = std::env::var("MSW_CAPTURE").unwrap_or_default().to_ascii_lowercase();
+        if let (true, Some(x), false) = (pick.is_empty() || pick == "wgc", &mon.out, gfx.warp) {
+            match WgcBackdrop::new(gfx, x, rects, margin, fps) {
+                Ok(d) => return Box::new(d),
+                Err(e) => eprintln!("mswidgets: graphics capture unavailable ({e}), trying GDI"),
+            }
+        }
+        if pick != "dxgi" && !gfx.warp {
+            match GdiBackdrop::new(gfx, mon.rect, rects, margin, fps) {
+                Ok(d) => return Box::new(d),
+                Err(e) => eprintln!("mswidgets: GDI capture unavailable ({e}), trying duplication"),
+            }
+        }
+        if let (Some(x), false) = (&mon.out, gfx.warp) {
+            match DuplBackdrop::new(gfx, x, RECT { left: 0, top: 0, right: w, bottom: h }, rects, margin, fps) {
+                Ok(d) => return Box::new(d),
+                Err(e) => eprintln!("mswidgets: desktop duplication unavailable ({e}), plain base"),
+            }
+        } else {
+            eprintln!("mswidgets: no hardware output found, plain base");
+        }
+    }
+    match PlainBackdrop::new(gfx, w as u32, h as u32) {
+        Ok(p) => Box::new(p),
+        Err(e) => {
+            eprintln!("mswidgets: plain backdrop: {e}");
+            std::process::exit(1)
+        }
+    }
+}
+
+unsafe fn setup(o: &Opts) -> Result<()> {
+    let mon = monitor();
+    let (mw, mh) = (mon.rect.right - mon.rect.left, mon.rect.bottom - mon.rect.top);
+    let gfx = match Gfx::new(mon.out.as_ref().map(|x| &x.adapter)) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("mswidgets: device on the output adapter failed ({e}), default adapter");
+            Gfx::new(None)?
+        }
+    };
+    let s = o.scale.unwrap_or(GetDpiForSystem() as f32 / 96.0);
+    let settings = layout::read_settings();
+    let dims = grid_dims(&mon.rect, &mon.work, s);
+
+    let mut items = layout::load(!o.no_config);
+    let specs = place_items(&mut items, &dims, s);
+    let m = (MARGIN * s).round() as i32;
+    let card_rects: Vec<RECT> = specs.iter().map(|c| c.rect()).collect();
+    let win = window_rect(&card_rects, m, mw, mh);
+
+    // window: layered, tool window, never activated, click-through until the cursor is over a card
+    let hinst = GetModuleHandleW(None)?;
+    let cls = w!("MsWidgetsNative");
+    RegisterClassExW(&WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32, lpfnWndProc: Some(wndproc), hInstance: hinst.into(), lpszClassName: cls, hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(), ..Default::default() });
+    let hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+        cls,
+        w!("mswidgets"),
+        WS_POPUP,
+        mon.rect.left + win.left,
+        mon.rect.top + win.top,
+        (win.right - win.left).max(8),
+        (win.bottom - win.top).max(8),
+        None,
+        None,
+        hinst,
+        None,
+    )?;
+    // backdrop: graphics capture of the wallpaper window, else screen capture, else a plain dark translucent base
+    let regions = region_list(&card_rects, None, None);
+    let backdrop = make_backdrop(&gfx, &mon, mw, mh, settings.live, o.fps, &regions, m);
+    // a backdrop that reads the SCREEN would see the layer itself: keep the window out of every capture then (screenshots miss it);
+    // `MSW_NO_EXCLUDE=1` (diagnostics only) skips that
+    if backdrop.name() != "desktop-wgc" && std::env::var_os("MSW_NO_EXCLUDE").is_none() && SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_err() {
+        eprintln!("mswidgets: WDA_EXCLUDEFROMCAPTURE refused (needs Windows 10 2004+)");
+    }
+    let dupl_ok = backdrop.name().starts_with("desktop");
+    backdrop.set_hwnd(hwnd);
+    eprintln!("mswidgets: backdrop = {}, scale {s:.2}, monitor {mw}x{mh}, window {}x{} at {},{}", backdrop.name(), win.right - win.left, win.bottom - win.top, mon.rect.left + win.left, mon.rect.top + win.top);
+
+    let env = SceneEnv { preview: false, hwnd: hwnd.0 as isize, lang: layout::lang(), utc_off: crate::sys::local_utc_offset_min() };
+    let mut scene = Scene::new(&gfx, mw, mh, s, settings.glass, backdrop.bitmap(), &specs, &env)?;
+    scene.set_appearance_pref(o.appearance.unwrap_or(settings.appearance));
+    // start-up: every card condenses out of the glass (staggered), a plain fade with reduced motion
+    let reduced0 = reduced_motion();
+    let mut pops = HashMap::new();
+    let t_start = Instant::now();
+    for i in 0..scene.len() {
+        let uid = scene.cards[i].uid;
+        pops.insert(uid, Pop { t0: t_start + Duration::from_millis(70 * i as u64), out: false });
+        scene.set_xf(i, mat_xf(&motion::materialize(0.0, false, reduced0), 0.0, 0.0));
+    }
+    let t0 = o.time.unwrap_or_else(Now::local);
+    for i in 0..scene.len() {
+        scene.tick_card(&gfx, i, &t0); // first tick: widgets start their jobs / report their schedule
+    }
+    let mut ui = Ui::new(env.lang, s, mw as f32 / s, mh as f32 / s);
+    ui.glass = settings.glass;
+    ui.live = settings.live;
+
+    // premultiplied BGRA DIB the layered window is fed from (only the dirty rect is copied per frame)
+    let screen = GetDC(None);
+    let mem_dc = CreateCompatibleDC(screen);
+    ReleaseDC(None, screen);
+    let (dib, bits) = new_dib(mem_dc, win.right - win.left, win.bottom - win.top)?;
+    SelectObject(mem_dc, dib);
+
+    let mut app = App {
+        gfx,
+        scene,
+        ui,
+        backdrop: Some(backdrop),
+        hwnd,
+        mem_dc,
+        dib,
+        bits,
+        mon: mon.rect,
+        work: mon.work,
+        s,
+        dims,
+        win,
+        win_dirty: true,
+        items,
+        settings,
+        cfg_mtime: layout::config_mtime(),
+        own_write: false,
+        hot: None,
+        pressed: None,
+        press: Press::None,
+        drag: None,
+        springs: HashMap::new(),
+        pops,
+        tracking: false,
+        interactive: false,
+        near: false,
+        visible: false,
+        first_present: true,
+        last_lum: Instant::now() - Duration::from_secs(1),
+        last_day: 0,
+        guard_n: 0,
+        fixed_time: o.time,
+        fps: o.fps,
+        use_dupl: dupl_ok,
+        editing: false,
+        gal_t: 0.0,
+        dim_t: 0.0,
+        prev_fg: HWND::default(),
+        reduced: reduced0,
+        t_edit: Instant::now(),
+        last_anim: Instant::now(),
+        anim_period: 0,
+        ui_tick: 0,
+        esc_down: false,
+        in_menu: false,
+        app_front: false,
+        was_fg: false,
+        st: Stats::default(),
+        bench: o.bench,
+        t0: Instant::now(),
+        cpu0: cpu_time_100ns(),
+        cpu_mark: None,
+    };
+    // First frame is drawn BEFORE the capture thread exists (probe staging and layers get created while the GPU is quiet: the very first
+    // luminance probe racing the first full-texture copy of the duplication thread used to wedge the start). Then the capture starts,
+    // we wait (<= 600 ms) for its first copy so the window never shows an empty backdrop, and redraw once with the real pixels.
+    app.sync_regions();
+    let all = app.all_mask();
+    app.redraw(all, true);
+    if let Some(b) = &app.backdrop {
+        b.start();
+    }
+    if dupl_ok {
+        // wait (<= 600 ms) for the first duplication copy so the window never shows an empty backdrop, then redraw with the real pixels
+        let t = Instant::now();
+        while app.backdrop.as_ref().map_or(0, |b| b.take_dirty()) == 0 && t.elapsed() < Duration::from_millis(600) {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        app.redraw(all, true);
+    }
+    app.scene.trim_staging();
+    app.show();
+    app.update_dim();
+
+    if !o.no_hotkeys {
+        if RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'Q' as u32).is_err() {
+            eprintln!("mswidgets: Ctrl+Alt+Q could not be registered (macshell holds it?); close the window to quit");
+        }
+        if RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W' as u32).is_err() {
+            eprintln!("mswidgets: Ctrl+Alt+W could not be registered (macshell holds it?); edit mode via the context menu only");
+        }
+    }
+    SetTimer(hwnd, T_HIT, 100, None);
+    SetTimer(hwnd, T_GUARD, 500, None);
+    SetTimer(hwnd, T_DAY, 30_000, None);
+    SetTimer(hwnd, T_CFG, 2_000, None);
+    if let Some(sec) = o.bench {
+        SetTimer(hwnd, T_BENCH, sec * 1000, None);
+    }
+    APP.with(|a| *a.borrow_mut() = Some(app));
+    APP.with(|a| {
+        if let Some(app) = a.borrow_mut().as_mut() {
+            app.update_tick_timer();
+            app.last_anim = Instant::now();
+            app.arm_anim(); // the start-up materialisation
+        }
+    });
+    Ok(())
+}
+
+/// Bounding box of the card layers (+ margin) clipped to the canvas.
+fn window_rect(cards: &[RECT], m: i32, mw: i32, mh: i32) -> RECT {
+    let bb = cards.iter().copied().reduce(union).unwrap_or(RECT { left: 0, top: 0, right: 8, bottom: 8 });
+    clip(RECT { left: bb.left - m, top: bb.top - m, right: bb.right + m, bottom: bb.bottom + m }, mw, mh)
+}
+
+unsafe fn new_dib(dc: HDC, w: i32, h: i32) -> Result<(HBITMAP, *mut u8)> {
+    let bmi = BITMAPINFO { bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: w.max(1), biHeight: -h.max(1), biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() }, ..Default::default() };
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    let dib = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)?;
+    Ok((dib, bits as *mut u8))
+}
+
+/// The 64 backdrop regions: card i = bit i, the gallery = bit 62, the settings strip = bit 63 (unused ones are empty rectangles).
+fn region_list(cards: &[RECT], gallery: Option<RECT>, toolbar: Option<RECT>) -> Vec<RECT> {
+    let mut v = vec![RECT::default(); 64];
+    for (i, c) in cards.iter().take(MAX_CARDS).enumerate() {
+        v[i] = *c;
+    }
+    if let Some(g) = gallery {
+        v[62] = g;
+    }
+    if let Some(t) = toolbar {
+        v[63] = t;
+    }
+    v
+}
+
+/// Packed screen point -> (x, y) (signed 16 bit each, as in mouse messages).
+fn unpack(lp: isize) -> (i32, i32) {
+    ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32)
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_TIMER | WM_BACKDROP | WM_HOTKEY | WM_WIDGET | WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
+            with_app(|app| app.on_msg(msg, wp.0));
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_MOUSELEAVE | WM_CAPTURECHANGED => {
+            with_app(|app| app.on_mouse(msg, wp, lp));
+            LRESULT(0)
+        }
+        WM_KEYDOWN | WM_CHAR | WM_SYSKEYDOWN => {
+            with_app(|app| app.on_key(msg, wp.0));
+            if msg == WM_SYSKEYDOWN {
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            LRESULT(0)
+        }
+        WM_MENU => {
+            // the popup menu is modal: it must run without the App borrowed, the result is applied afterwards
+            let req = APP.with(|a| a.try_borrow_mut().ok().and_then(|mut g| g.as_mut().and_then(|app| app.menu_request(wp.0, lp.0))));
+            if let Some(req) = req {
+                let cmd = run_menu(hwnd, &req);
+                with_app(|app| app.menu_result(&req, cmd));
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEACTIVATE => {
+            // the layer never takes the foreground by a click, except while editing (the search box needs the keyboard)
+            if APP.with(|a| a.try_borrow().ok().is_some_and(|g| g.as_ref().is_some_and(|app| app.ui.edit))) {
+                DefWindowProcW(hwnd, msg, wp, lp)
+            } else {
+                LRESULT(MA_NOACTIVATE as isize)
+            }
+        }
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// Run `f` on the App when it is not borrowed already (SetWindowPos / UpdateLayeredWindow can re-enter us with messages we do not
+/// handle anyway); a panic in the host code is logged and the Direct2D context is put back in a sane state instead of killing the process.
+fn with_app(f: impl FnOnce(&mut App)) {
+    APP.with(|a| {
+        if let Ok(mut g) = a.try_borrow_mut() {
+            if let Some(app) = g.as_mut() {
+                if catch_unwind(AssertUnwindSafe(|| f(app))).is_err() {
+                    eprintln!("mswidgets: internal error caught (see above); continuing");
+                    unsafe {
+                        let _ = app.gfx.dc.EndDraw(None, None);
+                        app.gfx.dc.SetTarget(None::<&windows::Win32::Graphics::Direct2D::ID2D1Image>);
+                        let _ = ReleaseCapture();
+                    }
+                    app.press = Press::None;
+                    app.pressed = None;
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------- context menu (native popup)
+
+const CMD_EDIT: usize = 1;
+const CMD_SIZE: usize = 10; // + 0 / 1 / 2 for S / M / L
+const CMD_DELETE: usize = 20;
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+
+unsafe fn run_menu(hwnd: HWND, r: &MenuReq) -> usize {
+    let t = |ru: &'static str, en: &'static str| wide(r.lang.pick(ru, en));
+    let Ok(menu) = CreatePopupMenu() else { return 0 };
+    let Ok(sub) = CreatePopupMenu() else {
+        let _ = DestroyMenu(menu);
+        return 0;
+    };
+    let label = if r.editing { t("Готово", "Done") } else { t("Изменить виджеты…", "Edit Widgets…") };
+    let _ = AppendMenuW(menu, MF_STRING, CMD_EDIT, PCWSTR(label.as_ptr()));
+    let sizes = [(Size::S, t("Маленький (S)", "Small (S)")), (Size::M, t("Средний (M)", "Medium (M)")), (Size::L, t("Большой (L)", "Large (L)"))];
+    for (i, (sz, name)) in sizes.iter().enumerate() {
+        if r.sizes.contains(sz) {
+            let flags = MF_STRING | if *sz == r.cur { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(sub, flags, CMD_SIZE + i, PCWSTR(name.as_ptr()));
+        }
+    }
+    let size_label = t("Размер", "Size");
+    let _ = AppendMenuW(menu, MF_POPUP | if r.sizes.len() > 1 { MF_ENABLED } else { MF_GRAYED }, sub.0 as usize, PCWSTR(size_label.as_ptr()));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let del = t("Удалить виджет", "Remove Widget");
+    let _ = AppendMenuW(menu, MF_STRING, CMD_DELETE, PCWSTR(del.as_ptr()));
+    // the owner must be foreground, else a click elsewhere does not close the menu
+    let prev = GetForegroundWindow();
+    force_foreground(hwnd);
+    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, r.x, r.y, 0, hwnd, None).0 as usize;
+    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+    let _ = DestroyMenu(menu); // destroys the submenu too
+    if !prev.0.is_null() && prev != hwnd && !r.editing && GetForegroundWindow() == hwnd {
+        let _ = SetForegroundWindow(prev);
+    }
+    cmd
+}
+
+/// Borrow the foreground thread's input state so SetForegroundWindow is allowed (same trick as input.rs).
+unsafe fn force_foreground(hwnd: HWND) {
+    let fg = GetForegroundWindow();
+    let (me, theirs) = (GetCurrentThreadId(), GetWindowThreadProcessId(fg, None));
+    let attached = theirs != 0 && theirs != me && AttachThreadInput(me, theirs, true).as_bool();
+    let _ = SetForegroundWindow(hwnd);
+    let _ = BringWindowToTop(hwnd);
+    if attached {
+        let _ = AttachThreadInput(me, theirs, false);
+    }
+}
+
+fn clipboard_text(hwnd: HWND) -> Option<String> {
+    unsafe {
+        OpenClipboard(hwnd).ok()?;
+        let r = (|| {
+            let h = GetClipboardData(13).ok()?; // CF_UNICODETEXT
+            let p = windows::Win32::System::Memory::GlobalLock(windows::Win32::Foundation::HGLOBAL(h.0)) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            let mut n = 0usize;
+            while *p.add(n) != 0 && n < 4096 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+            let _ = windows::Win32::System::Memory::GlobalUnlock(windows::Win32::Foundation::HGLOBAL(h.0));
+            Some(s)
+        })();
+        let _ = CloseClipboard();
+        r
+    }
+}
+
+// ---------------------------------------------------------------- the host
+
+impl App {
+    fn now(&self) -> Now {
+        self.fixed_time.unwrap_or_else(Now::local)
+    }
+
+    fn ext(&self) -> i32 {
+        (60.0 * self.s) as i32
+    }
+
+    fn bd(&self) -> &dyn Backdrop {
+        self.backdrop.as_deref().expect("backdrop present")
+    }
+
+    unsafe fn on_msg(&mut self, msg: u32, id: usize) {
+        match (msg, id) {
+            (WM_HOTKEY, 2) => {
+                if self.editing {
+                    self.leave_edit();
+                } else {
+                    self.enter_edit();
+                }
+            }
+            (WM_HOTKEY, _) => {
+                let _ = DestroyWindow(self.hwnd);
+            }
+            (WM_BACKDROP, _) => {
+                let mask = self.bd().take_dirty();
+                if mask != 0 && self.visible {
+                    self.redraw(mask, false);
+                }
+            }
+            (WM_WIDGET, uid) => self.on_job(uid),
+            (WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE, _) => {
+                SetTimer(self.hwnd, T_REPLACE, 600, None); // debounce: a mode switch sends a burst
+            }
+            (_, T_TICK) => self.tick(),
+            (_, T_HIT) => self.hit_test(),
+            (_, T_GUARD) => self.guard(),
+            (_, T_ANIM) => self.anim_step(),
+            (_, T_UI) => self.ui_timer(),
+            (_, T_CFG) => self.poll_config(),
+            (_, T_SHRINK) => {
+                let _ = KillTimer(self.hwnd, T_SHRINK);
+                self.fit_window();
+            }
+            (_, T_TOAST) => {
+                let _ = KillTimer(self.hwnd, T_TOAST);
+                self.ui.toast = None;
+                let d = self.toast_rect();
+                self.frame(d);
+            }
+            (_, T_REPLACE) => {
+                let _ = KillTimer(self.hwnd, T_REPLACE);
+                self.replace_monitor();
+            }
+            (_, T_DAY) => {
+                if self.now().day_key() != self.last_day && self.visible {
+                    let all = self.all_mask();
+                    self.redraw(all, false);
+                }
+            }
+            (_, T_BENCH) => {
+                self.report();
+                let _ = DestroyWindow(self.hwnd);
+            }
+            _ => {}
+        }
+        if let (Some(b), None) = (self.bench, self.cpu_mark) {
+            if b > 6 && self.t0.elapsed() > Duration::from_secs(3) {
+                self.cpu_mark = Some((Instant::now(), cpu_time_100ns()));
+            }
+        }
+    }
+
+    fn all_mask(&self) -> u64 {
+        (1u64 << self.scene.len().min(MAX_CARDS)) - 1
+    }
+
+    fn card_rects(&self) -> Vec<RECT> {
+        self.scene.card_rects()
+    }
+
+    fn all_dirty(&self) -> RECT {
+        let mut d = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        for i in 0..self.scene.len() {
+            d = if d.right == 0 { self.scene.layer_rect_ext(i, self.ext()) } else { union(d, self.scene.layer_rect_ext(i, self.ext())) };
+        }
+        if let Some(u) = self.ui.dirty_rect(&self.scene) {
+            d = if d.right == 0 { u } else { union(d, u) };
+        }
+        d
+    }
+
+    // ------------------------------------------------ backdrop regions, window geometry
+
+    fn sync_regions(&self) {
+        let s = self.s;
+        let px = |r: Rect| RECT { left: (r.x * s) as i32, top: (r.y * s) as i32, right: (r.right() * s).ceil() as i32, bottom: (r.bottom() * s).ceil() as i32 };
+        let g = (self.ui.edit && self.ui.gallery).then(|| px(self.ui.panel_rect()));
+        let t = self.ui.edit.then(|| px(self.ui.toolbar_rect()));
+        if let Some(b) = &self.backdrop {
+            b.set_regions(&region_list(&self.card_rects(), g, t));
+        }
+    }
+
+    /// Window = whole monitor while editing / dragging / settling, else the card bounding box.
+    fn want_full(&self) -> bool {
+        self.ui.edit || self.drag.is_some() || !self.springs.is_empty() || self.in_menu
+    }
+
+    unsafe fn desired_window(&self) -> RECT {
+        let (mw, mh) = (self.scene.w, self.scene.h);
+        if self.want_full() {
+            return RECT { left: 0, top: 0, right: mw, bottom: mh };
+        }
+        window_rect(&self.card_rects(), self.scene.margin(), mw, mh)
+    }
+
+    /// Resize the layered window to `r` (canvas px): a new DIB, a full present.
+    unsafe fn set_window(&mut self, r: RECT) {
+        if r.left == self.win.left && r.top == self.win.top && r.right == self.win.right && r.bottom == self.win.bottom {
+            return;
+        }
+        match new_dib(self.mem_dc, r.right - r.left, r.bottom - r.top) {
+            Ok((dib, bits)) => {
+                let old = SelectObject(self.mem_dc, dib);
+                let _ = old;
+                let _ = DeleteObject(self.dib);
+                self.dib = dib;
+                self.bits = bits;
+                self.win = r;
+                self.win_dirty = true;
+                self.present_full();
+            }
+            Err(e) => eprintln!("mswidgets: window bitmap: {e}"),
+        }
+    }
+
+    /// Back to the bounding box once nothing needs the whole monitor any more.
+    unsafe fn fit_window(&mut self) {
+        if self.want_full() {
+            return;
+        }
+        if self.scene.cards.iter().any(|c| !c.xf.is_id()) {
+            let ids: Vec<usize> = (0..self.scene.len()).collect();
+            for i in ids {
+                self.scene.set_xf(i, Xf::ID);
+            }
+        }
+        self.scene.release_scratch();
+        self.scene.trim_staging();
+        let r = self.desired_window();
+        self.set_window(r);
+    }
+
+    // ------------------------------------------------ rendering
+
+    /// Re-render the cards in `mask` (their backdrop changed), then present the union of their layers.
+    unsafe fn redraw(&mut self, mask: u64, force_lum: bool) {
+        let t = Instant::now();
+        let now = self.now();
+        // luminance at most twice a second (from an 8x8 GPU downscale), otherwise the previous value is reused
+        if force_lum || self.last_lum.elapsed() >= Duration::from_millis(500) {
+            self.last_lum = Instant::now();
+            if let Err(e) = self.scene.measure_lum(&self.gfx, mask, !force_lum) {
+                eprintln!("mswidgets: luminance probe: {e}");
+            } else {
+                self.st.lum_reads += 1;
+            }
+        }
+        let mut dirty: Option<RECT> = None;
+        let add = |d: &mut Option<RECT>, r: RECT| *d = Some(d.map_or(r, |x| union(x, r)));
+        for i in 0..self.scene.cards.len().min(MAX_CARDS) {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            if let Err(e) = self.scene.render_card(&self.gfx, i, &now) {
+                eprintln!("mswidgets: render card {i}: {e}");
+                continue;
+            }
+            self.st.card_redraws += 1;
+            add(&mut dirty, self.scene.layer_rect_ext(i, if self.ui.edit { self.ext() } else { 0 }));
+        }
+        if self.scene.fx_busy() {
+            // a card's appearance flipped (or is still fading): cross-fade it
+            self.last_anim = Instant::now();
+            self.arm_anim();
+        }
+        for (bit, slot) in [(BIT_GALLERY, ui::SLOT_GALLERY), (BIT_TOOLBAR, ui::SLOT_TOOLBAR)] {
+            if mask & bit != 0 && self.ui.edit {
+                if let Err(e) = self.scene.render_panel(&self.gfx, slot) {
+                    eprintln!("mswidgets: panel {slot}: {e}");
+                }
+                if let Some(u) = self.ui.dirty_rect(&self.scene) {
+                    add(&mut dirty, u);
+                }
+            }
+        }
+        self.last_day = now.day_key();
+        self.st.backdrop_batches += 1;
+        if let Some(d) = dirty {
+            self.frame(d);
+        }
+        self.st.render_ms += t.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    /// Compose the dirty rectangle `d` (canvas px) of the scene + the host UI and present it.
+    unsafe fn frame(&mut self, d: RECT) {
+        let d = clip(d, self.scene.w, self.scene.h);
+        if d.right <= d.left || d.bottom <= d.top {
+            return;
+        }
+        let now = self.now();
+        if let Err(e) = self.scene.prepare(&self.gfx, d, &now) {
+            eprintln!("mswidgets: prepare: {e}");
+            return;
+        }
+        self.scene.begin(&self.gfx, d, None);
+        if self.ui.dim > 0.002 || self.ui.placeholder.is_some() {
+            self.ui.draw_pre(&self.gfx, d);
+        }
+        self.scene.draw_cards(&self.gfx, d, &now);
+        if self.ui.edit || self.ui.toast.is_some() {
+            self.ui.draw_post(&self.scene, &self.gfx, &now, d);
+        }
+        if let Err(e) = self.scene.end(&self.gfx) {
+            eprintln!("mswidgets: composite: {e}");
+            return;
+        }
+        self.present(d);
+    }
+
+    /// Copy `d` (canvas px, inside the window) of the frame into the DIB and push it to the layered window.
+    unsafe fn present(&mut self, d: RECT) {
+        if self.win_dirty {
+            return self.present_full();
+        }
+        let d = RECT { left: d.left.max(self.win.left), top: d.top.max(self.win.top), right: d.right.min(self.win.right), bottom: d.bottom.min(self.win.bottom) };
+        if d.right <= d.left || d.bottom <= d.top {
+            return;
+        }
+        let t = Instant::now();
+        let ww = (self.win.right - self.win.left) as usize;
+        let (bits, wl, wt) = (self.bits, self.win.left, self.win.top);
+        let r = self.scene.read_rect(&self.gfx, d, |y, row| {
+            let off = ((y - wt) as usize * ww + (d.left - wl) as usize) * 4;
+            std::ptr::copy_nonoverlapping(row.as_ptr(), bits.add(off), row.len());
+        });
+        if let Err(e) = r {
+            eprintln!("mswidgets: readback: {e}");
+            return;
+        }
+        let dirty = RECT { left: d.left - wl, top: d.top - wt, right: d.right - wl, bottom: d.bottom - wt };
+        self.update_layered(Some(&dirty));
+        self.st.present_ms += t.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    /// The whole window (after a resize / move): read everything back and pass position + size.
+    unsafe fn present_full(&mut self) {
+        let t = Instant::now();
+        let ww = (self.win.right - self.win.left) as usize;
+        let (bits, wl, wt) = (self.bits, self.win.left, self.win.top);
+        let r = self.scene.read_rect(&self.gfx, self.win, |y, row| {
+            let off = (y - wt) as usize * ww * 4;
+            std::ptr::copy_nonoverlapping(row.as_ptr(), bits.add(off), row.len());
+        });
+        let _ = wl;
+        if let Err(e) = r {
+            eprintln!("mswidgets: readback: {e}");
+            return;
+        }
+        self.update_layered(None);
+        self.st.present_ms += t.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    unsafe fn update_layered(&mut self, dirty: Option<&RECT>) {
+        let (ww, wh) = (self.win.right - self.win.left, self.win.bottom - self.win.top);
+        let pos = POINT { x: self.mon.left + self.win.left, y: self.mon.top + self.win.top };
+        let size = SIZE { cx: ww, cy: wh };
+        let src = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+        // diagnostics: `MSW_PARTIAL=1` restores partial (prcDirty) updates; by default every update passes position + size
+        let full = dirty.is_none() || self.win_dirty || self.first_present || std::env::var_os("MSW_PARTIAL").is_none();
+        let info = UPDATELAYEREDWINDOWINFO {
+            cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+            hdcDst: HDC::default(),
+            pptDst: if full { &pos } else { std::ptr::null() },
+            psize: if full { &size } else { std::ptr::null() },
+            hdcSrc: self.mem_dc,
+            pptSrc: &src,
+            crKey: COLORREF(0),
+            pblend: &blend,
+            dwFlags: ULW_ALPHA,
+            prcDirty: if full { std::ptr::null() } else { dirty.map_or(std::ptr::null(), |d| d as *const RECT) },
+        };
+        if UpdateLayeredWindowIndirect(self.hwnd, &info).as_bool() {
+            self.first_present = false;
+            self.win_dirty = false;
+            if let Some(mode) = std::env::var_os("MSW_SOLID") {
+                // diagnostics: `1` paints the whole layer opaque red and presents it again; `dup` presents the same frame twice
+                let px = std::slice::from_raw_parts_mut(self.bits, (ww * wh * 4) as usize);
+                if mode == "opaque" {
+                    px.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+                } else if mode == "clamp" {
+                    px.chunks_exact_mut(4).for_each(|p| {
+                        let a = p[3];
+                        p[0] = p[0].min(a);
+                        p[1] = p[1].min(a);
+                        p[2] = p[2].min(a);
+                    });
+                } else if mode != "dup" {
+                    let v: [u8; 4] = if mode == "half" { [0, 0, 128, 128] } else { [0, 0, 255, 255] };
+                    px.chunks_exact_mut(4).for_each(|p| p.copy_from_slice(&v));
+                }
+                let _ = UpdateLayeredWindowIndirect(self.hwnd, &info);
+            }
+            // diagnostics: `MSW_DUMP=<file.png>` saves what is handed to Windows (at most every 2 s)
+            if let Some(path) = std::env::var_os("MSW_DUMP") {
+                thread_local!(static LAST_DUMP: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) });
+                if LAST_DUMP.with(|l| l.get()).is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+                    LAST_DUMP.with(|l| l.set(Some(Instant::now())));
+                    let px = std::slice::from_raw_parts(self.bits, (ww * wh * 4) as usize);
+                    let _ = self.gfx.save_png(&path.to_string_lossy(), ww as u32, wh as u32, px);
+                }
+            }
+        } else {
+            eprintln!("mswidgets: UpdateLayeredWindow: {}", windows::core::Error::from_win32());
+        }
+    }
+
+    // ------------------------------------------------ widget schedules
+
+    /// Widget schedules: call `tick` of every due card; animating cards repaint only their own rectangle (cached glass layers are just
+    /// blitted + the overlay), a card whose static content went stale is re-rendered first.
+    unsafe fn tick(&mut self) {
+        if !self.visible {
+            return;
+        }
+        let t = Instant::now();
+        let now = self.now();
+        let mut dirty: Option<RECT> = None;
+        for i in self.scene.due_cards(t) {
+            self.scene.tick_card(&self.gfx, i, &now);
+            let animated = self.scene.cards[i].tick.animates();
+            if let Some(r) = self.settle(i, &now, animated) {
+                dirty = Some(dirty.map_or(r, |d| union(d, r)));
+            }
+        }
+        if let Some(d) = dirty {
+            self.frame(d);
+            self.st.clock_frames += 1;
+        }
+        self.st.render_ms += t.elapsed().as_secs_f64() * 1000.0;
+        self.update_tick_timer();
+    }
+
+    /// A background job of the card with handle `uid` finished: let the widget pick up the result.
+    unsafe fn on_job(&mut self, uid: usize) {
+        let Some(i) = self.scene.index_of_uid(uid) else { return };
+        if !self.visible {
+            return;
+        }
+        let now = self.now();
+        self.scene.tick_card(&self.gfx, i, &now);
+        if let Some(r) = self.settle(i, &now, false) {
+            self.frame(r);
+        }
+        self.update_tick_timer();
+    }
+
+    /// After any widget callback on card `i`: persist changed settings, re-render the layer when its static content is stale
+    /// (version / day / invalidate), and return the rectangle to recompose (None = nothing visible changed).
+    unsafe fn settle(&mut self, i: usize, now: &Now, animated: bool) -> Option<RECT> {
+        if let Some((id, cfg)) = self.scene.take_cfg(i) {
+            if let Some(it) = self.items.iter_mut().find(|x| x.id == id) {
+                it.cfg = cfg;
+            }
+            layout::persist_cfg(&self.items, &id);
+            self.note_own_write();
+        }
+        let frame = self.scene.take_frame_request(i);
+        let edit_ext = if self.ui.edit { self.ext() } else { 0 };
+        if self.scene.content_stale(i, now) {
+            return match self.scene.render_card(&self.gfx, i, now) {
+                Ok(()) => {
+                    self.st.card_redraws += 1;
+                    Some(self.scene.layer_rect_ext(i, edit_ext))
+                }
+                Err(e) => {
+                    eprintln!("mswidgets: render card {i}: {e}");
+                    None
+                }
+            };
+        }
+        (animated || frame).then(|| if edit_ext > 0 { self.scene.layer_rect_ext(i, edit_ext) } else { self.scene.card_rect(i) })
+    }
+
+    unsafe fn send_mouse(&mut self, i: usize, kind: MouseKind, x: i32, y: i32, button: Button, delta: f32, now: &Now) -> bool {
+        let changed = self.scene.mouse(&self.gfx, i, kind, x, y, button, delta, now);
+        if let Some(r) = self.settle(i, now, changed) {
+            self.frame(r);
+        }
+        if self.scene.take_fx_wake() {
+            // the pointer glint moved / faded: the animation timer paints it, then stops again
+            self.last_anim = Instant::now();
+            self.arm_anim();
+        }
+        changed
+    }
+
+    unsafe fn leave(&mut self, now: &Now) {
+        if let Some(o) = self.hot.take() {
+            if o < self.scene.len() {
+                self.send_mouse(o, MouseKind::Leave, 0, 0, Button::None, 0.0, now);
+            }
+        }
+    }
+
+    // ------------------------------------------------ mouse
+
+    /// Cursor position in monitor px for the message being handled.
+    unsafe fn mouse_pos(&self) -> (i32, i32) {
+        let p = GetMessagePos();
+        (((p & 0xFFFF) as i16 as i32) - self.mon.left, (((p >> 16) & 0xFFFF) as i16 as i32) - self.mon.top)
+    }
+
+    /// Window mouse messages (live mode: only delivered while the window is not click-through, i.e. the cursor is over a card;
+    /// edit mode / drag: the whole window).
+    unsafe fn on_mouse(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) {
+        let now = self.now();
+        match msg {
+            WM_MOUSELEAVE => {
+                self.tracking = false;
+                if self.pressed.is_none() && !self.ui.edit {
+                    self.leave(&now);
+                }
+                if self.ui.edit && self.ui.hover != Hit::None && self.press == Press::None {
+                    self.set_hover(Hit::None);
+                }
+                return;
+            }
+            WM_CAPTURECHANGED => {
+                if self.drag.is_some() {
+                    // another window took the capture (alt-tab, a popup): drop the card where it is instead of leaving it stuck to the pointer
+                    if HWND(lp.0 as *mut std::ffi::c_void) != self.hwnd {
+                        self.end_drag();
+                    }
+                } else {
+                    self.pressed = None;
+                    self.press = Press::None;
+                }
+                return;
+            }
+            _ => {}
+        }
+        let (x, y) = self.mouse_pos();
+        if !self.tracking && msg == WM_MOUSEMOVE {
+            let mut t = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.hwnd, dwHoverTime: 0 };
+            if TrackMouseEvent(&mut t).is_ok() {
+                self.tracking = true;
+            }
+        }
+        if self.ui.edit {
+            return self.edit_mouse(msg, wp, x, y);
+        }
+        let under = self.scene.cards.iter().rposition(|c| x >= c.x && x < c.x + c.w && y >= c.y && y < c.y + c.h);
+        if self.pressed.is_none() && self.hot != under {
+            self.leave(&now);
+            self.hot = under;
+        }
+        let uid_of = |s: &Scene, i: usize| s.cards.get(i).map_or(0, |c| c.uid);
+        // a press that turned into a drag: the card follows the pointer, the widget hears nothing more
+        if let Press::Drag = self.press {
+            match msg {
+                WM_MOUSEMOVE => {
+                    if let Some(d) = self.drag.as_mut() {
+                        d.cur = (x, y);
+                    }
+                }
+                WM_LBUTTONUP => self.end_drag(),
+                _ => {}
+            }
+            if matches!(msg, WM_LBUTTONUP) && wp.0 & 0x13 == 0 {
+                let _ = ReleaseCapture();
+                self.pressed = None;
+            }
+            return;
+        }
+        if let (Press::Cand { uid, x: x0, y: y0 }, WM_MOUSEMOVE) = (self.press, msg) {
+            if (x - x0).abs().max((y - y0).abs()) > DRAG_PX {
+                if let Some(i) = self.scene.index_of_uid(uid) {
+                    self.send_mouse(i, MouseKind::Leave, 0, 0, Button::None, 0.0, &now);
+                    self.hot = None;
+                }
+                self.begin_drag(uid, x0, y0, x, y, false, None);
+                return;
+            }
+        }
+        let Some(i) = self.pressed.or(under) else { return };
+        let (kind, button, delta) = match msg {
+            WM_MOUSEMOVE => (MouseKind::Move, Button::None, 0.0),
+            WM_LBUTTONDOWN => (MouseKind::Down, Button::Left, 0.0),
+            WM_LBUTTONUP => (MouseKind::Up, Button::Left, 0.0),
+            WM_RBUTTONDOWN => (MouseKind::Down, Button::Right, 0.0),
+            WM_RBUTTONUP => (MouseKind::Up, Button::Right, 0.0),
+            WM_MBUTTONDOWN => (MouseKind::Down, Button::Middle, 0.0),
+            WM_MBUTTONUP => (MouseKind::Up, Button::Middle, 0.0),
+            WM_MOUSEWHEEL => (MouseKind::Wheel, Button::None, ((wp.0 >> 16) as u16 as i16) as f32 / 120.0),
+            _ => return,
+        };
+        if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) && self.pressed.is_none() {
+            SetCapture(self.hwnd);
+            self.pressed = Some(i);
+        }
+        let changed = self.send_mouse(i, kind, x, y, button, delta, &now);
+        match (msg, changed) {
+            (WM_LBUTTONDOWN, true) => self.press = Press::Widget(uid_of(&self.scene, i)),
+            (WM_LBUTTONDOWN, false) => self.press = Press::Cand { uid: uid_of(&self.scene, i), x, y },
+            (WM_RBUTTONUP, false) if under == Some(i) => {
+                // the widget did not use the right click: the card context menu (run outside of this borrow)
+                let uid = uid_of(&self.scene, i);
+                let p = GetMessagePos();
+                let _ = PostMessageW(self.hwnd, WM_MENU, WPARAM(uid), LPARAM(p as isize));
+            }
+            _ => {}
+        }
+        if matches!(msg, WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP) && wp.0 & 0x13 == 0 {
+            let _ = ReleaseCapture();
+            self.pressed = None;
+            self.press = Press::None;
+        }
+    }
+
+    // ------------------------------------------------ edit mode mouse
+
+    fn hover_dirty(&self, h: Hit) -> Option<RECT> {
+        let s = self.s;
+        let px = |r: Rect| RECT { left: (r.x * s) as i32 - 8, top: (r.y * s) as i32 - 8, right: (r.right() * s).ceil() as i32 + 8, bottom: (r.bottom() * s).ceil() as i32 + 8 };
+        match h {
+            Hit::Minus(i) | Hit::Card(i) => (i < self.scene.len()).then(|| self.scene.layer_rect_ext(i, self.ext())),
+            Hit::Slider(_) | Hit::Seg(_) | Hit::Toolbar => Some(px(self.ui.toolbar_rect())),
+            Hit::None => None,
+            _ => Some(px(self.ui.panel_rect())),
+        }
+    }
+
+    unsafe fn set_hover(&mut self, h: Hit) {
+        let same = |a: Hit, b: Hit| match (a, b) {
+            (Hit::Slider(_), Hit::Slider(_)) => true,
+            (Hit::Search(_), Hit::Search(_)) => true,
+            _ => a == b,
+        };
+        if same(self.ui.hover, h) {
+            return;
+        }
+        let old = self.ui.hover;
+        self.ui.hover = h;
+        // only hovers that change how something looks need a frame
+        let looks = |h: Hit| matches!(h, Hit::Minus(_) | Hit::Group(_) | Hit::Item(_) | Hit::Done);
+        if looks(old) || looks(h) {
+            let mut d: Option<RECT> = None;
+            for r in [self.hover_dirty(old), self.hover_dirty(h)].into_iter().flatten() {
+                d = Some(d.map_or(r, |x| union(x, r)));
+            }
+            if let Some(d) = d {
+                self.frame(d);
+            }
+        }
+    }
+
+    unsafe fn edit_mouse(&mut self, msg: u32, wp: WPARAM, x: i32, y: i32) {
+        let hit = self.ui.hit(&self.scene, x, y);
+        match msg {
+            WM_MOUSEMOVE => {
+                match self.press {
+                    Press::Drag => {
+                        if let Some(d) = self.drag.as_mut() {
+                            d.cur = (x, y);
+                        }
+                        return;
+                    }
+                    Press::Cand { uid, x: x0, y: y0 } => {
+                        if (x - x0).abs().max((y - y0).abs()) > DRAG_PX - 2 {
+                            self.begin_drag(uid, x0, y0, x, y, false, None);
+                        }
+                        return;
+                    }
+                    Press::Preview { k, x: x0, y: y0 } => {
+                        if (x - x0).abs().max((y - y0).abs()) > DRAG_PX {
+                            self.drag_from_preview(k, x, y);
+                        }
+                        return;
+                    }
+                    Press::Ui(Hit::Slider(_)) => {
+                        let v = self.ui.slider_value(x);
+                        self.apply_glass(v);
+                        return;
+                    }
+                    _ => {}
+                }
+                self.set_hover(hit);
+            }
+            WM_LBUTTONDOWN => {
+                SetCapture(self.hwnd);
+                self.ui.press = hit;
+                match hit {
+                    Hit::Card(i) => {
+                        self.ui.st.focus = false;
+                        self.press = Press::Cand { uid: self.scene.cards[i].uid, x, y };
+                    }
+                    Hit::Item(k) => self.press = Press::Preview { k, x, y },
+                    Hit::Slider(v) => {
+                        self.press = Press::Ui(hit);
+                        self.apply_glass(v);
+                    }
+                    Hit::Search(dx) => {
+                        self.ui.st.focus = true;
+                        let c = self.ui.caret_at(&self.scene, &self.gfx, dx);
+                        self.ui.st.query.set_caret(c);
+                        self.ui.caret_on = true;
+                        self.press = Press::Ui(hit);
+                        let d = self.hover_dirty(hit);
+                        if let Some(d) = d {
+                            self.frame(d);
+                        }
+                    }
+                    Hit::None => self.ui.st.focus = false,
+                    _ => {
+                        self.press = Press::Ui(hit);
+                        if let Some(d) = self.hover_dirty(hit) {
+                            self.frame(d);
+                        }
+                    }
+                }
+            }
+            WM_LBUTTONUP => {
+                let press = std::mem::replace(&mut self.press, Press::None);
+                self.ui.press = Hit::None;
+                let _ = ReleaseCapture();
+                match press {
+                    Press::Drag => self.end_drag(),
+                    Press::Preview { k, .. } => {
+                        if let Some((def, size)) = self.ui.item(k) {
+                            self.add_widget(def.type_id, size, None);
+                        }
+                    }
+                    Press::Ui(Hit::Slider(_)) => {
+                        let v = self.ui.slider_value(x);
+                        self.apply_glass(v);
+                        let v = (v * 100.0).round() / 100.0;
+                        self.write_setting("widgetsGlass", serde_json::json!(v));
+                        self.settings.glass = v;
+                    }
+                    Press::Ui(h) => {
+                        let same = match (h, hit) {
+                            (Hit::Search(_), Hit::Search(_)) => true,
+                            (a, b) => a == b,
+                        };
+                        if same {
+                            self.ui_click(h);
+                        } else if let Some(d) = self.hover_dirty(h) {
+                            self.frame(d);
+                        }
+                    }
+                    _ => {}
+                }
+                self.set_hover(hit);
+            }
+            WM_RBUTTONUP => {
+                if let Hit::Card(i) | Hit::Minus(i) = hit {
+                    let uid = self.scene.cards[i].uid;
+                    let p = GetMessagePos();
+                    let _ = PostMessageW(self.hwnd, WM_MENU, WPARAM(uid), LPARAM(p as isize));
+                }
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((wp.0 >> 16) as u16 as i16) as f32 / 120.0;
+                if self.ui.wheel(x as f32 / self.s, y as f32 / self.s, delta) {
+                    if let Some(d) = self.hover_dirty(Hit::Panel) {
+                        self.frame(d);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    unsafe fn ui_click(&mut self, h: Hit) {
+        match h {
+            Hit::Done => self.leave_edit(),
+            Hit::Minus(i) => {
+                if let Some(c) = self.scene.cards.get(i) {
+                    let uid = c.uid;
+                    self.remove_card(uid);
+                }
+            }
+            Hit::Group(i) => {
+                self.ui.select_group(i);
+                self.gallery_changed();
+            }
+            Hit::Chip(s) => {
+                self.ui.select_size(s);
+                self.gallery_changed();
+            }
+            Hit::Seg(live) => self.set_live(live),
+            _ => {}
+        }
+    }
+
+    unsafe fn gallery_changed(&mut self) {
+        let now = Now::local();
+        self.ui.sync_previews(&self.gfx, &now);
+        self.arm_ui_timer();
+        if let Some(d) = self.hover_dirty(Hit::Panel) {
+            self.frame(d);
+        }
+    }
+
+    // ------------------------------------------------ keyboard (edit mode: the search box)
+
+    unsafe fn on_key(&mut self, msg: u32, wp: usize) {
+        if !self.ui.edit {
+            return;
+        }
+        let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+        let mut changed = false;
+        match msg {
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                let vk = VIRTUAL_KEY(wp as u16);
+                match vk {
+                    VK_ESCAPE => {
+                        self.esc_down = true;
+                        return self.leave_edit();
+                    }
+                    _ if !self.ui.gallery => return,
+                    VK_BACK => {
+                        self.ui.st.query.backspace();
+                        changed = true;
+                    }
+                    VK_DELETE => {
+                        self.ui.st.query.delete();
+                        changed = true;
+                    }
+                    VK_LEFT => self.ui.st.query.left(),
+                    VK_RIGHT => self.ui.st.query.right(),
+                    VK_HOME => self.ui.st.query.home(),
+                    VK_END => self.ui.st.query.end(),
+                    VK_V if ctrl => {
+                        if let Some(t) = clipboard_text(self.hwnd) {
+                            self.ui.st.query.insert_str(&t);
+                            changed = true;
+                        }
+                    }
+                    VK_A if ctrl => self.ui.st.query.select_all(),
+                    _ => return,
+                }
+            }
+            WM_CHAR => {
+                if !self.ui.gallery || ctrl {
+                    return;
+                }
+                let u = wp as u32;
+                let Some(c) = char::from_u32(u) else { return }; // lone surrogates (astral plane) are ignored: no emoji search
+                if c.is_control() {
+                    return;
+                }
+                self.ui.st.query.insert(c);
+                changed = true;
+            }
+            _ => return,
+        }
+        self.ui.st.focus = true;
+        self.ui.caret_on = true;
+        if changed {
+            self.ui.query_changed();
+            self.gallery_changed();
+        } else if let Some(d) = self.hover_dirty(Hit::Panel) {
+            self.frame(d);
+        }
+    }
+
+    // ------------------------------------------------ drag & drop
+
+    fn occupied(&self, except: Option<&str>) -> Vec<grid::Place> {
+        self.items.iter().filter(|it| Some(it.id.as_str()) != except && self.scene.index_of_id(&it.id).is_some()).map(|it| grid::Place::new(it.size, it.col as i32, it.row as i32)).collect()
+    }
+
+    /// Lift card `uid` and let it follow the pointer. (x0, y0) = where the press happened, (x, y) = the pointer now.
+    unsafe fn begin_drag(&mut self, uid: usize, x0: i32, y0: i32, x: i32, y: i32, fresh: bool, from: Option<(i32, i32)>) {
+        let Some(i) = self.scene.index_of_uid(uid) else { return };
+        let c = &self.scene.cards[i];
+        let off = if fresh { (c.w / 2, c.h / 2) } else { (x0 - c.x, y0 - c.y) };
+        let from = from.or_else(|| self.items.iter().find(|it| it.id == c.id).map(|it| (it.col as i32, it.row as i32)));
+        self.drag = Some(Drag { uid, off, cur: (x, y), target: None, fresh, from, vel: (0.0, 0.0) });
+        self.press = Press::Drag;
+        self.springs.remove(&uid);
+        let mut xf = self.scene.cards[i].xf;
+        xf.lift = xf.lift.max(0.02);
+        self.scene.set_xf(i, xf);
+        self.last_anim = Instant::now();
+        let r = self.desired_window();
+        self.set_window(r);
+        self.set_transparent(false);
+        SetCapture(self.hwnd);
+        self.arm_anim();
+        self.anim_step();
+    }
+
+    unsafe fn drag_from_preview(&mut self, k: usize, x: i32, y: i32) {
+        let Some((def, size)) = self.ui.item(k) else { return };
+        if self.scene.len() >= MAX_CARDS {
+            return self.show_toast(self.ui.lang.pick("Слишком много виджетов", "Too many widgets").to_string());
+        }
+        let (lw, lh) = size.logical();
+        let (w, h) = ((lw * self.s).round() as i32, (lh * self.s).round() as i32);
+        let id = layout::new_id_time(def.type_id, &self.items);
+        let spec = CardSpec { id: id.clone(), type_id: def.type_id.to_string(), size, cfg: serde_json::json!({}), x: x - w / 2, y: y - h / 2, w, h };
+        let Some(uid) = self.spawn_card(&spec, false) else { return };
+        self.items.push(layout::Item { id, type_id: def.type_id.to_string(), size, col: 0, row: 0, cfg: serde_json::json!({}) });
+        self.begin_drag(uid, x, y, x, y, true, None);
+    }
+
+    /// Build the card for `spec`, tick it once, measure its backdrop and render it. Returns its uid.
+    unsafe fn spawn_card(&mut self, spec: &CardSpec, pop: bool) -> Option<usize> {
+        if self.scene.len() >= MAX_CARDS {
+            return None;
+        }
+        let i = match self.scene.add_card(&self.gfx, spec) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("mswidgets: add card '{}': {e}", spec.type_id);
+                return None;
+            }
+        };
+        let now = self.now();
+        self.scene.tick_card(&self.gfx, i, &now);
+        let _ = self.scene.measure_lum(&self.gfx, 1 << i, false);
+        if let Err(e) = self.scene.render_card(&self.gfx, i, &now) {
+            eprintln!("mswidgets: render card: {e}");
+        }
+        let uid = self.scene.cards[i].uid;
+        if pop && !self.reduced {
+            self.pops.insert(uid, Pop { t0: Instant::now(), out: false });
+            self.scene.set_xf(i, mat_xf(&motion::materialize(0.0, false, false), 0.0, 0.0));
+        }
+        self.update_tick_timer();
+        Some(uid)
+    }
+
+    /// Drop the dragged card: snap to the free cell (or go home / vanish), spring settle, persist.
+    unsafe fn end_drag(&mut self) {
+        let Some(d) = self.drag.take() else { return };
+        self.press = Press::None;
+        self.pressed = None;
+        let _ = ReleaseCapture();
+        self.ui.placeholder = None;
+        let Some(i) = self.scene.index_of_uid(d.uid) else { return };
+        let (id, size) = (self.scene.cards[i].id.clone(), self.scene.cards[i].size);
+        let landing = d.target.map(|p| (p.col, p.row)).or(d.from);
+        let dropped_on_gallery = d.fresh && self.ui.gallery && self.ui.edit && {
+            let (lx, ly) = (d.cur.0 as f32 / self.s, d.cur.1 as f32 / self.s);
+            self.ui.panel_rect().contains(lx, ly)
+        };
+        match landing {
+            Some((col, row)) if !dropped_on_gallery => {
+                if let Some(it) = self.items.iter_mut().find(|x| x.id == id) {
+                    it.col = col as u32;
+                    it.row = row as u32;
+                }
+                let (x, y, _, _) = cell_rect(size, col, row, self.s);
+                let c = &self.scene.cards[i];
+                self.springs.insert(d.uid, Spring { x: c.x as f32, y: c.y as f32, vx: 0.0, vy: 0.0, tx: x as f32, ty: y as f32 });
+                self.save_layout();
+                self.sync_regions();
+            }
+            _ => {
+                // dropped on the gallery / nowhere free: a fresh card is discarded, a moved one stays where it was
+                if d.fresh {
+                    self.discard_card(d.uid);
+                    if !dropped_on_gallery {
+                        self.show_toast(self.ui.lang.pick("На рабочем столе нет свободного места", "No free space on the desktop").to_string());
+                    }
+                    return;
+                }
+            }
+        }
+        self.last_anim = Instant::now();
+        self.arm_anim();
+        self.anim_step();
+    }
+
+    /// Remove a card without animation (cancelled drag).
+    unsafe fn discard_card(&mut self, uid: usize) {
+        let Some(i) = self.scene.index_of_uid(uid) else { return };
+        let r = self.scene.layer_rect_ext(i, self.ext());
+        let id = self.scene.cards[i].id.clone();
+        self.scene.remove_card(i);
+        self.items.retain(|x| x.id != id);
+        self.springs.remove(&uid);
+        self.pops.remove(&uid);
+        self.sync_regions();
+        self.frame(r);
+        self.update_tick_timer();
+        self.arm_anim();
+    }
+
+    // ------------------------------------------------ add / remove / resize
+
+    /// Gallery click / drop: a new card at (want) or the first free cell.
+    unsafe fn add_widget(&mut self, type_id: &str, size: Size, want: Option<(i32, i32)>) {
+        let Some(def) = crate::registry::global().get(type_id) else { return };
+        let occ = self.occupied(None);
+        let (c0, r0) = want.unwrap_or((0, 0));
+        let Some(p) = grid::find_free(&self.dims, &occ, size, c0, r0) else {
+            return self.show_toast(self.ui.lang.pick("На рабочем столе нет свободного места", "No free space on the desktop").to_string());
+        };
+        let id = layout::new_id_time(def.type_id, &self.items);
+        let (x, y, w, h) = cell_rect(size, p.col, p.row, self.s);
+        let spec = CardSpec { id: id.clone(), type_id: def.type_id.to_string(), size, cfg: serde_json::json!({}), x, y, w, h };
+        let Some(uid) = self.spawn_card(&spec, true) else { return };
+        self.items.push(layout::Item { id, type_id: def.type_id.to_string(), size, col: p.col as u32, row: p.row as u32, cfg: serde_json::json!({}) });
+        self.save_layout();
+        self.sync_regions();
+        self.last_anim = Instant::now();
+        self.arm_anim();
+        if let Some(i) = self.scene.index_of_uid(uid) {
+            let r = self.scene.layer_rect_ext(i, self.ext());
+            self.frame(r);
+        }
+    }
+
+    /// "−" / menu "Удалить": pop out, then forget the card.
+    unsafe fn remove_card(&mut self, uid: usize) {
+        if self.reduced {
+            self.finish_remove(uid);
+            return;
+        }
+        self.pops.insert(uid, Pop { t0: Instant::now(), out: true });
+        self.last_anim = Instant::now();
+        self.arm_anim();
+    }
+
+    unsafe fn finish_remove(&mut self, uid: usize) {
+        self.discard_card(uid);
+        self.save_layout();
+        if !self.want_full() {
+            SetTimer(self.hwnd, T_SHRINK, 150, None);
+        }
+    }
+
+    unsafe fn change_size(&mut self, uid: usize, size: Size) {
+        let Some(i) = self.scene.index_of_uid(uid) else { return };
+        let id = self.scene.cards[i].id.clone();
+        let Some(me) = self.items.iter().find(|x| x.id == id).cloned() else { return };
+        if me.size == size {
+            return;
+        }
+        let occ = self.occupied(Some(&id));
+        let Some(p) = grid::resize(&self.dims, &occ, size, me.col as i32, me.row as i32) else {
+            return self.show_toast(self.ui.lang.pick("Нет места для этого размера", "No room for this size").to_string());
+        };
+        let old = self.scene.layer_rect_ext(i, self.ext());
+        let (x, y, _, _) = cell_rect(size, p.col, p.row, self.s);
+        if let Err(e) = self.scene.resize_card(&self.gfx, i, size, x, y) {
+            eprintln!("mswidgets: resize: {e}");
+            return;
+        }
+        let now = self.now();
+        self.scene.tick_card(&self.gfx, i, &now);
+        let _ = self.scene.measure_lum(&self.gfx, 1 << i, false);
+        let _ = self.scene.render_card(&self.gfx, i, &now);
+        if let Some(it) = self.items.iter_mut().find(|x| x.id == id) {
+            it.size = size;
+            it.col = p.col as u32;
+            it.row = p.row as u32;
+        }
+        if !self.reduced {
+            self.pops.insert(uid, Pop { t0: Instant::now(), out: false });
+            self.scene.set_xf(i, mat_xf(&motion::materialize(0.0, false, false), 0.0, 0.0));
+        }
+        self.save_layout();
+        self.sync_regions();
+        self.update_tick_timer();
+        let d = union(old, self.scene.layer_rect_ext(i, self.ext()));
+        // the window may have to grow to hold the new size
+        let r = self.desired_window();
+        let w = if self.want_full() { r } else { union(self.win, r) };
+        self.set_window(w);
+        self.last_anim = Instant::now();
+        self.arm_anim();
+        self.frame(d);
+        if !self.want_full() {
+            SetTimer(self.hwnd, T_SHRINK, 400, None);
+        }
+    }
+
+    // ------------------------------------------------ context menu glue
+
+    unsafe fn menu_request(&mut self, uid: usize, lp: isize) -> Option<MenuReq> {
+        let i = self.scene.index_of_uid(uid)?;
+        let c = &self.scene.cards[i];
+        let def = crate::registry::global().get(&c.type_id)?;
+        let (x, y) = unpack(lp);
+        self.in_menu = true;
+        Some(MenuReq { uid, x, y, sizes: def.sizes.to_vec(), cur: c.size, editing: self.ui.edit, lang: self.ui.lang })
+    }
+
+    unsafe fn menu_result(&mut self, req: &MenuReq, cmd: usize) {
+        self.in_menu = false;
+        match cmd {
+            CMD_EDIT => {
+                if self.editing {
+                    self.leave_edit();
+                } else {
+                    self.enter_edit();
+                }
+            }
+            c if (CMD_SIZE..CMD_SIZE + 3).contains(&c) => self.change_size(req.uid, Size::ALL[c - CMD_SIZE]),
+            CMD_DELETE => self.remove_card(req.uid),
+            _ => {}
+        }
+        if !self.ui.edit {
+            place_above_desktop(self.hwnd);
+            if !self.want_full() {
+                SetTimer(self.hwnd, T_SHRINK, 150, None);
+            }
+        }
+    }
+
+    // ------------------------------------------------ animation
+
+    fn anim_busy(&self) -> bool {
+        let want_gal = if self.editing { 1.0 } else { 0.0 };
+        self.drag.is_some()
+            || !self.springs.is_empty()
+            || !self.pops.is_empty()
+            || (self.gal_t - want_gal).abs() > 1e-3
+            || (self.dim_t - want_gal).abs() > 1e-3
+            || self.scene.cards.iter().any(|c| c.xf.lift > 0.0)
+            || self.scene.fx_busy()
+            || self.ui.away > 0.0
+    }
+
+    /// One timer drives every animation: 16 ms while something moves, 100 ms for the jiggle of a resting edit mode, off otherwise.
+    unsafe fn arm_anim(&mut self) {
+        let period = if self.anim_busy() {
+            16
+        } else if self.ui.edit && !self.reduced {
+            100
+        } else {
+            0
+        };
+        if period != self.anim_period {
+            self.anim_period = period;
+            if period == 0 {
+                let _ = KillTimer(self.hwnd, T_ANIM);
+            } else {
+                SetTimer(self.hwnd, T_ANIM, period, None);
+            }
+        }
+    }
+
+    unsafe fn anim_step(&mut self) {
+        let t = Instant::now();
+        let dt = t.saturating_duration_since(self.last_anim).as_secs_f32().clamp(0.004, 0.05);
+        self.last_anim = t;
+        let ext = self.ext();
+        let mut dirty: Option<RECT> = None;
+        let add = |d: &mut Option<RECT>, r: RECT| *d = Some(d.map_or(r, |x| union(x, r)));
+
+        // gallery / dim progress
+        let want = if self.editing { 1.0 } else { 0.0 };
+        if self.reduced {
+            self.gal_t = want;
+            self.dim_t = want;
+        } else {
+            let rate = if self.editing { 1.0 / 0.34 } else { 1.0 / 0.2 };
+            self.gal_t = step_toward(self.gal_t, want, rate * dt);
+            self.dim_t = step_toward(self.dim_t, want, dt / 0.25);
+        }
+        let eased = 1.0 - (1.0 - self.gal_t).powi(3);
+        if (self.ui.anim - eased).abs() > 1e-4 {
+            self.ui.anim = eased;
+            if let Some(u) = self.ui.dirty_rect(&self.scene) {
+                add(&mut dirty, u);
+            }
+        }
+        // the dim covers the whole monitor: it fades in 6 steps (each one a full-monitor compose + present)
+        let dim = DIM_ALPHA * (self.dim_t * 6.0).round() / 6.0;
+        if (self.ui.dim - dim).abs() > 1e-4 {
+            self.ui.dim = dim;
+            add(&mut dirty, RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h });
+        }
+
+        // the dragged card follows the pointer
+        let now0 = self.now();
+        if let Some(d) = self.drag.as_mut() {
+            if let Some(i) = self.scene.cards.iter().position(|c| c.uid == d.uid) {
+                let c = &self.scene.cards[i];
+                let old = self.scene.layer_rect_ext(i, ext);
+                let nx = (d.cur.0 - d.off.0).clamp(-c.w / 2, self.scene.w - c.w / 2);
+                let ny = (d.cur.1 - d.off.1).clamp(-c.h / 2, self.scene.h - c.h / 2);
+                let (size, id) = (c.size, c.id.clone());
+                let occ = self.items.iter().filter(|it| it.id != id && self.scene.index_of_id(&it.id).is_some()).map(|it| grid::Place::new(it.size, it.col as i32, it.row as i32)).collect::<Vec<_>>();
+                let target = grid::target_for(&self.dims, &occ, size, nx, ny, self.s);
+                let ph_old = self.ui.placeholder;
+                self.ui.placeholder = target.map(|p| {
+                    let (x, y, w, h) = cell_rect(size, p.col, p.row, self.s);
+                    (RECT { left: x, top: y, right: x + w, bottom: y + h }, size.radius() * self.s)
+                });
+                if let Some((r, _)) = ph_old {
+                    add(&mut dirty, RECT { left: r.left - 4, top: r.top - 4, right: r.right + 4, bottom: r.bottom + 4 });
+                }
+                if let Some((r, _)) = self.ui.placeholder {
+                    add(&mut dirty, RECT { left: r.left - 4, top: r.top - 4, right: r.right + 4, bottom: r.bottom + 4 });
+                }
+                d.target = target;
+                let lum_ok = self.scene.cards[i].x != nx || self.scene.cards[i].y != ny;
+                // card velocity (low-passed) for the light inertia
+                let (ivx, ivy) = ((nx - self.scene.cards[i].x) as f32 / dt, (ny - self.scene.cards[i].y) as f32 / dt);
+                d.vel = (d.vel.0 * 0.55 + ivx * 0.45, d.vel.1 * 0.55 + ivy * 0.45);
+                if lum_ok {
+                    self.scene.set_card_pos(i, nx, ny);
+                    let _ = self.scene.render_card(&self.gfx, i, &now0);
+                }
+                add(&mut dirty, old);
+                add(&mut dirty, self.scene.layer_rect_ext(i, ext));
+            }
+        }
+        // the gallery fades while a card is out on the desk and comes back when it is dropped
+        if self.ui.gallery && self.ui.edit {
+            let out = self.drag.as_ref().is_some_and(|d| !self.ui.panel_rect().contains(d.cur.0 as f32 / self.s, d.cur.1 as f32 / self.s));
+            let a = step_toward(self.ui.away, if out { 1.0 } else { 0.0 }, dt / 0.15);
+            if (a - self.ui.away).abs() > 1e-4 {
+                self.ui.away = a;
+                if let Some(u) = self.ui.dirty_rect(&self.scene) {
+                    add(&mut dirty, u);
+                }
+            }
+        }
+
+        // springs (settle after a drop)
+        let mut settled = false;
+        let uids: Vec<usize> = self.springs.keys().copied().collect();
+        for uid in uids {
+            let Some(i) = self.scene.index_of_uid(uid) else {
+                self.springs.remove(&uid);
+                continue;
+            };
+            let old = self.scene.layer_rect_ext(i, ext);
+            let done = match self.springs.get_mut(&uid) {
+                Some(sp) => sp.step(dt),
+                None => continue,
+            };
+            let sp = self.springs[&uid];
+            self.scene.set_card_pos(i, sp.x.round() as i32, sp.y.round() as i32);
+            let now = self.now();
+            let _ = self.scene.render_card(&self.gfx, i, &now);
+            add(&mut dirty, old);
+            add(&mut dirty, self.scene.layer_rect_ext(i, ext));
+            if done {
+                self.springs.remove(&uid);
+                // landed: the backdrop (luminance, capture region) is the one under the new place
+                let _ = self.scene.measure_lum(&self.gfx, 1 << i, false);
+                let _ = self.scene.render_card(&self.gfx, i, &now);
+                settled = true;
+            }
+        }
+        if settled {
+            self.sync_regions();
+        }
+
+        // pops (add / resize / remove)
+        let reduced = self.reduced;
+        let mut finished_out = Vec::new();
+        let mut finished: Vec<usize> = Vec::new();
+        for (uid, p) in self.pops.iter() {
+            if p.at(t, reduced).finished {
+                finished.push(*uid);
+            }
+        }
+        for uid in finished {
+            if let Some(p) = self.pops.remove(&uid) {
+                if p.out {
+                    finished_out.push(uid);
+                }
+            }
+        }
+
+        // light inertia: every card's light is pushed against its own velocity (dragged: the pointer, settling: the spring)
+        for i in 0..self.scene.len() {
+            let uid = self.scene.cards[i].uid;
+            let v = match (self.drag.as_ref().filter(|d| d.uid == uid), self.springs.get(&uid)) {
+                (Some(d), _) => d.vel,
+                (None, Some(sp)) => (sp.vx, sp.vy),
+                _ => (0.0, 0.0),
+            };
+            self.scene.set_light_drive(i, v.0, v.1);
+        }
+
+        // per-card visual transform: jiggle, lift, pop
+        let jig_t = t.saturating_duration_since(self.t_edit).as_secs_f32();
+        let edit_on = self.ui.edit && self.editing && !self.reduced;
+        for i in 0..self.scene.len() {
+            let c = &self.scene.cards[i];
+            let dragging = self.drag.as_ref().is_some_and(|d| d.uid == c.uid);
+            let lift = if dragging { (c.xf.lift + dt / 0.12).min(1.0) } else { (c.xf.lift - dt / 0.18).max(0.0) };
+            let rot = if edit_on && !dragging { ui::jiggle(i, jig_t) } else { 0.0 };
+            let xf = match self.pops.get(&c.uid) {
+                Some(p) => mat_xf(&p.at(t, reduced), rot, lift),
+                None => Xf { rot, scale: 1.0 + 0.03 * lift, alpha: 1.0, lift, blur: 0.0, sweep: -1.0 },
+            };
+            if xf != c.xf {
+                self.scene.set_xf(i, xf);
+                add(&mut dirty, self.scene.layer_rect_ext(i, ext));
+            }
+        }
+        for uid in finished_out {
+            self.finish_remove(uid);
+        }
+        // glass motion: light spring, pointer glint, appearance cross-fade
+        if let Some(r) = self.scene.step_fx(&self.gfx, dt, &now0) {
+            add(&mut dirty, r);
+        }
+
+        if let Some(d) = dirty {
+            self.frame(d);
+        }
+        // finished?
+        if !self.editing && self.ui.edit && self.gal_t <= 0.0 && self.dim_t <= 0.0 && self.drag.is_none() {
+            self.finish_leave_edit();
+        }
+        if self.drag.is_none() && self.springs.is_empty() && !self.ui.edit && !self.in_menu {
+            SetTimer(self.hwnd, T_SHRINK, 150, None);
+        }
+        self.arm_anim();
+    }
+
+    // ------------------------------------------------ edit mode
+
+    unsafe fn set_transparent(&mut self, on: bool) {
+        let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+        let tr = WS_EX_TRANSPARENT.0 as isize;
+        SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, if on { ex | tr } else { ex & !tr });
+        self.interactive = !on;
+    }
+
+    unsafe fn enter_edit(&mut self) {
+        if self.editing || self.ui.edit || !self.visible {
+            return;
+        }
+        self.editing = true;
+        self.was_fg = false;
+        self.reduced = reduced_motion();
+        let now = self.now();
+        self.leave(&now); // the widget under the cursor stops hovering
+        self.ui.edit = true;
+        self.update_dim();
+        self.t_edit = Instant::now();
+        // keyboard: the layer becomes activatable and takes the foreground (the search box needs it); remember who had it
+        let fg = GetForegroundWindow();
+        if fg != self.hwnd {
+            self.prev_fg = fg;
+        }
+        let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, ex & !(WS_EX_NOACTIVATE.0 as isize) & !(WS_EX_TRANSPARENT.0 as isize));
+        self.interactive = true;
+        let _ = SetWindowPos(self.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        self.ui.edit = true;
+        self.ui.gallery = true;
+        self.ui.st.focus = true;
+        self.ui.caret_on = true;
+        self.ui.anim = 0.0;
+        self.ui.dim = 0.0;
+        self.gal_t = 0.0;
+        self.dim_t = 0.0;
+        let now = Now::local();
+        let r = RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h };
+        self.set_window(r);
+        self.ui.sync_previews(&self.gfx, &now);
+        self.ui.sync_panels(&mut self.scene, &self.gfx);
+        self.sync_regions();
+        force_foreground(self.hwnd);
+        let _ = SetFocus(self.hwnd);
+        self.last_anim = Instant::now();
+        self.arm_ui_timer();
+        self.arm_anim();
+        self.anim_step();
+    }
+
+    /// Esc / "Готово" / hotkey / menu: start the closing animation; `finish_leave_edit` runs when it is over.
+    unsafe fn leave_edit(&mut self) {
+        if !self.editing {
+            return;
+        }
+        self.editing = false;
+        if self.drag.is_some() {
+            self.end_drag();
+        }
+        self.ui.press = Hit::None;
+        self.ui.hover = Hit::None;
+        self.last_anim = Instant::now();
+        self.arm_anim();
+        self.anim_step();
+    }
+
+    unsafe fn finish_leave_edit(&mut self) {
+        self.ui.edit = false;
+        self.update_dim();
+        self.ui.gallery = false;
+        self.ui.anim = 0.0;
+        self.ui.dim = 0.0;
+        self.ui.st.focus = false;
+        self.ui.sync_panels(&mut self.scene, &self.gfx);
+        self.sync_regions();
+        let _ = KillTimer(self.hwnd, T_UI);
+        // activation off again, the layer goes back under the app windows and the foreground to whoever had it
+        let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE.0 as isize | WS_EX_TRANSPARENT.0 as isize);
+        self.interactive = false;
+        if GetForegroundWindow() == self.hwnd && !self.prev_fg.0.is_null() && IsWindow(self.prev_fg).as_bool() {
+            let _ = SetForegroundWindow(self.prev_fg);
+        }
+        place_above_desktop(self.hwnd);
+        self.fit_window();
+        let w = self.win;
+        self.frame(w);
+        self.arm_anim();
+    }
+
+    // ------------------------------------------------ gallery timer / toast
+
+    unsafe fn arm_ui_timer(&mut self) {
+        if self.ui.edit && self.ui.gallery {
+            SetTimer(self.hwnd, T_UI, 200, None);
+        }
+    }
+
+    /// 200 ms while the gallery is open: animated previews (<= 5 fps), the search caret blink, Esc fallback.
+    unsafe fn ui_timer(&mut self) {
+        if !(self.ui.edit && self.ui.gallery) {
+            let _ = KillTimer(self.hwnd, T_UI);
+            return;
+        }
+        let mut redraw = false;
+        if self.ui.refresh_previews(&self.gfx, &Now::local()) {
+            redraw = true;
+        }
+        self.ui_tick += 1;
+        if self.ui.st.focus && self.ui_tick % 3 == 0 {
+            self.ui.caret_on = !self.ui.caret_on;
+            redraw = true;
+        }
+        // Esc even when the key message went elsewhere (the layer is foreground, but a popup may have eaten it)
+        let esc = GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0 && GetForegroundWindow() == self.hwnd;
+        if esc && !self.esc_down {
+            self.esc_down = true;
+            return self.leave_edit();
+        }
+        if !esc {
+            self.esc_down = false;
+        }
+        if redraw {
+            if let Some(d) = self.hover_dirty(Hit::Panel) {
+                self.frame(d);
+            }
+        }
+    }
+
+    fn toast_rect(&self) -> RECT {
+        let s = self.s;
+        RECT { left: ((self.ui.mw / 2.0 - 420.0) * s) as i32, top: ((self.ui.mh * 0.5 - 40.0) * s) as i32, right: ((self.ui.mw / 2.0 + 420.0) * s) as i32, bottom: ((self.ui.mh * 0.5 + 40.0) * s) as i32 }
+    }
+
+    unsafe fn show_toast(&mut self, msg: String) {
+        self.ui.toast = Some(msg);
+        SetTimer(self.hwnd, T_TOAST, 2000, None);
+        let d = self.toast_rect();
+        self.frame(d);
+    }
+
+    // ------------------------------------------------ settings
+
+    fn note_own_write(&mut self) {
+        self.cfg_mtime = layout::config_mtime();
+    }
+
+    fn write_setting(&mut self, key: &str, v: serde_json::Value) {
+        if let Err(e) = layout::write_setting(key, v) {
+            eprintln!("mswidgets: {e}");
+        }
+        self.note_own_write();
+    }
+
+    fn save_layout(&mut self) {
+        if let Err(e) = layout::save_layout(&self.items) {
+            eprintln!("mswidgets: layout not saved: {e}");
+        }
+        self.note_own_write();
+    }
+
+    /// The glass slider: new tint strength for every card, live.
+    unsafe fn apply_glass(&mut self, g: f32) {
+        if (self.ui.glass - g).abs() < 1e-4 {
+            return;
+        }
+        self.ui.glass = g;
+        if let Err(e) = self.scene.set_glass(&self.gfx, g) {
+            eprintln!("mswidgets: glass: {e}");
+            return;
+        }
+        let now = self.now();
+        for i in 0..self.scene.len() {
+            let _ = self.scene.render_card(&self.gfx, i, &now);
+        }
+        let d = self.all_dirty();
+        self.frame(d);
+    }
+
+    /// Live (desktop duplication) <-> plain glass.
+    unsafe fn set_live(&mut self, live: bool) {
+        if self.ui.live == live {
+            return;
+        }
+        self.ui.live = live;
+        self.settings.live = live;
+        self.write_setting("widgetsGlassMode", serde_json::json!(if live { "capture" } else { "plain" }));
+        self.rebuild(true);
+    }
+
+    /// Re-create the backdrop and every GPU object of the scene (settings / monitor / DPI change); widget instances stay.
+    unsafe fn rebuild(&mut self, keep_layout: bool) {
+        let mon = monitor();
+        let (mw, mh) = (mon.rect.right - mon.rect.left, mon.rect.bottom - mon.rect.top);
+        let s = if keep_layout { self.s } else { GetDpiForWindow(self.hwnd) as f32 / 96.0 };
+        self.backdrop = None; // stops the capture thread before a new duplication is requested
+        self.mon = mon.rect;
+        self.work = mon.work;
+        self.s = s;
+        self.dims = grid_dims(&self.mon, &self.work, s);
+        let m = (MARGIN * s).round() as i32;
+        // card positions: from the grid again (a new monitor / scale); the stored layout is not rewritten
+        let specs = place_items(&mut self.items, &self.dims, s);
+        let mut rects = Vec::new();
+        for c in &self.scene.cards {
+            match specs.iter().find(|sp| sp.id == c.id) {
+                Some(sp) => rects.push((sp.x, sp.y, sp.w, sp.h)),
+                None => rects.push((c.x, c.y, c.w, c.h)),
+            }
+        }
+        let card_rects: Vec<RECT> = rects.iter().map(|&(x, y, w, h)| RECT { left: x, top: y, right: x + w, bottom: y + h }).collect();
+        let bd = make_backdrop(&self.gfx, &mon, mw, mh, self.settings.live, self.fps, &region_list(&card_rects, None, None), m);
+        bd.set_hwnd(self.hwnd);
+        self.use_dupl = bd.name().starts_with("desktop");
+        if let Err(e) = self.scene.reconfigure(&self.gfx, mw, mh, s, bd.bitmap(), &rects) {
+            eprintln!("mswidgets: rebuild: {e}");
+        }
+        self.backdrop = Some(bd);
+        self.ui.set_screen(s, mw as f32 / s, mh as f32 / s);
+        self.springs.clear();
+        let r = self.desired_window();
+        // the window moves with the monitor: force a new position and size
+        self.win = RECT { left: -1, top: -1, right: 0, bottom: 0 };
+        self.set_window(r);
+        self.ui.sync_panels(&mut self.scene, &self.gfx);
+        self.sync_regions();
+        if self.use_dupl {
+            let t = Instant::now();
+            while self.bd().take_dirty() == 0 && t.elapsed() < Duration::from_millis(400) {
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+        let all = self.all_mask();
+        self.redraw(all | BIT_GALLERY | BIT_TOOLBAR, true);
+        let d = RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h };
+        self.frame(d);
+        self.update_tick_timer();
+    }
+
+    unsafe fn replace_monitor(&mut self) {
+        let cur = monitor();
+        let same = cur.rect.left == self.mon.left && cur.rect.top == self.mon.top && cur.rect.right == self.mon.right && cur.rect.bottom == self.mon.bottom;
+        let s = GetDpiForWindow(self.hwnd) as f32 / 96.0;
+        let wa = cur.work.bottom == self.work.bottom && cur.work.top == self.work.top;
+        if same && (s - self.s).abs() < 0.01 && wa {
+            return;
+        }
+        if self.drag.is_some() {
+            self.end_drag();
+        }
+        eprintln!("mswidgets: monitor / DPI / work area changed, re-placing the widgets");
+        self.rebuild(false);
+    }
+
+    /// config.json changed behind our back (the settings of the Tauri app / a manual edit): glass, backdrop mode, dim.
+    unsafe fn poll_config(&mut self) {
+        if !self.visible {
+            return;
+        }
+        let m = layout::config_mtime();
+        if m == self.cfg_mtime {
+            return;
+        }
+        self.cfg_mtime = m;
+        let new = layout::read_settings();
+        let old = self.settings;
+        self.settings = new;
+        if new.dim != old.dim {
+            self.update_dim();
+        }
+        if new.appearance != old.appearance {
+            self.scene.set_appearance_pref(new.appearance);
+            self.last_anim = Instant::now();
+            self.arm_anim();
+        }
+        if (new.glass - old.glass).abs() > 1e-4 {
+            self.apply_glass(new.glass);
+        }
+        if new.live != old.live {
+            self.ui.live = new.live;
+            self.rebuild(true);
+        }
+    }
+
+    // ------------------------------------------------ click-through
+
+    /// WS_EX_TRANSPARENT toggled from a cursor poll: 100 ms normally, 16 ms within 8 px of a card.
+    unsafe fn hit_test(&mut self) {
+        if !self.visible {
+            return;
+        }
+        if self.want_full() {
+            if !self.interactive {
+                self.set_transparent(false);
+            }
+            return;
+        }
+        let mut p = POINT::default();
+        if GetCursorPos(&mut p).is_err() {
+            return;
+        }
+        let (mut inside, mut near) = (false, false);
+        for c in &self.scene.cards {
+            let r = RECT { left: c.x + self.mon.left, top: c.y + self.mon.top, right: c.x + c.w + self.mon.left, bottom: c.y + c.h + self.mon.top };
+            inside |= p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
+            near |= p.x >= r.left - NEAR_PX && p.x < r.right + NEAR_PX && p.y >= r.top - NEAR_PX && p.y < r.bottom + NEAR_PX;
+        }
+        let held = self.interactive && (GetAsyncKeyState(0x01) < 0 || GetAsyncKeyState(0x02) < 0);
+        let want = inside || held;
+        if want != self.interactive {
+            if !want && self.pressed.is_none() {
+                let now = self.now();
+                self.leave(&now); // the cursor left the cards: clear hover states
+            }
+            self.set_transparent(!want);
+        }
+        if near != self.near {
+            self.near = near;
+            SetTimer(self.hwnd, T_HIT, if near { 16 } else { 100 }, None);
+        }
+    }
+
+    unsafe fn show(&mut self) {
+        let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        place_above_desktop(self.hwnd);
+        self.visible = true;
+        if let Some(b) = &self.backdrop {
+            b.set_paused(false);
+        }
+        self.update_tick_timer();
+    }
+
+    /// One timer, armed for the earliest widget schedule; nothing is armed (zero wake-ups) while no visible card animates.
+    unsafe fn update_tick_timer(&mut self) {
+        match (self.visible, self.scene.next_due()) {
+            (true, Some(d)) => {
+                let ms = d.saturating_duration_since(Instant::now()).as_millis().clamp(1, 3_600_000) as u32;
+                SetTimer(self.hwnd, T_TICK, ms, None);
+            }
+            _ => {
+                let _ = KillTimer(self.hwnd, T_TICK);
+            }
+        }
+    }
+
+    /// Fullscreen guard (500 ms): hide while a fullscreen app is in front, pause the capture, re-stack on show.
+    unsafe fn guard(&mut self) {
+        // edit mode ends when another window takes the foreground (alt-tab, a click on another app)
+        if self.editing && self.ui.edit && !self.in_menu && self.drag.is_none() {
+            let fg = GetForegroundWindow();
+            let mut cls = [0u16; 64];
+            let n = GetClassNameW(fg, &mut cls);
+            let popup = String::from_utf16_lossy(&cls[..n.max(0) as usize]) == "#32768";
+            if fg == self.hwnd {
+                self.was_fg = true;
+            } else if self.was_fg && !fg.0.is_null() && !popup && self.t_edit.elapsed() > Duration::from_millis(1500) {
+                self.leave_edit();
+            }
+        }
+        // insurance against a lost WM_BACKDROP wake-up (the capture thread only posts when its mask was empty)
+        let m = self.bd().take_dirty();
+        if m != 0 && self.visible {
+            self.redraw(m, false);
+        }
+        let front = app_in_front(self.hwnd);
+        if front != self.app_front {
+            self.app_front = front;
+            self.update_dim();
+        }
+        let fs = foreground_is_fullscreen(self.hwnd);
+        if fs && self.visible {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            self.visible = false;
+            if let Some(b) = &self.backdrop {
+                b.set_paused(true);
+            }
+            self.update_tick_timer();
+        } else if !fs && !self.visible {
+            self.show();
+            let all = self.all_mask();
+            self.redraw(all, false);
+        } else if self.visible {
+            self.guard_n += 1;
+            if self.guard_n % 8 == 0 && !self.ui.edit {
+                place_above_desktop(self.hwnd); // explorer restarts / shell re-stacks
+            }
+        }
+    }
+
+    /// `widgetsDim`: monochrome cards while an app window is in front (auto) / always / never; off while editing.
+    unsafe fn update_dim(&mut self) {
+        let want = !self.ui.edit
+            && match self.settings.dim {
+                layout::Dim::Always => true,
+                layout::Dim::Never => false,
+                layout::Dim::Auto => self.app_front,
+            };
+        if want != self.scene.dimmed() {
+            self.scene.set_dim(want);
+            if self.visible {
+                let d = RECT { left: self.win.left, top: self.win.top, right: self.win.right, bottom: self.win.bottom };
+                self.frame(d);
+            }
+        }
+    }
+
+    unsafe fn report(&self) {
+        let secs = self.t0.elapsed().as_secs_f64();
+        let (acq, copied) = self.bd().stats();
+        let mut c = PROCESS_MEMORY_COUNTERS_EX::default();
+        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        let _ = GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut PROCESS_MEMORY_COUNTERS, c.cb);
+        let cpu = (cpu_time_100ns() - self.cpu0) as f64 / 1e7;
+        let steady = self.cpu_mark.map(|(t, c0)| (cpu_time_100ns() - c0) as f64 / 1e7 / t.elapsed().as_secs_f64() * 100.0);
+        let frames = self.st.backdrop_batches + self.st.clock_frames;
+        println!("backdrop={}", self.bd().name());
+        println!("seconds={secs:.1}");
+        println!("working_set_mb={:.1}", c.WorkingSetSize as f64 / 1048576.0);
+        println!("private_mb={:.1}", c.PrivateUsage as f64 / 1048576.0);
+        println!("cpu_percent_of_one_core={:.2}", cpu / secs * 100.0);
+        if let Some(s) = steady {
+            println!("cpu_percent_steady_state={s:.2}");
+        }
+        println!("frames_rendered={frames}");
+        println!("  backdrop_batches={} card_redraws={} clock_frames={}", self.st.backdrop_batches, self.st.card_redraws, self.st.clock_frames);
+        println!("duplication_frames={acq}");
+        println!("duplication_frames_with_gpu_copy={copied}");
+        println!("achieved_backdrop_fps={:.1}", self.st.backdrop_batches as f64 / secs);
+        println!("achieved_clock_fps={:.1}", self.st.clock_frames as f64 / secs);
+        println!("render_cpu_ms_avg={:.3}", self.st.render_ms / frames.max(1) as f64);
+        println!("present_cpu_ms_avg={:.3}", self.st.present_ms / frames.max(1) as f64);
+        println!("luminance_probes={}", self.st.lum_reads);
+    }
+}
+
+fn step_toward(v: f32, target: f32, d: f32) -> f32 {
+    if v < target {
+        (v + d).min(target)
+    } else {
+        (v - d).max(target)
+    }
+}
+
+fn cpu_time_100ns() -> u64 {
+    unsafe {
+        let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let _ = GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u);
+        let f = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+        f(k) + f(u)
+    }
+}
+
+/// Directly above the desktop host (Progman / the WorkerW owning SHELLDLL_DefView), below every app window.
+unsafe fn place_above_desktop(me: HWND) {
+    let has_view = |h: HWND| FindWindowExW(h, HWND::default(), w!("SHELLDLL_DefView"), PCWSTR::null()).is_ok();
+    let mut host = FindWindowW(w!("Progman"), PCWSTR::null()).ok().filter(|&h| has_view(h));
+    if host.is_none() {
+        let mut prev = HWND::default();
+        while let Ok(ww) = FindWindowExW(HWND::default(), prev, w!("WorkerW"), PCWSTR::null()) {
+            if has_view(ww) {
+                host = Some(ww);
+                break;
+            }
+            prev = ww;
+        }
+    }
+    if let Some(h) = host {
+        let _ = SetWindowPos(me, h, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+/// An ordinary app window is in front (not the desktop, the taskbar, the shell's own surfaces or this process): what "auto" dim reacts to.
+unsafe fn app_in_front(me: HWND) -> bool {
+    let hwnd = GetForegroundWindow();
+    if hwnd.0.is_null() || hwnd == me {
+        return false;
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == windows::Win32::System::Threading::GetCurrentProcessId() {
+        return false;
+    }
+    let mut buf = [0u16; 128];
+    let len = GetClassNameW(hwnd, &mut buf);
+    let class = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+    !matches!(
+        class.as_str(),
+        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Windows.UI.Core.CoreWindow" | "XamlExplorerHostIslandWindow" | "TopLevelWindowForOverflowXamlIsland" | "NotifyIconOverflowWindow" | "ForegroundStaging" | "#32768"
+    )
+}
+
+/// Same logic as `foreground_is_fullscreen` in src-tauri/src/main.rs (the own window does not count).
+unsafe fn foreground_is_fullscreen(me: HWND) -> bool {
+    let hwnd = GetForegroundWindow();
+    if hwnd.0.is_null() || hwnd == me {
+        return false;
+    }
+    let mut buf = [0u16; 256];
+    let len = GetClassNameW(hwnd, &mut buf);
+    let class = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+    if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+        return false;
+    }
+    let mut r = RECT::default();
+    if GetWindowRect(hwnd, &mut r).is_err() {
+        return false;
+    }
+    let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
+        return false;
+    }
+    let m = mi.rcMonitor;
+    r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spring_settles_on_the_target_with_a_little_overshoot() {
+        let mut s = Spring { x: 0.0, y: 0.0, vx: 0.0, vy: 0.0, tx: 400.0, ty: -40.0 };
+        let (mut t, mut max_x, mut done) = (0.0f32, 0.0f32, false);
+        while !done && t < 2.0 {
+            done = s.step(0.016);
+            t += 0.016;
+            max_x = max_x.max(s.x);
+        }
+        assert!(done && (s.x - 400.0).abs() < 0.01 && (s.y + 40.0).abs() < 0.01);
+        assert!((0.2..0.7).contains(&t), "settled after {t}s");
+        assert!(max_x > 403.0 && max_x < 420.0, "overshoot {max_x}");
+    }
+
+    #[test]
+    fn pop_in_and_out() {
+        let t0 = Instant::now();
+        let p = Pop { t0, out: false };
+        let s0 = p.at(t0, false);
+        assert!((s0.scale - 0.92).abs() < 1e-3 && s0.alpha == 0.0 && s0.blur > 0.99 && !s0.finished);
+        // a start in the future (staggered start-up) shows the first frame
+        assert_eq!(p.at(t0 - Duration::from_millis(5), false).alpha, 0.0);
+        let s1 = p.at(t0 + Duration::from_secs(1), false);
+        assert!((s1.scale - 1.0).abs() < 1e-3 && s1.alpha == 1.0 && s1.finished && s1.blur == 0.0);
+        let o = Pop { t0, out: true };
+        let e = o.at(t0 + Duration::from_millis(300), false);
+        assert!(e.alpha == 0.0 && e.finished);
+        let x = mat_xf(&s0, 0.0, 0.0);
+        assert!(!x.is_id() && x.blur > 0.99 && x.sweep < 0.0);
+        assert!(mat_xf(&s1, 0.0, 0.0).is_id());
+    }
+
+    #[test]
+    fn window_is_the_card_box_plus_margin() {
+        let cards = [RECT { left: 100, top: 200, right: 270, bottom: 370 }, RECT { left: 300, top: 150, right: 470, bottom: 320 }];
+        let w = window_rect(&cards, 48, 1920, 1080);
+        assert_eq!((w.left, w.top, w.right, w.bottom), (52, 102, 518, 418));
+        let edge = window_rect(&[RECT { left: 10, top: 10, right: 100, bottom: 100 }], 48, 1920, 1080);
+        assert_eq!((edge.left, edge.top), (0, 0));
+    }
+
+    #[test]
+    fn regions_reserve_gallery_and_toolbar_bits() {
+        let r = region_list(&[RECT { left: 1, top: 2, right: 3, bottom: 4 }], Some(RECT { left: 5, top: 5, right: 9, bottom: 9 }), None);
+        assert_eq!(r.len(), 64);
+        assert_eq!(r[0].right, 3);
+        assert_eq!(r[62].right, 9);
+        assert_eq!(r[63].right, 0);
+        assert_eq!(unpack(((300i32 << 16) | 200) as isize), (200, 300));
+        assert_eq!(unpack(0xFFFF_FFFF_u32 as isize), (-1, -1));
+    }
+}

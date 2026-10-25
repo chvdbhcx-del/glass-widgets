@@ -1,0 +1,454 @@
+//! Which widgets sit where: `%APPDATA%\macshell\config.json` -> `widgetsLayout` = [{id, type, size, col, row, cfg}].
+//! The Tauri app writes the same file, so every write here is a read-modify-write of ONE field (`cfg` of one item), keeps all
+//! other keys exactly as parsed and goes through a temp file + rename. A file that cannot be parsed is never touched.
+use crate::registry;
+use crate::widget::Size;
+use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+#[derive(Clone, Debug)]
+pub struct Item {
+    pub id: String,
+    pub type_id: String,
+    pub size: Size,
+    pub col: u32,
+    pub row: u32,
+    pub cfg: Value,
+}
+
+pub fn config_path() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("APPDATA")?).join("macshell").join("config.json"))
+}
+
+fn new_id(t: &str, salt: usize) -> String {
+    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos() as u64 ^ d.as_secs() << 20).unwrap_or(0).wrapping_add(salt as u64 * 7919);
+    let mut s = String::new();
+    let mut v = n;
+    for _ in 0..6 {
+        s.push(char::from_digit((v % 36) as u32, 36).unwrap_or('x'));
+        v /= 36;
+    }
+    format!("{t}-{s}")
+}
+
+/// Layout from config.json (unknown types skipped; a size the widget does not support falls back to its default); the default
+/// layout when `use_config` is false, the file is missing / unreadable or the array is empty. Never writes anything.
+pub fn load(use_config: bool) -> Vec<Item> {
+    load_path(if use_config { config_path() } else { None }.as_deref())
+}
+
+pub fn load_path(path: Option<&std::path::Path>) -> Vec<Item> {
+    let read = || -> Option<Vec<Item>> {
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(path?).ok()?).ok()?;
+        let reg = registry::global();
+        let items: Vec<Item> = v
+            .get("widgetsLayout")?
+            .as_array()?
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| {
+                let t = it.get("type")?.as_str()?;
+                let def = reg.get(t)?;
+                let size = it.get("size").and_then(|s| s.as_str()).and_then(Size::parse).filter(|s| def.sizes.contains(s)).unwrap_or(def.default_size);
+                let id = it.get("id").and_then(|s| s.as_str()).map(str::to_string).unwrap_or_else(|| new_id(t, i));
+                let cfg = it.get("cfg").filter(|c| c.is_object()).cloned().unwrap_or_else(|| json!({}));
+                Some(Item { id, type_id: t.to_string(), size, col: it.get("col")?.as_u64()? as u32, row: it.get("row")?.as_u64()? as u32, cfg })
+            })
+            .collect();
+        (!items.is_empty()).then_some(items)
+    };
+    read().unwrap_or_else(default_layout)
+}
+
+/// Tidy default: clock S + calendar S in row 0, then up to two more finished (non-stub) widgets as default-size cards below.
+pub fn default_layout() -> Vec<Item> {
+    let reg = registry::global();
+    let mut order: Vec<&str> = vec!["clock", "calendar"];
+    order.extend(reg.all().iter().map(|d| d.type_id).filter(|t| !matches!(*t, "clock" | "calendar") && !reg.is_stub(t)).take(2));
+    let mut used: HashSet<(u32, u32)> = HashSet::new();
+    let mut out = Vec::new();
+    for (i, t) in order.iter().enumerate() {
+        let Some(def) = reg.get(t) else { continue };
+        let (cw, ch) = def.default_size.cells();
+        'find: for row in 0..16 {
+            for col in 0..=(2 - cw) {
+                let free = (0..cw).all(|dx| (0..ch).all(|dy| !used.contains(&(col + dx, row + dy))));
+                if free {
+                    for dx in 0..cw {
+                        for dy in 0..ch {
+                            used.insert((col + dx, row + dy));
+                        }
+                    }
+                    out.push(Item { id: new_id(t, i), type_id: t.to_string(), size: def.default_size, col, row, cfg: json!({}) });
+                    break 'find;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Split on ';' outside of {...}.
+fn split_top(spec: &str) -> Vec<&str> {
+    let (mut out, mut depth, mut start) = (Vec::new(), 0i32, 0usize);
+    for (i, ch) in spec.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ';' if depth == 0 => {
+                out.push(&spec[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&spec[start..]);
+    out
+}
+
+/// "clock:s@0,0;calendar:m@1,0;weather@0,1;notes:m@0,2{\"text\":\"hi\"}" for `--cards`: size optional, optional JSON `cfg` after the position.
+pub fn parse_cards(spec: &str) -> Result<Vec<Item>, String> {
+    let reg = registry::global();
+    let mut out = Vec::new();
+    for (i, part) in split_top(spec).into_iter().map(str::trim).filter(|p| !p.is_empty()).enumerate() {
+        let (part, cfg) = match part.split_once('{') {
+            Some((a, b)) => (a.trim(), serde_json::from_str::<Value>(&format!("{{{b}")).map_err(|e| format!("'{part}': bad cfg JSON ({e})"))?),
+            None => (part, json!({})),
+        };
+        let (head, pos) = part.split_once('@').ok_or_else(|| format!("'{part}': expected type[:size]@col,row"))?;
+        let (t, sz) = head.split_once(':').map_or((head, None), |(a, b)| (a, Some(b)));
+        let def = reg.get(t.trim()).ok_or_else(|| format!("unknown widget '{t}' (known: {})", reg.all().iter().map(|d| d.type_id).collect::<Vec<_>>().join(", ")))?;
+        let size = match sz {
+            Some(s) => Size::parse(s.trim()).filter(|s| def.sizes.contains(s)).ok_or_else(|| format!("'{t}' does not support size '{s}'"))?,
+            None => def.default_size,
+        };
+        let (c, r) = pos.split_once(',').ok_or_else(|| format!("'{part}': position must be col,row"))?;
+        let (col, row) = (c.trim().parse().map_err(|_| format!("bad col '{c}'"))?, r.trim().parse().map_err(|_| format!("bad row '{r}'"))?);
+        out.push(Item { id: format!("{}-{i}", def.type_id), type_id: def.type_id.to_string(), size, col, row, cfg });
+    }
+    if out.is_empty() {
+        return Err("--cards: nothing to draw".into());
+    }
+    Ok(out)
+}
+
+fn item_json(it: &Item) -> Value {
+    json!({ "id": it.id, "type": it.type_id, "size": it.size.key(), "col": it.col, "row": it.row, "cfg": it.cfg })
+}
+
+/// Persist the `cfg` of card `id` (current value taken from `items`). Never clobbers: unparsable file -> nothing written;
+/// layout array exists but no longer has this id (the Tauri app rearranged it) -> nothing written; array missing or empty ->
+/// the whole current layout is written once.
+pub fn persist_cfg(items: &[Item], id: &str) {
+    let Some(p) = config_path() else { return };
+    let mut root: Value = match std::fs::read_to_string(&p) {
+        Ok(t) => match serde_json::from_str(&t) {
+            Ok(v) => v,
+            Err(e) => return eprintln!("mswidgets: config.json is not valid JSON ({e}); settings not saved"),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return eprintln!("mswidgets: config.json unreadable ({e}); settings not saved"),
+    };
+    let Some(me) = items.iter().find(|i| i.id == id) else { return };
+    let obj = match root.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    let arr = obj.get("widgetsLayout").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    if arr.is_empty() {
+        obj.insert("widgetsLayout".into(), Value::Array(items.iter().map(item_json).collect()));
+    } else {
+        let mut arr = arr;
+        match arr.iter_mut().find(|e| e.get("id").and_then(|v| v.as_str()) == Some(id)) {
+            Some(e) => e["cfg"] = me.cfg.clone(),
+            None => return,
+        }
+        obj.insert("widgetsLayout".into(), Value::Array(arr));
+    }
+    let Ok(text) = serde_json::to_string_pretty(&root) else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = p.with_extension("json.tmp");
+    if std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &p)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!("mswidgets: could not write config.json");
+    }
+}
+
+/// UI language from config.json (`lang`: "ru" | "en"), default ru.
+pub fn lang() -> crate::widget::Lang {
+    let l = (|| -> Option<String> {
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(config_path()?).ok()?).ok()?;
+        v.get("lang")?.as_str().map(str::to_string)
+    })();
+    if l.as_deref().is_some_and(|s| s.starts_with("en")) {
+        crate::widget::Lang::En
+    } else {
+        crate::widget::Lang::Ru
+    }
+}
+
+// ---------------------------------------------------------------- host: settings, layout write-back
+
+/// `widgetsDim`: widgets turn monochrome while an app window is in front (auto) / always / never.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dim {
+    Auto,
+    Always,
+    Never,
+}
+
+/// The host settings of config.json: `widgetsGlass` 0..1, `widgetsDim`, `widgetsGlassMode` ("plain" = no desktop capture, anything else = live glass),
+/// `widgetsAppearance` ("auto" | "dark" | "light").
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Settings {
+    pub glass: f32,
+    pub dim: Dim,
+    pub live: bool,
+    /// `widgetsAppearance`: auto (from the backdrop) / dark / light glass
+    pub appearance: crate::motion::AppearancePref,
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { glass: 0.5, dim: Dim::Auto, live: true, appearance: crate::motion::AppearancePref::Dark }
+    }
+}
+impl Settings {
+    pub fn from_value(v: &Value) -> Settings {
+        let d = Settings::default();
+        Settings {
+            glass: v.get("widgetsGlass").and_then(|g| g.as_f64()).map_or(d.glass, |g| g.clamp(0.0, 1.0) as f32),
+            dim: match v.get("widgetsDim").and_then(|g| g.as_str()) {
+                Some("always") => Dim::Always,
+                Some("never") => Dim::Never,
+                _ => Dim::Auto,
+            },
+            live: v.get("widgetsGlassMode").and_then(|g| g.as_str()) != Some("plain"),
+            appearance: v.get("widgetsAppearance").and_then(|g| g.as_str()).and_then(crate::motion::AppearancePref::parse).unwrap_or_default(),
+        }
+    }
+}
+
+/// Settings from the user's config.json (defaults for a missing / unreadable file).
+pub fn read_settings() -> Settings {
+    config_path().and_then(|p| read_root(&p).ok()).map(|v| Settings::from_value(&v)).unwrap_or_default()
+}
+
+pub fn config_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(config_path()?).and_then(|m| m.modified()).ok()
+}
+
+/// config.json as JSON; a missing file is an empty object, anything else that cannot be parsed is an error (and is never overwritten).
+fn read_root(p: &std::path::Path) -> Result<Value, String> {
+    match std::fs::read_to_string(p) {
+        Ok(t) => serde_json::from_str(&t).map_err(|e| format!("{} is not valid JSON ({e})", p.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
+        Err(e) => Err(format!("{} unreadable ({e})", p.display())),
+    }
+}
+
+/// Temp file + rename: the file is either the old or the new content, never half of it.
+fn write_root(p: &std::path::Path, root: &Value) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(root).map_err(|e| e.to_string())?;
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, p)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("could not write {}: {e}", p.display())
+    })
+}
+
+/// Write one top-level key (`widgetsGlass`, `widgetsGlassMode`, ...) of config.json, everything else untouched.
+pub fn write_setting(key: &str, val: Value) -> Result<(), String> {
+    let p = config_path().ok_or("no APPDATA")?;
+    write_setting_to(&p, key, val)
+}
+pub fn write_setting_to(p: &std::path::Path, key: &str, val: Value) -> Result<(), String> {
+    let mut root = read_root(p)?;
+    root.as_object_mut().ok_or("config root is not an object")?.insert(key.to_string(), val);
+    write_root(p, &root)
+}
+
+/// Persist the whole layout after the user moved / resized / added / removed a card. Per-item keys the host does not know are kept,
+/// entries of widget types this renderer does not know are kept untouched, an unparsable file is never overwritten.
+pub fn save_layout(items: &[Item]) -> Result<(), String> {
+    let p = config_path().ok_or("no APPDATA")?;
+    save_layout_to(&p, items)
+}
+pub fn save_layout_to(p: &std::path::Path, items: &[Item]) -> Result<(), String> {
+    let mut root = read_root(p)?;
+    let obj = root.as_object_mut().ok_or("config root is not an object")?;
+    let old: Vec<Value> = obj.get("widgetsLayout").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let reg = registry::global();
+    let id_of = |v: &Value| v.get("id").and_then(|s| s.as_str()).map(str::to_string);
+    let mut out: Vec<Value> = items
+        .iter()
+        .map(|it| {
+            let mut e = old.iter().find(|o| id_of(o).as_deref() == Some(it.id.as_str())).filter(|o| o.is_object()).cloned().unwrap_or_else(|| json!({}));
+            e["id"] = json!(it.id);
+            e["type"] = json!(it.type_id);
+            e["size"] = json!(it.size.key());
+            e["col"] = json!(it.col);
+            e["row"] = json!(it.row);
+            e["cfg"] = it.cfg.clone();
+            e
+        })
+        .collect();
+    for o in &old {
+        let unknown = o.get("type").and_then(|t| t.as_str()).is_none_or(|t| reg.get(t).is_none());
+        let have = id_of(o).is_some_and(|id| items.iter().any(|it| it.id == id));
+        if unknown && !have {
+            out.push(o.clone());
+        }
+    }
+    obj.insert("widgetsLayout".into(), Value::Array(out));
+    write_root(p, &root)
+}
+
+fn base36(mut v: u128) -> String {
+    let mut s = Vec::new();
+    loop {
+        s.push(char::from_digit((v % 36) as u32, 36).unwrap_or('0'));
+        v /= 36;
+        if v == 0 {
+            break;
+        }
+    }
+    s.iter().rev().collect()
+}
+
+/// `<type>-<base36 millis since epoch>`, made unique among `items`.
+pub fn new_id_time(t: &str, items: &[Item]) -> String {
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let mut id = format!("{t}-{}", base36(ms));
+    let mut n = 0u32;
+    while items.iter().any(|i| i.id == id) {
+        n += 1;
+        id = format!("{t}-{}{}", base36(ms), base36(n as u128));
+    }
+    id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// persist_cfg keeps every unknown key / other item, replaces only the cfg of one id, and leaves no temp file.
+    #[test]
+    fn persist_cfg_is_surgical() {
+        let dir = std::env::temp_dir().join(format!("mswidgets-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("macshell")).unwrap();
+        std::env::set_var("APPDATA", &dir);
+        let cfg = dir.join("macshell").join("config.json");
+        std::fs::write(&cfg, r#"{"mode":"widgets","extra":{"a":[1,2,3]},"widgetsLayout":[{"cfg":{},"col":0,"id":"clock-1","row":0,"size":"s","type":"clock","unknown":7},{"cfg":{"k":1},"col":1,"id":"calendar-2","row":0,"size":"s","type":"calendar"}]}"#).unwrap();
+        let mut items = vec![
+            Item { id: "clock-1".into(), type_id: "clock".into(), size: Size::S, col: 0, row: 0, cfg: json!({"zones": []}) },
+            Item { id: "calendar-2".into(), type_id: "calendar".into(), size: Size::S, col: 1, row: 0, cfg: json!({"k": 1}) },
+        ];
+        persist_cfg(&items, "clock-1");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["mode"], "widgets");
+        assert_eq!(v["extra"]["a"][2], 3);
+        assert_eq!(v["widgetsLayout"][0]["cfg"]["zones"], json!([]));
+        assert_eq!(v["widgetsLayout"][0]["unknown"], 7);
+        assert_eq!(v["widgetsLayout"][1]["cfg"]["k"], 1);
+        assert!(!dir.join("macshell").join("config.json.tmp").exists());
+        // an id the file no longer has: nothing is written
+        items[0].id = "gone".into();
+        let before = std::fs::read_to_string(&cfg).unwrap();
+        persist_cfg(&items, "gone");
+        assert_eq!(before, std::fs::read_to_string(&cfg).unwrap());
+        // unparsable file: untouched
+        std::fs::write(&cfg, "{ not json").unwrap();
+        persist_cfg(&items, "gone");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "{ not json");
+        // empty layout: the whole current layout is written once
+        std::fs::write(&cfg, r#"{"mode":"widgets","widgetsLayout":[]}"#).unwrap();
+        items[0].id = "clock-1".into();
+        persist_cfg(&items, "clock-1");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["widgetsLayout"].as_array().unwrap().len(), 2);
+        assert_eq!(v["mode"], "widgets");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn item(id: &str, t: &str, size: Size, col: u32, row: u32) -> Item {
+        Item { id: id.into(), type_id: t.into(), size, col, row, cfg: json!({}) }
+    }
+
+    /// The layout round trip: moved / added / removed items are written, foreign keys and foreign widget types survive,
+    /// an unparsable file is refused, a missing file is created. Uses explicit paths (no APPDATA, no races with the other test).
+    #[test]
+    fn layout_round_trip_keeps_foreign_data() {
+        let dir = std::env::temp_dir().join(format!("mswidgets-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config.json");
+        std::fs::write(
+            &f,
+            r#"{"mode":"widgets","widgetsGlass":0.7,"widgetsLayout":[{"id":"clock-1","type":"clock","size":"s","col":0,"row":0,"cfg":{},"unknown":7},{"id":"zzz-9","type":"no_such_widget","size":"m","col":3,"row":1,"cfg":{"a":1}},{"id":"gone-1","type":"calendar","size":"s","col":4,"row":0,"cfg":{}}]}"#,
+        )
+        .unwrap();
+        let items = vec![item("clock-1", "clock", Size::M, 2, 1), item("weather-abc", "weather", Size::S, 0, 0)];
+        save_layout_to(&f, &items).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        let arr = v["widgetsLayout"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!((arr[0]["id"].as_str(), arr[0]["size"].as_str(), arr[0]["col"].as_u64(), arr[0]["row"].as_u64()), (Some("clock-1"), Some("m"), Some(2), Some(1)));
+        assert_eq!(arr[0]["unknown"], 7);
+        assert_eq!(arr[1]["id"], "weather-abc");
+        assert_eq!(arr[2]["id"], "zzz-9"); // foreign widget type kept
+        assert!(arr.iter().all(|e| e["id"] != "gone-1")); // a known type that the user removed is gone
+        assert_eq!(v["mode"], "widgets");
+        assert_eq!(v["widgetsGlass"], 0.7);
+        assert!(!f.with_extension("json.tmp").exists());
+        let back = load_path(Some(&f));
+        assert_eq!(back.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["clock-1", "weather-abc"]);
+        assert_eq!((back[0].col, back[0].row), (2, 1));
+        assert_eq!(Settings::from_value(&v).glass, 0.7);
+        // single setting write keeps the layout
+        write_setting_to(&f, "widgetsGlassMode", json!("plain")).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        assert!(!Settings::from_value(&v).live);
+        assert_eq!(v["widgetsLayout"].as_array().unwrap().len(), 3);
+        // unparsable: refused, untouched
+        std::fs::write(&f, "{ nope").unwrap();
+        assert!(save_layout_to(&f, &items).is_err());
+        assert!(write_setting_to(&f, "widgetsGlass", json!(0.1)).is_err());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "{ nope");
+        assert_eq!(load_path(Some(&f)).len(), default_layout().len()); // falls back to the default layout
+        // missing: created
+        let g = dir.join("sub").join("config.json");
+        save_layout_to(&g, &items).unwrap();
+        assert_eq!(load_path(Some(&g)).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_defaults_and_ids() {
+        assert_eq!(Settings::from_value(&json!({})), Settings::default());
+        let s = Settings::from_value(&json!({"widgetsGlass": 7, "widgetsDim": "always", "widgetsGlassMode": "plain"}));
+        assert_eq!((s.glass, s.dim, s.live), (1.0, Dim::Always, false));
+        let items = vec![item("clock-1", "clock", Size::S, 0, 0)];
+        let a = new_id_time("clock", &items);
+        assert!(a.starts_with("clock-") && a.len() > 8);
+        let taken = vec![item(&a, "clock", Size::S, 0, 0)];
+        assert_ne!(new_id_time("clock", &taken), a);
+        assert_eq!(base36(35), "z");
+        assert_eq!(base36(36), "10");
+    }
+
+    #[test]
+    fn cards_arg_parses_sizes_and_cfg() {
+        let ok = parse_cards("clock:s@0,0;calendar:m@1,0;weather:l@0,1{\"city\":\"Oslo\"}").unwrap();
+        assert_eq!(ok.len(), 3);
+        assert_eq!(ok[2].cfg["city"], "Oslo");
+        assert!(parse_cards("worldclock:s@0,0").is_err()); // S not supported
+        assert!(parse_cards("nope@0,0").is_err());
+    }
+}

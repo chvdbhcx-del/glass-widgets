@@ -1,0 +1,8 @@
+# build output (the project builds into several private target dirs during development)
+/target*/
+/dist/
+
+# renders, benchmark logs and calibration inputs
+/out/
+/calib/ref/
+*.log
