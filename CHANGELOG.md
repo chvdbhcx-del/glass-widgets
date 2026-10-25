@@ -1,6 +1,17 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-10-25
+
+### Changed
+- Typography: the bundled Nunito typeface (SIL OFL, Latin + Cyrillic) is used everywhere, hinted grayscale text with even digits and stems, heavier captions, brighter secondary text. `MSW_FONT=system` falls back to Segoe UI.
+- Disks widget: roomier ring, clearer M / L rows.
+- Text prompt (new reminder, note, timer...): rounded glass-style panel with a field well, placeholder and Add / Cancel buttons.
+- New installer: artwork, app icon, English and Russian pages, optional desktop shortcut and autostart, project link on the last page.
+- Wider slider ranges, so every slider visibly changes the look; the icon is embedded into the exe.
+
+### Fixed
+- Changing the card size left the glass without a backdrop.
+- Dimming no longer turns the widgets grey when another window is active (it is off by default).
 
 ### Added
 - Tray icon with a menu (settings, edit widgets, hide / show, start with Windows, quit); it is added again after Explorer restarts.

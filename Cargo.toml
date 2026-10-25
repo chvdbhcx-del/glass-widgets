@@ -1,6 +1,6 @@
 [package]
 name = "mswidgets"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Glass Widgets: native (no WebView) Direct2D desktop widgets for Windows with a Liquid-Glass look"
 license = "MIT"
@@ -76,6 +76,9 @@ features = [
   "Win32_System_Console",
   "Devices_Radios",
 ]
+
+[build-dependencies]
+winresource = "0.1" # embeds installer/icon.ico and the version info into the exe
 
 [profile.release]
 opt-level = "s"

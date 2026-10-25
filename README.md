@@ -17,7 +17,7 @@ and roughly 100 MB of RAM and under 10 % of one CPU core while the wallpaper mov
 
 - **Real glass**: each card refracts and blurs the wallpaper behind it, with a chromatic fringe, a specular highlight that follows
   the light and a soft materialise animation. Cards that touch merge into one blob.
-- **Dark or light glass** (`dark` by default) and crisp Segoe UI Variable typography.
+- **Dark or light glass** (`dark` by default) and crisp Nunito typography (bundled, SIL OFL).
 - **Live wallpapers work**: the glass reads the wallpaper window itself, so it follows videos and animated wallpapers.
 - **Visible to screenshots and screen recorders**: the layer never captures itself.
 - **Light**: about 100 MB of RAM and under 10 % of one core with an animated wallpaper.
