@@ -22,6 +22,8 @@ pub enum TrayCmd {
     Profile(usize),
     SaveProfile,
     DeleteProfile,
+    /// "Monitor" submenu: move the desk to the n-th monitor (display order, the list in `MenuState::monitors`)
+    Monitor(usize),
     Quit,
 }
 
@@ -34,6 +36,9 @@ pub struct MenuState {
     /// saved layout profiles (config `profiles`) and the checked one (`activeProfile`)
     pub profiles: Vec<String>,
     pub active: Option<usize>,
+    /// the connected monitors in display order ("1 (основной)", "2", ...) and the one the desk is on; the submenu appears with 2 or more
+    pub monitors: Vec<String>,
+    pub monitor: usize,
 }
 
 /// The id of the broadcast Explorer sends after it (re)creates the taskbar: the icon must be added again.
@@ -76,9 +81,14 @@ const C_SAVE_PROFILE: usize = 6;
 /// the "Layouts" submenu entry of the main menu (a popup, no command id of its own)
 const C_LAYOUTS: usize = 8;
 const C_DELETE_PROFILE: usize = 7;
+/// the "Monitor" submenu entry of the main menu (a popup)
+const C_MONITORS: usize = 9;
 /// + the index of the profile; at most `MAX_PROFILES` are listed
 const C_PROFILE: usize = 100;
 const MAX_PROFILES: usize = 40;
+/// + the display position of the monitor; at most `MAX_MONITORS` are listed
+const C_MONITOR: usize = 200;
+const MAX_MONITORS: usize = 16;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -103,11 +113,20 @@ pub unsafe fn run_menu(hwnd: HWND, st: &MenuState, foreground: impl Fn(HWND)) ->
         let del = MF_STRING | if st.active.is_some() { MF_ENABLED } else { MF_GRAYED };
         let _ = AppendMenuW(sub, del, C_DELETE_PROFILE, PCWSTR(t("Удалить текущий макет", "Delete current layout").as_ptr()));
     }
+    // the "Monitor" submenu: one entry per connected monitor (radio mark on the one the desk is on); only with a second monitor
+    let monitors = if st.monitors.len() > 1 { CreatePopupMenu().ok() } else { None };
+    if let Some(sub) = monitors {
+        for (i, name) in st.monitors.iter().take(MAX_MONITORS).enumerate() {
+            let flags = MF_STRING | if st.monitor == i { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(sub, flags, C_MONITOR + i, PCWSTR(wide(&name.replace('&', "&&")).as_ptr()));
+        }
+    }
     let items = [
         (C_SETTINGS, t("Настройки…", "Settings…"), false),
         (C_EDIT, if st.editing { t("Готово", "Done") } else { t("Изменить виджеты…", "Edit Widgets…") }, false),
         (C_VISIBLE, if st.hidden { t("Показать виджеты", "Show Widgets") } else { t("Скрыть виджеты", "Hide Widgets") }, false),
         (C_LAYOUTS, t("Макеты", "Layouts"), false),
+        (C_MONITORS, t("Монитор", "Monitor"), false),
         (0, Vec::new(), false),
         (C_AUTOSTART, t("Запускать вместе с Windows", "Start with Windows"), st.autostart),
         (0, Vec::new(), false),
@@ -118,6 +137,10 @@ pub unsafe fn run_menu(hwnd: HWND, st: &MenuState, foreground: impl Fn(HWND)) ->
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         } else if *id == C_LAYOUTS {
             if let Some(sub) = layouts {
+                let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(label.as_ptr()));
+            }
+        } else if *id == C_MONITORS {
+            if let Some(sub) = monitors {
                 let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(label.as_ptr()));
             }
         } else {
@@ -141,6 +164,7 @@ pub unsafe fn run_menu(hwnd: HWND, st: &MenuState, foreground: impl Fn(HWND)) ->
         C_DELETE_PROFILE => TrayCmd::DeleteProfile,
         C_QUIT => TrayCmd::Quit,
         c if (C_PROFILE..C_PROFILE + MAX_PROFILES).contains(&c) => TrayCmd::Profile(c - C_PROFILE),
+        c if (C_MONITOR..C_MONITOR + MAX_MONITORS).contains(&c) => TrayCmd::Monitor(c - C_MONITOR),
         _ => TrayCmd::None,
     }
 }

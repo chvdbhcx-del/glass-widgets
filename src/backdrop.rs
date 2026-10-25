@@ -95,10 +95,17 @@ pub struct OutputInfo {
     /// Desktop coordinates of the monitor.
     pub rect: RECT,
     pub adapter_name: String,
+    /// LUID of the adapter (high part << 32 | low part): a shared capture texture only works between devices on the same GPU
+    pub luid: i64,
 }
 
 /// The adapter/output pair that owns the primary monitor (the machine has two GPUs: the device must live on the owner).
 pub fn find_primary_output() -> Option<OutputInfo> {
+    find_output(None)
+}
+
+/// The adapter/output pair of the monitor with GDI device name `device` (`\\.\DISPLAY2`); `None` = the primary monitor.
+pub fn find_output(device: Option<&str>) -> Option<OutputInfo> {
     unsafe {
         let f: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
         let prim = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
@@ -109,10 +116,19 @@ pub fn find_primary_output() -> Option<OutputInfo> {
             while let Ok(o) = a.EnumOutputs(oi) {
                 oi += 1;
                 let Ok(d) = o.GetDesc() else { continue };
-                if d.Monitor == prim {
-                    let name = a.GetDesc1().map(|d| String::from_utf16_lossy(&d.Description).trim_end_matches('\0').to_string()).unwrap_or_default();
+                let hit = match device {
+                    None => d.Monitor == prim,
+                    Some(n) => {
+                        let len = d.DeviceName.iter().position(|&c| c == 0).unwrap_or(d.DeviceName.len());
+                        String::from_utf16_lossy(&d.DeviceName[..len]).eq_ignore_ascii_case(n)
+                    }
+                };
+                if hit {
+                    let desc = a.GetDesc1().ok();
+                    let name = desc.as_ref().map(|d| String::from_utf16_lossy(&d.Description).trim_end_matches('\0').to_string()).unwrap_or_default();
+                    let luid = desc.map_or(0, |d| ((d.AdapterLuid.HighPart as i64) << 32) | d.AdapterLuid.LowPart as i64);
                     let output = o.cast::<IDXGIOutput1>().ok()?;
-                    return Some(OutputInfo { adapter: a, output, rect: d.DesktopCoordinates, adapter_name: name });
+                    return Some(OutputInfo { adapter: a, output, rect: d.DesktopCoordinates, adapter_name: name, luid });
                 }
             }
         }
