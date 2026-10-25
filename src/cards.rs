@@ -1407,7 +1407,8 @@ impl Scene {
     pub fn with_ui_cx<R>(&self, gfx: &Gfx, base: Matrix3x2, lang: Lang, now: &Now, f: impl FnOnce(&Cx) -> R) -> R {
         let mut cfg = json!({});
         let flags = Flags::default();
-        let cx = Cx::new(CxParts { gfx, res: &self.sh.res, flags: &flags, cfg: &mut cfg, size: Size::S, scale: self.s, now: *now, preview: true, lum: 0.2, lang, hover: None, waker: Waker::default(), utc_off: 0, base, light: false });
+        let mut cx = Cx::new(CxParts { gfx, res: &self.sh.res, flags: &flags, cfg: &mut cfg, size: Size::S, scale: self.s, now: *now, preview: true, lum: 0.2, lang, hover: None, waker: Waker::default(), utc_off: 0, base, light: false });
+        cx.plain = true;
         unsafe { gfx.dc.SetTransform(&base) };
         let r = f(&cx);
         cx.finish();

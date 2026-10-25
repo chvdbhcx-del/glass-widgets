@@ -110,14 +110,6 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 3] {
     [r + m, g + m, b + m]
 }
 
-/// A fill for chrome that carries white text, from the accent: the same hue and saturation, lightness lowered by .18 into .38 ..= .55
-/// (the default accent comes out as a deep sky blue); `lift` adds lightness (hover).
-pub fn fill(rgb: [u8; 3], lift: f32) -> [u8; 3] {
-    let (h, s, l) = rgb_to_hsl(rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0);
-    let out = hsl_to_rgb(h, s, ((l - 0.18).clamp(0.38, 0.55) + lift).min(0.9));
-    [(out[0] * 255.0).round() as u8, (out[1] * 255.0).round() as u8, (out[2] * 255.0).round() as u8]
-}
-
 // ---------------------------------------------------------------- the wallpaper
 
 /// The current wallpaper file and its modification time (a slideshow rewrites the same transcoded file, so the time matters too).
@@ -203,17 +195,6 @@ mod tests {
         // the default accent itself is inside the band: a pure sky blue wallpaper comes out as about the default
         let (h, _, _) = hsl(pick(&solid([100, 190, 255], 100)).unwrap());
         assert!((h - 205.0).abs() < 6.0, "{h}");
-    }
-
-    #[test]
-    fn chrome_fill_keeps_the_hue_and_is_dark_enough_for_white_text() {
-        for rgb in [[100u8, 190, 255], [235, 90, 90], [90, 220, 120], [200, 120, 240], [225, 200, 40], [0, 120, 200]] {
-            let (h0, _, _) = hsl(rgb);
-            let (h, _, l) = hsl(fill(rgb, 0.0));
-            assert!((h - h0).abs() < 3.0 && (0.37..=0.56).contains(&l), "{rgb:?} h {h} l {l}");
-            let hot = hsl(fill(rgb, 0.07)).2;
-            assert!(hot > l + 0.05, "{rgb:?}: hover is lighter");
-        }
     }
 
     #[test]

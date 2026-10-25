@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.4] - 2026-10-25
+
+### Changed
+- The gallery, the strip and the settings panel are neutral: "Accent on: Everywhere" no longer tints their text and icons, and the selection, the Done button, the add badge and the focus rings are white glass instead of the wallpaper accent. The accent stays in the widgets.
+
 ## [0.5.3] - 2026-10-25
 
 ### Changed

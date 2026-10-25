@@ -281,6 +281,18 @@ pub struct Ui {
 }
 
 /// Per-group sidebar icon colours (top, bottom).
+/// Selected row of the gallery: a lighter glass, no accent (the panels stay neutral on any wallpaper).
+const SEL: Color = Color::rgba(1.0, 1.0, 1.0, 0.24);
+/// Text on a white button / segment.
+const ON_WHITE: Color = Color::rgba(0.07, 0.07, 0.09, 1.0);
+
+/// The "Done" button of both panels: white glass pill with dark text (like the selected segment).
+fn done_button(cx: &Cx, r: Rect, label: &str, hot: bool) {
+    cx.pill(r.offset(0.0, 1.5), Color::rgba(0.0, 0.0, 0.0, 0.20));
+    cx.pill(r, Color::rgba(1.0, 1.0, 1.0, if hot { 1.0 } else { 0.92 }));
+    cx.text(r, label, Style::new(13.0, 600).center(), ON_WHITE);
+}
+
 fn group_colors(id: &str) -> (Color, Color) {
     let c = |r: u8, g: u8, b: u8| Color::rgb8(r, g, b);
     match id {
@@ -1300,7 +1312,7 @@ impl Ui {
                 cx.pill(c.offset(0.0, 1.0), Color::rgba(0.0, 0.0, 0.0, 0.18));
                 cx.pill(c, Color::rgba(1.0, 1.0, 1.0, 0.92));
             }
-            cx.text(c, txt, Style::new(11.5, 600).center(), if *on { Color::rgba(0.07, 0.07, 0.09, 1.0) } else { TEXT });
+            cx.text(c, txt, Style::new(11.5, 600).center(), if *on { ON_WHITE } else { TEXT });
         }
     }
 
@@ -1344,7 +1356,7 @@ impl Ui {
             cx.circle((kx, tb.track.cy() + 1.5), 9.0, Color::rgba(0.0, 0.0, 0.0, 0.25));
             cx.circle((kx, tb.track.cy()), 8.0, Color::rgba(1.0, 1.0, 1.0, 0.97));
             if self.sfocus == Some(0) {
-                cx.circle_stroke((kx, tb.track.cy()), 11.5, 2.0, accent().alpha(0.95));
+                cx.circle_stroke((kx, tb.track.cy()), 11.5, 2.0, Color::rgba(1.0, 1.0, 1.0, 0.70));
             }
             cx.rect(tb.sep, FILL);
             cx.text(tb.label_bg, self.t("Фон", "Back"), Style::new(12.5, 500), TEXT);
@@ -1378,7 +1390,7 @@ impl Ui {
         cx.circle((kx, t.cy() + 1.5), kr + 1.0, Color::rgba(0.0, 0.0, 0.0, 0.25));
         cx.circle((kx, t.cy()), kr, Color::rgba(1.0, 1.0, 1.0, 0.97));
         if focus {
-            cx.circle_stroke((kx, t.cy()), kr + 3.5, 2.0, accent().alpha(0.95));
+            cx.circle_stroke((kx, t.cy()), kr + 3.5, 2.0, Color::rgba(1.0, 1.0, 1.0, 0.70));
         }
     }
 
@@ -1493,12 +1505,10 @@ impl Ui {
             cx.text(l.upd_status, &msg, Style::new(12.0, 500).ellipsis(), color);
             if matches!(self.update, UpdateState::Available { .. }) {
                 self.set_button(cx, l.upd_page, self.t("О релизе", "Release page"), hv == Hit::UpdPage, pr == Hit::UpdPage, DIM);
-                self.set_button(cx, l.upd_dl, self.t("Обновить", "Update now"), hv == Hit::UpdInstall, pr == Hit::UpdInstall, accent());
+                self.set_button(cx, l.upd_dl, self.t("Обновить", "Update now"), hv == Hit::UpdInstall, pr == Hit::UpdInstall, TEXT);
             }
             let hot = hv == Hit::Done || pr == Hit::Done;
-            cx.pill(l.done.offset(0.0, 2.0).inset_xy(2.0, 0.0), accent_fill(false).alpha(0.40));
-            cx.pill(l.done, accent_fill(hot));
-            cx.text(l.done, self.t("Готово", "Done"), Style::new(13.0, 600).center(), WHITE);
+            done_button(cx, l.done, self.t("Готово", "Done"), hot);
         });
         if layer {
             unsafe { gfx.dc.PopLayer() };
@@ -1522,8 +1532,8 @@ impl Ui {
             let focus = self.st.focus;
             cx.rrect(l.search, 9.0, Color::rgba(1.0, 1.0, 1.0, if focus { 0.16 } else { 0.12 }));
             if focus {
-                cx.rrect_stroke(l.search.inset(-2.0), 11.0, 3.0, accent().alpha(0.30));
-                cx.rrect_stroke(l.search, 9.0, 1.6, accent().alpha(0.95));
+                cx.rrect_stroke(l.search.inset(-2.0), 11.0, 3.0, Color::rgba(1.0, 1.0, 1.0, 0.16));
+                cx.rrect_stroke(l.search, 9.0, 1.4, Color::rgba(1.0, 1.0, 1.0, 0.70));
             }
             cx.icon(Glyph::Search, Rect::new(l.search.x + 9.0, l.search.cy() - 7.0, 14.0, 14.0), DIM);
             let text_area = Rect::new(l.search.x + 30.0, l.search.y, l.search.w - 38.0, l.search.h);
@@ -1535,7 +1545,7 @@ impl Ui {
             } else {
                 let tw = cx.measure(&q, Style::BODY, 4096.0).0;
                 if self.st.query.sel_all {
-                    cx.rrect(Rect::new(text_area.x - off - 1.0, text_area.cy() - 9.0, tw + 2.0, 18.0), 4.0, accent_fill(false).alpha(0.75));
+                    cx.rrect(Rect::new(text_area.x - off - 1.0, text_area.cy() - 9.0, tw + 2.0, 18.0), 4.0, Color::rgba(1.0, 1.0, 1.0, 0.30));
                 }
                 cx.text(Rect::new(text_area.x - off, text_area.y, 4096.0, text_area.h), &q, Style::BODY, TEXT);
             }
@@ -1557,7 +1567,7 @@ impl Ui {
                 }
                 let sel = !searching && cur == Some(g.id);
                 if sel {
-                    cx.rrect(r, 9.0, accent_fill(false).alpha(0.92));
+                    cx.rrect(r, 9.0, SEL);
                 } else if self.hover == Hit::Group(i) {
                     cx.rrect(r, 9.0, FILL);
                 }
@@ -1605,9 +1615,9 @@ impl Ui {
                     cx.rrect_stroke(it.pv.inset(-2.0), 17.0 * K + 2.0, 1.4, Color::rgba(1.0, 1.0, 1.0, 0.35));
                     let b = (it.pv.x + 14.0, it.pv.y + 14.0);
                     cx.circle((b.0, b.1 + 1.0), 12.0, Color::rgba(0.0, 0.0, 0.0, 0.25));
-                    cx.circle(b, 11.0, accent_fill(false).alpha(0.97));
-                    cx.line((b.0 - 4.6, b.1), (b.0 + 4.6, b.1), 1.9, WHITE);
-                    cx.line((b.0, b.1 - 4.6), (b.0, b.1 + 4.6), 1.9, WHITE);
+                    cx.circle(b, 11.0, Color::rgba(1.0, 1.0, 1.0, 0.95));
+                    cx.line((b.0 - 4.6, b.1), (b.0 + 4.6, b.1), 1.9, ON_WHITE);
+                    cx.line((b.0, b.1 - 4.6), (b.0, b.1 + 4.6), 1.9, ON_WHITE);
                 }
                 cx.text(it.title, self.t(def.name.0, def.name.1), Style::new(12.5, 600).center().ellipsis(), TEXT);
                 cx.clip(it.desc);
@@ -1620,9 +1630,7 @@ impl Ui {
             cx.rect(Rect::new(p.x + 14.0, p.bottom() - FOOT_H, p.w - 28.0, 0.8), FILL);
             cx.text(l.hint, self.t("Перетащите виджет на рабочий стол…", "Drag a widget to place it on the desktop…"), Style::new(12.5, 600).ellipsis(), TEXT);
             let hot = self.hover == Hit::Done || self.press == Hit::Done;
-            cx.pill(l.done.offset(0.0, 2.0).inset_xy(2.0, 0.0), accent_fill(false).alpha(0.40));
-            cx.pill(l.done, accent_fill(hot));
-            cx.text(l.done, self.t("Готово", "Done"), Style::new(13.0, 600).center(), WHITE);
+            done_button(cx, l.done, self.t("Готово", "Done"), hot);
         });
         if layer {
             unsafe { gfx.dc.PopLayer() };
@@ -1725,24 +1733,6 @@ mod tests {
         let s0 = ui.panel_rect();
         ui.move_panel(10.0, 10.0);
         assert!(ui.panel_rect().x < s0.x && ui.gallery_rect().y == p.y);
-    }
-
-    /// The panel chrome (Done, selection, focus rings) and the text prompt's accent take the colour of `set_accent`, not a fixed blue. This is the only
-    /// test that moves the process-wide accent (it puts the default back).
-    #[test]
-    fn panel_chrome_follows_the_accent() {
-        set_accent(None);
-        let (blue, blue_hot, blue_ring, blue_prompt) = (accent_fill(false), accent_fill(true), accent(), crate::input::acc(1.0));
-        assert!(blue.b > blue.r && blue_ring.b > blue_ring.r && blue_prompt.b > blue_prompt.r);
-        assert!(blue_hot.r + blue_hot.g + blue_hot.b > blue.r + blue.g + blue.b, "hover is lighter");
-        assert!(set_accent(Some([230, 70, 70])), "a new accent reports a change");
-        let (red, red_hot, red_ring, red_prompt) = (accent_fill(false), accent_fill(true), accent(), crate::input::acc(1.0));
-        for c in [red.r > red.b && red.r > red.g, red_hot.r > red_hot.b, red_ring.r > red_ring.b && red_ring.r > red_ring.g, red_prompt.r > red_prompt.b && red_prompt.r > red_prompt.g] {
-            assert!(c, "chrome stays blue after set_accent");
-        }
-        assert!((red_ring.r, red_ring.g, red_ring.b) == (red_prompt.r, red_prompt.g, red_prompt.b) && red.r < red_ring.r + 0.01 && red.r + red.g + red.b < red_ring.r + red_ring.g + red_ring.b, "the fill is the deeper shade of the ring");
-        set_accent(None);
-        assert_eq!((accent_fill(false).b > accent_fill(false).r, accent().b > accent().r), (true, true));
     }
 
     /// The hit map of edit mode on a real scene: card body, "−" button, gallery controls, previews, settings strip, empty desk.
