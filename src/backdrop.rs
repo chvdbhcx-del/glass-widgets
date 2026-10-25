@@ -10,7 +10,7 @@
 //! then sets the card's bit in an atomic mask and posts WM_APP+1 to the UI thread (only when the mask was empty), and sleeps
 //! to honour the fps cap. The D3D device is multithread-protected, the D2D factory is multithreaded.
 use crate::gfx::*;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::{Interface, Result};
@@ -26,8 +26,10 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 pub const WM_BACKDROP: u32 = WM_APP + 1;
 
 mod gdi;
+mod pace;
 mod wgc;
 pub use gdi::GdiBackdrop;
+pub use pace::{parse_capture_fps, Pace, Rate};
 pub use wgc::WgcBackdrop;
 
 pub trait Backdrop {
@@ -48,6 +50,12 @@ pub trait Backdrop {
     /// (frames acquired from the duplication API, frames that caused GPU copies)
     fn stats(&self) -> (u64, u64) {
         (0, 0)
+    }
+    /// Something the user is about to look at changed (card moved, edit mode, settings): capture at full rate again at once.
+    fn boost(&self) {}
+    /// Current capture rate in Hz (0 = not a polling source); drops while the wallpaper is still.
+    fn rate_hz(&self) -> u32 {
+        0
     }
 }
 
@@ -148,6 +156,40 @@ struct Shared {
     /// regions (backdrop px, margin included) that raise a dirty bit + a version the capture thread polls
     regions: Mutex<Vec<RECT>>,
     regions_ver: AtomicU64,
+    /// bumped by the host (`Backdrop::boost`); the capture thread snaps to full rate and wakes from its nap
+    boost: AtomicU64,
+    /// the capture thread's current rate (Hz), for the stats
+    rate: AtomicU32,
+}
+
+impl Shared {
+    fn new(regions: Vec<RECT>) -> Arc<Shared> {
+        Arc::new(Shared {
+            regions: Mutex::new(regions),
+            regions_ver: AtomicU64::new(1),
+            dirty: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            hwnd: AtomicIsize::new(0),
+            acquired: AtomicU64::new(0),
+            copied: AtomicU64::new(0),
+            boost: AtomicU64::new(0),
+            rate: AtomicU32::new(0),
+        })
+    }
+
+    /// Sleep `d` in short slices: ends early on stop, a host boost (vs `boost`) or moved regions (vs `ver`), so a 2 fps nap neither delays
+    /// shutdown nor the snap back to full rate.
+    fn nap(&self, d: Duration, boost: u64, ver: u64) {
+        let end = Instant::now() + d;
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() || self.stop.load(Relaxed) || self.boost.load(Relaxed) != boost || self.regions_ver.load(Relaxed) != ver {
+                return;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(25)));
+        }
+    }
 }
 
 struct SendBox<T>(T);
@@ -182,7 +224,7 @@ impl DuplBackdrop {
     /// `win`: the area of the monitor the backdrop texture covers (the whole monitor: card positions are monitor px); `cards`: card rects in
     /// those px; `margin`: px around each card whose changes raise the card's dirty bit. The texture always holds the CURRENT desktop
     /// everywhere (every dirty rect is copied), so a card dragged to a never-seen place has its backdrop at once.
-    pub fn new(gfx: &Gfx, out: &OutputInfo, win: RECT, cards: &[RECT], margin: i32, fps: u32) -> Result<Self> {
+    pub fn new(gfx: &Gfx, out: &OutputInfo, win: RECT, cards: &[RECT], margin: i32, rate: Rate) -> Result<Self> {
         unsafe {
             let (w, h) = ((win.right - win.left) as u32, (win.bottom - win.top) as u32);
             // The capture thread gets its OWN device: duplication calls can sit in the kernel with the device lock held (capture hooks such as
@@ -227,16 +269,7 @@ impl DuplBackdrop {
             let props = bmp_props(D2D1_BITMAP_OPTIONS_NONE, D2D1_ALPHA_MODE_IGNORE);
             let bmp = gfx.dc.CreateBitmapFromDxgiSurface(&surf, Some(&props))?;
             let regions = pad_regions(cards, margin, w as i32, h as i32);
-            let shared = Arc::new(Shared {
-                regions: Mutex::new(regions),
-                regions_ver: AtomicU64::new(1),
-                dirty: AtomicU64::new(0),
-                stop: AtomicBool::new(false),
-                paused: AtomicBool::new(false),
-                hwnd: AtomicIsize::new(0),
-                acquired: AtomicU64::new(0),
-                copied: AtomicU64::new(0),
-            });
+            let shared = Shared::new(regions);
             let cap = SendBox(Capture {
                 dupl,
                 output: out.output.clone(),
@@ -245,7 +278,7 @@ impl DuplBackdrop {
                 tex,
                 size: (w as i32, h as i32),
                 org: (win.left, win.top),
-                interval: Duration::from_micros(1_000_000 / fps.clamp(1, 240) as u64),
+                interval: Duration::from_micros(1_000_000 / rate.fps.clamp(1, 240) as u64),
                 shared: shared.clone(),
             });
             Ok(DuplBackdrop { bmp, shared, pending: Mutex::new(Some(cap)), th: Mutex::new(None), adapter: out.adapter_name.clone(), margin, size: (w as i32, h as i32) })

@@ -1,8 +1,8 @@
 //! Live screen capture with plain GDI `BitBlt` of just the regions under the cards (a few 100k px), compared with the previous copy so
 //! only real changes are uploaded and flagged. It does not depend on DXGI Desktop Duplication (whose frames can stop arriving in a
 //! process with capture hooks, and whose 250 ms waits on a shared device starved the UI thread). The layer itself is excluded from
-//! capture (WDA), so the copy is what is BEHIND the widgets. Polls at `fps` while things change, at 8 Hz once the screen has been still
-//! for ~2 s.
+//! capture (WDA), so the copy is what is BEHIND the widgets. Polls at `fps` while things change and backs off to 2 Hz while
+//! the screen is still (`pace.rs`).
 use super::*;
 
 pub struct GdiBackdrop {
@@ -19,13 +19,13 @@ struct GdiCap {
     tex: ID3D11Texture2D,
     org: (i32, i32),
     size: (i32, i32),
-    interval: Duration,
+    rate: Rate,
     shared: Arc<Shared>,
 }
 
 impl GdiBackdrop {
     /// `mon`: the monitor rectangle in desktop px (the backdrop texture covers all of it); `cards`: card rects in monitor px.
-    pub fn new(gfx: &Gfx, mon: RECT, cards: &[RECT], margin: i32, fps: u32) -> Result<Self> {
+    pub fn new(gfx: &Gfx, mon: RECT, cards: &[RECT], margin: i32, rate: Rate) -> Result<Self> {
         unsafe {
             let (w, h) = ((mon.right - mon.left) as u32, (mon.bottom - mon.top) as u32);
             let desc = D3D11_TEXTURE2D_DESC {
@@ -45,22 +45,13 @@ impl GdiBackdrop {
             let tex = tex.ok_or_else(windows::core::Error::empty)?;
             let surf: IDXGISurface = tex.cast()?;
             let bmp = gfx.dc.CreateBitmapFromDxgiSurface(&surf, Some(&bmp_props(D2D1_BITMAP_OPTIONS_NONE, D2D1_ALPHA_MODE_IGNORE)))?;
-            let shared = Arc::new(Shared {
-                regions: Mutex::new(pad_regions(cards, margin, w as i32, h as i32)),
-                regions_ver: AtomicU64::new(1),
-                dirty: AtomicU64::new(0),
-                stop: AtomicBool::new(false),
-                paused: AtomicBool::new(false),
-                hwnd: AtomicIsize::new(0),
-                acquired: AtomicU64::new(0),
-                copied: AtomicU64::new(0),
-            });
+            let shared = Shared::new(pad_regions(cards, margin, w as i32, h as i32));
             let cap = SendBox(GdiCap {
                 ctx: gfx.ctx.clone(),
                 tex,
                 org: (mon.left, mon.top),
                 size: (w as i32, h as i32),
-                interval: Duration::from_micros(1_000_000 / fps.clamp(1, 120) as u64),
+                rate: Rate { fps: rate.fps.clamp(1, 120), auto: rate.auto },
                 shared: shared.clone(),
             });
             Ok(GdiBackdrop { bmp, shared, pending: Mutex::new(Some(cap)), th: Mutex::new(None), margin, size: (w as i32, h as i32) })
@@ -111,6 +102,12 @@ impl Backdrop for GdiBackdrop {
     fn stats(&self) -> (u64, u64) {
         (self.shared.acquired.load(Relaxed), self.shared.copied.load(Relaxed))
     }
+    fn boost(&self) {
+        self.shared.boost.fetch_add(1, Relaxed);
+    }
+    fn rate_hz(&self) -> u32 {
+        self.shared.rate.load(Relaxed)
+    }
 }
 
 unsafe fn gdi_loop(c: GdiCap) {
@@ -123,11 +120,13 @@ unsafe fn gdi_loop(c: GdiCap) {
     let mut prev: Vec<Vec<u8>> = Vec::new();
     let (mut dib, mut bits, mut cw, mut ch) = (HBITMAP::default(), std::ptr::null_mut::<u8>(), 0i32, 0i32);
     let mut buf: Vec<u8> = Vec::new();
-    let mut still = 0u64;
+    let mut pace = Pace::new(c.rate);
+    let mut boost = sh.boost.load(Relaxed);
     while !sh.stop.load(Relaxed) {
         let t0 = Instant::now();
         if sh.paused.load(Relaxed) {
             prev.iter_mut().for_each(|p| p.clear());
+            pace.snap();
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
@@ -188,7 +187,6 @@ unsafe fn gdi_loop(c: GdiCap) {
             }
         }
         if mask != 0 {
-            still = 0;
             sh.copied.fetch_add(1, Relaxed);
             c.ctx.Flush();
             let prevm = sh.dirty.fetch_or(mask, Relaxed);
@@ -196,14 +194,16 @@ unsafe fn gdi_loop(c: GdiCap) {
             if prevm == 0 && h != 0 {
                 let _ = PostMessageW(HWND(h as *mut _), WM_BACKDROP, WPARAM(0), LPARAM(0));
             }
-        } else {
-            still += 1;
         }
-        // poll at the capture fps while things move, at 8 Hz once the screen has been still for ~2 s
-        let period = if still * c.interval.as_millis().max(1) as u64 > 2000 { Duration::from_millis(125) } else { c.interval };
-        let el = t0.elapsed();
-        if el < period {
-            std::thread::sleep(period - el);
+        // poll at the capture fps while things move, backing off to 2 fps while the screen is still
+        if sh.boost.load(Relaxed) != boost {
+            boost = sh.boost.load(Relaxed);
+            pace.snap();
+        }
+        let period = pace.observe(mask != 0, Instant::now());
+        sh.rate.store(pace.fps(), Relaxed);
+        if let Some(rest) = period.checked_sub(t0.elapsed()) {
+            sh.nap(rest, boost, ver);
         }
     }
     let _ = DeleteDC(mem);

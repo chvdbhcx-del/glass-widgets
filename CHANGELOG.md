@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Next event: the `ics` setting may also be a calendar subscription link (`https://` or `webcal://`). Fetched by the card's worker only while it is on the desktop, at most every 30 min (conditional GET with ETag / Last-Modified, 15 s timeout, 2 MB limit, redirects re-checked at every hop), cached in `%APPDATA%\macshell\cache
+extevent-<hash>.ics` for offline use; the card shows a hint when the first fetch fails and nothing is cached. Plain http, `user@` tricks, `localhost` / `*.local` and private addresses are refused; the link (often a secret) is never logged, only its host. The prompt now reads "Путь к .ics или ссылка на календарь".
+- `captureFps` in config.json: `auto` (default) or a fixed wallpaper capture rate `1`..`30`.
+
+### Changed
+- Lighter wallpaper capture: a GPU-downscaled sample of the area under each card is compared with the previous one, so a card is redrawn only when its own backdrop changed, and the capture rate backs off 15 -> 8 -> 4 -> 2 fps while nothing changes (the GDI fallback too). The first change, a card move, edit mode, a drag or a look / appearance change snaps it back to full rate at once, so a video or slideshow wallpaper stays smooth. `--bench` prints `capture_rate_hz_at_exit`.
+
 ## [0.3.0] - 2026-10-25
 
 ### Added

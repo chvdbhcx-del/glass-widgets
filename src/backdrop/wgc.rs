@@ -2,6 +2,10 @@
 //! never other top-level windows, and so never our own layer). That is what lets the layer be visible to screenshots and recorders: the
 //! glass does not see itself. Frames arrive as GPU textures and are copied on a private device into the shared backdrop texture (like the
 //! duplication path, but without the 250 ms waits); the UI thread only reads the shared texture.
+//!
+//! Pace: every frame is copied (the texture is always current), but a card is only flagged dirty when its region really changed: a GPU mip chain
+//! shrinks the frame by 8x, the small level is read back and hashed per card region. While nothing changes the capture thread backs off
+//! 15 -> 8 -> 4 -> 2 fps (`pace.rs`); any change, a card move or a host `boost()` snaps it back to full rate.
 use super::*;
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
@@ -26,7 +30,8 @@ struct WgcCap {
     /// monitor origin inside the captured window
     org: (i32, i32),
     size: (i32, i32),
-    interval: Duration,
+    rate: Rate,
+    sampler: Option<Sampler>,
     shared: Arc<Shared>,
     /// keeps the capture session (and its device) alive
     _session: windows::Graphics::Capture::GraphicsCaptureSession,
@@ -35,7 +40,7 @@ struct WgcCap {
 
 impl WgcBackdrop {
     /// `out`: the monitor's output (its rect is the area the backdrop texture covers); `cards`: card rects in monitor px.
-    pub fn new(gfx: &Gfx, out: &OutputInfo, cards: &[RECT], margin: i32, fps: u32) -> Result<Self> {
+    pub fn new(gfx: &Gfx, out: &OutputInfo, cards: &[RECT], margin: i32, rate: Rate) -> Result<Self> {
         unsafe {
             let mon = out.rect;
             let (w, h) = ((mon.right - mon.left) as u32, (mon.bottom - mon.top) as u32);
@@ -79,24 +84,17 @@ impl WgcBackdrop {
             let _ = session.SetIsBorderRequired(false);
             session.StartCapture()?;
 
-            let shared = Arc::new(Shared {
-                regions: Mutex::new(pad_regions(cards, margin, w as i32, h as i32)),
-                regions_ver: AtomicU64::new(1),
-                dirty: AtomicU64::new(0),
-                stop: AtomicBool::new(false),
-                paused: AtomicBool::new(false),
-                hwnd: AtomicIsize::new(0),
-                acquired: AtomicU64::new(0),
-                copied: AtomicU64::new(0),
-            });
+            let shared = Shared::new(pad_regions(cards, margin, w as i32, h as i32));
+            let sampler = Sampler::new(&cap_dev, w, h).map_err(|e| eprintln!("mswidgets: capture change detection unavailable ({e}), full rate")).ok();
             let cap = SendBox(WgcCap {
                 ctx: cap_ctx,
                 tex,
                 pool,
                 org: origin_in_window(&mon, &pr),
                 size: (w as i32, h as i32),
-                // the glass is blurred: a wallpaper video under it needs no more than ~15 fps
-                interval: Duration::from_micros(1_000_000 / fps.clamp(1, 15) as u64),
+                // the glass is blurred: a wallpaper video under it needs no more than ~15 fps (a fixed `captureFps` may ask for up to 30)
+                rate: if rate.auto { Rate { fps: rate.fps.clamp(1, 15), auto: true } } else { Rate { fps: rate.fps.clamp(1, 30), auto: false } },
+                sampler,
                 shared: shared.clone(),
                 _session: session,
                 _dev: cap_dev,
@@ -149,6 +147,12 @@ impl Backdrop for WgcBackdrop {
     fn stats(&self) -> (u64, u64) {
         (self.shared.acquired.load(Relaxed), self.shared.copied.load(Relaxed))
     }
+    fn boost(&self) {
+        self.shared.boost.fetch_add(1, Relaxed);
+    }
+    fn rate_hz(&self) -> u32 {
+        self.shared.rate.load(Relaxed)
+    }
 }
 
 /// Which part of a captured frame lands in the monitor's backdrop texture. `org` = the monitor's top-left inside the captured window
@@ -166,12 +170,142 @@ fn origin_in_window(mon: &RECT, window: &RECT) -> (i32, i32) {
     (mon.left - window.left, mon.top - window.top)
 }
 
+/// Mip level read back for change detection: 1/8 of the frame in each direction (a 4K monitor gives a 480x270 read).
+const LEVEL: u32 = 3;
+
+/// GPU downscale of the captured crop + a small staging readback. Cheap on the CPU: the host never sees the full-size pixels.
+struct Sampler {
+    tex: ID3D11Texture2D,
+    srv: ID3D11ShaderResourceView,
+    stage: ID3D11Texture2D,
+    /// size of the read level in px
+    dims: (u32, u32),
+}
+
+impl Sampler {
+    unsafe fn new(dev: &ID3D11Device, w: u32, h: u32) -> Result<Sampler> {
+        let dims = (level_size(w), level_size(h));
+        let mut desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: LEVEL + 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
+        };
+        let mut tex = None;
+        dev.CreateTexture2D(&desc, None, Some(&mut tex))?;
+        let tex: ID3D11Texture2D = tex.ok_or_else(windows::core::Error::empty)?;
+        let mut srv = None;
+        dev.CreateShaderResourceView(&tex, None, Some(&mut srv))?;
+        desc = D3D11_TEXTURE2D_DESC { Width: dims.0, Height: dims.1, MipLevels: 1, Usage: D3D11_USAGE_STAGING, BindFlags: 0, CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32, MiscFlags: 0, ..desc };
+        let mut stage = None;
+        dev.CreateTexture2D(&desc, None, Some(&mut stage))?;
+        Ok(Sampler { tex, srv: srv.ok_or_else(windows::core::Error::empty)?, stage: stage.ok_or_else(windows::core::Error::empty)?, dims })
+    }
+
+    /// Copy `bx` of `src` to (`dx`,`dy`), build the mips and return the small level as tight BGRA rows.
+    unsafe fn read(&self, ctx: &ID3D11DeviceContext, src: &ID3D11Texture2D, bx: &D3D11_BOX, dx: u32, dy: u32, out: &mut Vec<u8>) -> Option<()> {
+        ctx.CopySubresourceRegion(&self.tex, 0, dx, dy, 0, src, 0, Some(bx));
+        ctx.GenerateMips(&self.srv);
+        ctx.CopySubresourceRegion(&self.stage, 0, 0, 0, 0, &self.tex, LEVEL, None);
+        let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+        ctx.Map(&self.stage, 0, D3D11_MAP_READ, 0, Some(&mut m)).ok()?;
+        let row = self.dims.0 as usize * 4;
+        out.clear();
+        for y in 0..self.dims.1 as usize {
+            out.extend_from_slice(std::slice::from_raw_parts((m.pData as *const u8).add(y * m.RowPitch as usize), row));
+        }
+        ctx.Unmap(&self.stage, 0);
+        Some(())
+    }
+}
+
+/// Size of one dimension at mip `LEVEL` (D3D: floor, at least 1).
+fn level_size(n: u32) -> u32 {
+    (n >> LEVEL).max(1)
+}
+
+/// One hash per region (monitor px, padded) over the pixels of the small level it covers; empty regions hash to 0.
+fn region_hashes(px: &[u8], dims: (u32, u32), regions: &[RECT]) -> Vec<u64> {
+    let up = (1i32 << LEVEL) - 1;
+    regions
+        .iter()
+        .take(64)
+        .map(|r| {
+            let (l, t) = ((r.left.max(0) >> LEVEL) as u32, (r.top.max(0) >> LEVEL) as u32);
+            let (rr, b) = (((r.right.max(0) + up) >> LEVEL) as u32, ((r.bottom.max(0) + up) >> LEVEL) as u32);
+            let (rr, b) = (rr.min(dims.0), b.min(dims.1));
+            if r.right <= r.left || r.bottom <= r.top || rr <= l || b <= t {
+                return 0;
+            }
+            let mut h = 0xcbf29ce484222325u64; // FNV-1a over 4-byte pixels
+            for y in t..b {
+                let o = (y * dims.0 + l) as usize * 4;
+                for chunk in px[o..o + (rr - l) as usize * 4].chunks_exact(4) {
+                    h = (h ^ u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as u64).wrapping_mul(0x100000001b3);
+                }
+            }
+            h | 1 // never 0, so an empty region is told apart
+        })
+        .collect()
+}
+
+/// Bit i = region i is not empty and its hash differs from the previous look (or there was none). No hashes (sampler unavailable) = all.
+fn changed_mask(regions: &[RECT], now: Option<&[u64]>, prev: &[u64]) -> u64 {
+    regions
+        .iter()
+        .take(64)
+        .enumerate()
+        .filter(|(_, r)| r.right > r.left && r.bottom > r.top)
+        .filter(|(i, _)| now.is_none_or(|h| prev.get(*i) != h.get(*i)))
+        .fold(0u64, |m, (i, _)| m | 1 << i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rc(l: i32, t: i32, w: i32, h: i32) -> RECT {
         RECT { left: l, top: t, right: l + w, bottom: t + h }
+    }
+
+    #[test]
+    fn region_hash_sees_changes_only_inside_the_region() {
+        // 480x270 level (a 3840x2160 frame)
+        let dims = (480u32, 270u32);
+        let mut px = vec![7u8; (dims.0 * dims.1 * 4) as usize];
+        let regs = [rc(80, 80, 800, 400), rc(2000, 1000, 400, 400), RECT::default()];
+        let a = region_hashes(&px, dims, &regs);
+        assert_eq!(a.len(), 3);
+        assert_eq!(a[2], 0);
+        assert_eq!(a, region_hashes(&px, dims, &regs));
+        // a pixel inside card 0 (level px 20,20 = frame px 160,160)
+        px[((20 * dims.0 + 20) * 4) as usize] = 9;
+        let b = region_hashes(&px, dims, &regs);
+        assert_ne!(a[0], b[0]);
+        assert_eq!(a[1], b[1]);
+        // first look: everything non-empty is changed; identical look: nothing; one card changed: its bit only
+        assert_eq!(changed_mask(&regs, Some(&a), &[]), 0b011);
+        assert_eq!(changed_mask(&regs, Some(&a), &a), 0);
+        assert_eq!(changed_mask(&regs, Some(&b), &a), 0b001);
+        // no change detection: every non-empty region is dirty, as before
+        assert_eq!(changed_mask(&regs, None, &a), 0b011);
+    }
+
+    #[test]
+    fn region_hash_clips_to_the_level() {
+        let dims = (level_size(1920), level_size(1080));
+        assert_eq!(dims, (240, 135));
+        let px = vec![1u8; (dims.0 * dims.1 * 4) as usize];
+        // a region hanging over the frame edge, one entirely outside it
+        let h = region_hashes(&px, dims, &[rc(1900, 1070, 100, 100), rc(5000, 0, 10, 10)]);
+        assert_ne!(h[0], 0);
+        assert_eq!(h[1], 0);
     }
 
     /// Progman spans the virtual desktop: primary 1920x1080 at 0,0, a second monitor LEFT of it (negative x, shifted down), a third
@@ -214,6 +348,9 @@ unsafe fn wgc_loop(c: WgcCap) {
     let sh = &c.shared;
     let mut regions: Vec<RECT> = Vec::new();
     let mut ver = 0u64;
+    let mut pace = Pace::new(c.rate);
+    let mut boost = sh.boost.load(Relaxed);
+    let (mut px, mut prev): (Vec<u8>, Vec<u64>) = (Vec::new(), Vec::new());
     while !sh.stop.load(Relaxed) {
         let t0 = Instant::now();
         // newest frame only; older ones go back to the pool
@@ -227,6 +364,8 @@ unsafe fn wgc_loop(c: WgcCap) {
             if let Some(f) = latest {
                 let _ = f.Close();
             }
+            prev.clear(); // the first look after the pause counts as a change
+            pace.snap();
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
@@ -235,8 +374,16 @@ unsafe fn wgc_loop(c: WgcCap) {
             if let Ok(g) = sh.regions.lock() {
                 regions = g.clone();
                 ver = v;
+                prev.clear(); // other places: compare with nothing
+                pace.snap();
             }
         }
+        let bst = sh.boost.load(Relaxed);
+        if bst != boost {
+            boost = bst;
+            pace.snap();
+        }
+        let mut changed = false;
         if let Some(f) = latest {
             sh.acquired.fetch_add(1, Relaxed);
             let src = f.Surface().ok().and_then(|s| s.cast::<IDirect3DDxgiInterfaceAccess>().ok()).and_then(|a| a.GetInterface::<ID3D11Texture2D>().ok());
@@ -246,20 +393,29 @@ unsafe fn wgc_loop(c: WgcCap) {
                     let bx = D3D11_BOX { left: l as u32, top: t as u32, front: 0, right: r as u32, bottom: b as u32, back: 1 };
                     c.ctx.CopySubresourceRegion(&c.tex, 0, dx as u32, dy as u32, 0, &src, 0, Some(&bx));
                     c.ctx.Flush();
-                    sh.copied.fetch_add(1, Relaxed);
-                    let mask = regions.iter().take(64).enumerate().filter(|(_, r)| r.right > r.left && r.bottom > r.top).fold(0u64, |m, (i, _)| m | 1 << i);
-                    let prevm = sh.dirty.fetch_or(mask, Relaxed);
-                    let h = sh.hwnd.load(Relaxed);
-                    if prevm == 0 && h != 0 && mask != 0 {
-                        let _ = PostMessageW(HWND(h as *mut _), WM_BACKDROP, WPARAM(0), LPARAM(0));
+                    // which cards see a different picture than at the last look (all of them when the sampler is missing / fails)
+                    let hashes = c.sampler.as_ref().and_then(|s| s.read(&c.ctx, &src, &bx, dx as u32, dy as u32, &mut px).map(|_| region_hashes(&px, s.dims, &regions)));
+                    let mask = changed_mask(&regions, hashes.as_deref(), &prev);
+                    if let Some(h) = hashes {
+                        prev = h;
+                    }
+                    if mask != 0 {
+                        changed = true;
+                        sh.copied.fetch_add(1, Relaxed);
+                        let prevm = sh.dirty.fetch_or(mask, Relaxed);
+                        let h = sh.hwnd.load(Relaxed);
+                        if prevm == 0 && h != 0 {
+                            let _ = PostMessageW(HWND(h as *mut _), WM_BACKDROP, WPARAM(0), LPARAM(0));
+                        }
                     }
                 }
             }
             let _ = f.Close();
         }
-        let el = t0.elapsed();
-        if el < c.interval {
-            std::thread::sleep(c.interval - el);
+        let period = pace.observe(changed, Instant::now());
+        sh.rate.store(pace.fps(), Relaxed);
+        if let Some(rest) = period.checked_sub(t0.elapsed()) {
+            sh.nap(rest, boost, ver);
         }
     }
 }
