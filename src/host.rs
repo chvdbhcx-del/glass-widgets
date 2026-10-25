@@ -16,7 +16,8 @@ use crate::grid;
 use crate::layout;
 use crate::motion::{self, MatState};
 use crate::tray::{self, TrayCmd};
-use crate::ui::{self, Hit, Ui};
+use crate::ui::{self, Hit, SAct, SKey, Ui};
+use crate::update::{self, UpdateState};
 use crate::widget::{Button, Lang, MouseKind, Now, Rect, Size, WM_WIDGET};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -50,6 +51,9 @@ const T_TOAST: usize = 10;
 const T_REPLACE: usize = 11;
 /// throttled apply of the look sliders (settings panel)
 const T_LOOK: usize = 40;
+/// commits a look slider moved from the keyboard / wheel once the burst of key repeats is over
+const T_LCOMMIT: usize = 41;
+const LCOMMIT_AFTER: u32 = 400;
 /// at most one live look apply per this long while a slider is dragged
 const LOOK_EVERY: Duration = Duration::from_millis(100);
 const NEAR_PX: i32 = 8;
@@ -229,6 +233,12 @@ struct App {
     look_dirty: bool,
     look_last: Instant,
     settings_back: bool,
+    /// slider moved from the keyboard / wheel whose value is not in config.json yet (0 = Glass)
+    look_commit: Option<usize>,
+    /// where the gallery / settings panel offsets were last written to config.json
+    panels_saved: ((f32, f32), (f32, f32)),
+    /// the update check in flight was the silent one at start (an available update is a toast, a failure is not shown)
+    update_silent: bool,
     st: Stats,
     bench: Option<u32>,
     t0: Instant,
@@ -421,6 +431,10 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     ui.base = look_base;
     ui.appearance = settings.appearance;
     ui.dim_mode = settings.dim;
+    ui.check_start = settings.check_updates;
+    let panels = if o.no_config { ((0.0, 0.0), (0.0, 0.0)) } else { layout::read_panels() };
+    (ui.gal_off, ui.set_off) = panels;
+    let check_now = settings.check_updates && !o.no_config && o.bench.is_none();
 
     // premultiplied BGRA DIB the layered window is fed from (only the dirty rect is copied per frame)
     let screen = GetDC(None);
@@ -485,6 +499,9 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         look_dirty: false,
         look_last: Instant::now() - Duration::from_secs(1),
         settings_back: false,
+        look_commit: None,
+        panels_saved: panels,
+        update_silent: false,
         st: Stats::default(),
         bench: o.bench,
         t0: Instant::now(),
@@ -540,6 +557,9 @@ unsafe fn setup(o: &Opts) -> Result<()> {
             app.update_tick_timer();
             app.last_anim = Instant::now();
             app.arm_anim(); // the start-up materialisation
+            if check_now {
+                app.start_update_check(true); // opt-in (`checkUpdates`): the one request of the session
+            }
         }
     });
     Ok(())
@@ -580,7 +600,7 @@ fn unpack(lp: isize) -> (i32, i32) {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
-        WM_TIMER | WM_BACKDROP | WM_HOTKEY | WM_WIDGET | WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
+        WM_TIMER | WM_BACKDROP | WM_HOTKEY | WM_WIDGET | update::WM_UPDATE | WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
             with_app(|app| app.on_msg(msg, wp.0));
             LRESULT(0)
         }
@@ -774,8 +794,10 @@ impl App {
                 }
             }
             (WM_HOTKEY, _) => {
+                self.flush_look_commit();
                 let _ = DestroyWindow(self.hwnd);
             }
+            (update::WM_UPDATE, _) => self.update_done(),
             (WM_BACKDROP, _) => {
                 let mask = self.bd().take_dirty();
                 if mask != 0 && self.visible {
@@ -792,6 +814,7 @@ impl App {
             (_, T_ANIM) => self.anim_step(),
             (_, T_UI) => self.ui_timer(),
             (_, T_CFG) => self.poll_config(),
+            (_, T_LCOMMIT) => self.flush_look_commit(),
             (_, T_LOOK) => {
                 let _ = KillTimer(self.hwnd, T_LOOK);
                 if self.look_dirty {
@@ -807,6 +830,7 @@ impl App {
                 self.ui.toast = None;
                 let d = self.toast_rect();
                 self.frame(d);
+                self.fit_window(); // the toast needed the whole monitor in live mode
             }
             (_, T_REPLACE) => {
                 let _ = KillTimer(self.hwnd, T_REPLACE);
@@ -869,7 +893,7 @@ impl App {
 
     unsafe fn desired_window(&self) -> RECT {
         let (mw, mh) = (self.scene.w, self.scene.h);
-        if self.want_full() {
+        if self.want_full() || self.ui.toast.is_some() {
             return RECT { left: 0, top: 0, right: mw, bottom: mh };
         }
         window_rect(&self.card_rects(), self.scene.margin(), mw, mh)
@@ -1316,7 +1340,7 @@ impl App {
         let old = self.ui.hover;
         self.ui.hover = h;
         // only hovers that change how something looks need a frame
-        let looks = |h: Hit| matches!(h, Hit::Minus(_) | Hit::Group(_) | Hit::Item(_) | Hit::Done | Hit::SettingsBtn | Hit::Look(..) | Hit::Opt(..) | Hit::Autostart | Hit::ResetLook | Hit::EditBtn | Hit::QuitBtn);
+        let looks = |h: Hit| matches!(h, Hit::Minus(_) | Hit::Group(_) | Hit::Item(_) | Hit::Done | Hit::SettingsBtn | Hit::Look(..) | Hit::Opt(..) | Hit::Autostart | Hit::CheckStart | Hit::UpdBtn | Hit::UpdDownload | Hit::ResetLook | Hit::EditBtn | Hit::QuitBtn);
         if looks(old) || looks(h) {
             let mut d: Option<RECT> = None;
             for r in [self.hover_dirty(old), self.hover_dirty(h)].into_iter().flatten() {
@@ -1377,6 +1401,19 @@ impl App {
             WM_LBUTTONDOWN => {
                 SetCapture(self.hwnd);
                 self.ui.press = hit;
+                self.flush_look_commit();
+                let old_focus = self.ui.sfocus;
+                self.ui.sfocus = match hit {
+                    Hit::Look(i, _) => Some(i),
+                    Hit::Slider(_) => Some(0),
+                    _ => None,
+                };
+                if self.ui.sfocus.is_some() {
+                    self.ui.st.focus = false;
+                }
+                if old_focus != self.ui.sfocus {
+                    self.redraw_ui();
+                }
                 match hit {
                     Hit::Card(i) => {
                         self.ui.st.focus = false;
@@ -1441,6 +1478,7 @@ impl App {
                         self.set_look_slider(i, t);
                         self.commit_look(i);
                     }
+                    Press::Move { .. } => self.save_panels(),
                     Press::Ui(h) => {
                         let same = match (h, hit) {
                             (Hit::Search(_), Hit::Search(_)) => true,
@@ -1465,6 +1503,21 @@ impl App {
             }
             WM_MOUSEWHEEL => {
                 let delta = ((wp.0 >> 16) as u16 as i16) as f32 / 120.0;
+                // over a slider the wheel changes it (2 % a notch); elsewhere it scrolls the gallery
+                let (lx, ly) = (x as f32 / self.s, y as f32 / self.s);
+                let slider = if self.ui.settings {
+                    self.ui.row_at(lx, ly)
+                } else {
+                    matches!(hit, Hit::Slider(_)).then_some(0)
+                };
+                if let (Some(i), Press::None) = (slider, self.press) {
+                    self.ui.sfocus = Some(i);
+                    self.ui.st.focus = false;
+                    let t = ui::wheel_pos(self.ui.set_pos(i), delta);
+                    self.nudge_slider(i, t);
+                    self.redraw_ui();
+                    return;
+                }
                 if self.ui.wheel(x as f32 / self.s, y as f32 / self.s, delta) {
                     if let Some(d) = self.hover_dirty(Hit::Panel) {
                         self.frame(d);
@@ -1483,8 +1536,16 @@ impl App {
             Hit::ResetLook => self.reset_look(),
             Hit::Opt(o, k) => self.set_option(o, k),
             Hit::Autostart => self.toggle_autostart(),
+            Hit::CheckStart => self.toggle_check_start(),
+            Hit::UpdBtn => self.start_update_check(false),
+            Hit::UpdDownload => {
+                if let UpdateState::Available { url, .. } = self.ui.update.clone() {
+                    crate::sys::perform(&crate::sys::Action::Open(url)); // the release page in the browser; nothing is downloaded here
+                }
+            }
             Hit::EditBtn => self.switch_panel(false),
             Hit::QuitBtn => {
+                self.flush_look_commit();
                 let _ = DestroyWindow(self.hwnd); // the Ctrl+Alt+Q path
             }
             Hit::Done => self.leave_edit(),
@@ -1516,7 +1577,106 @@ impl App {
         }
     }
 
-    // ------------------------------------------------ keyboard (edit mode: the search box)
+    // ------------------------------------------------ keyboard (edit mode: the search box, the sliders)
+
+    /// Keys for the sliders: all of them in the settings panel; in the gallery only while the strip's glass slider has the focus (Tab goes
+    /// between the search box and that slider). True = the key was used.
+    unsafe fn slider_key(&mut self, k: SKey, shift: bool) -> bool {
+        if self.ui.gallery {
+            match (self.ui.sfocus.is_some(), k) {
+                (false, SKey::Tab) => {
+                    self.ui.sfocus = Some(0);
+                    self.ui.st.focus = false;
+                }
+                (true, SKey::Tab) => {
+                    self.ui.sfocus = None;
+                    self.ui.st.focus = true;
+                    self.ui.caret_on = true;
+                }
+                (true, SKey::Up | SKey::Down) => return true,
+                (true, _) => {
+                    if let Some(SAct::Set(i, t)) = self.ui.slider_key(k, shift) {
+                        self.nudge_slider(i, t);
+                    }
+                    return true;
+                }
+                (false, _) => return false,
+            }
+            self.redraw_ui();
+            return true;
+        }
+        match self.ui.slider_key(k, shift) {
+            Some(SAct::Set(i, t)) => self.nudge_slider(i, t),
+            Some(SAct::Focus) => self.redraw_ui(),
+            None => {}
+        }
+        true
+    }
+
+    /// Maps a virtual key to a slider key; true = used.
+    unsafe fn slider_key_vk(&mut self, vk: VIRTUAL_KEY) -> bool {
+        let k = match vk {
+            VK_UP => SKey::Up,
+            VK_DOWN => SKey::Down,
+            VK_LEFT => SKey::Left,
+            VK_RIGHT => SKey::Right,
+            VK_HOME => SKey::Home,
+            VK_END => SKey::End,
+            VK_BACK | VK_DELETE => SKey::Reset,
+            VK_TAB => SKey::Tab,
+            _ => return self.ui.settings, // the settings panel has no text field: other keys are swallowed
+        };
+        self.slider_key(k, GetKeyState(VK_SHIFT.0 as i32) < 0)
+    }
+
+    /// A slider moved from the keyboard / wheel: shown and applied live like a drag, committed to config.json (`commit_look`, as on release)
+    /// once the burst of key repeats is over.
+    unsafe fn nudge_slider(&mut self, i: usize, t: f32) {
+        if self.look_commit.is_some_and(|p| p != i) {
+            self.flush_look_commit();
+        }
+        if self.ui.settings {
+            self.set_look_slider(i, t);
+            self.frame_row(i);
+        } else {
+            self.apply_glass(t.clamp(0.0, 1.0)); // the strip's glass slider
+        }
+        self.look_commit = Some(i);
+        SetTimer(self.hwnd, T_LCOMMIT, LCOMMIT_AFTER, None);
+    }
+
+    unsafe fn flush_look_commit(&mut self) {
+        let _ = KillTimer(self.hwnd, T_LCOMMIT);
+        if let Some(i) = self.look_commit.take() {
+            self.commit_look(i);
+        }
+    }
+
+    /// Repaint the open panel (and the strip under the gallery).
+    unsafe fn redraw_ui(&mut self) {
+        let mut d = self.hover_dirty(Hit::Panel);
+        if !self.ui.settings {
+            if let (Some(a), Some(b)) = (d, self.hover_dirty(Hit::Toolbar)) {
+                d = Some(union(a, b));
+            }
+        }
+        if let Some(d) = d {
+            self.frame(d);
+        }
+    }
+
+    /// Remember where the user left the gallery / settings panel (only when it changed).
+    fn save_panels(&mut self) {
+        let now = (self.ui.gal_off, self.ui.set_off);
+        if now == self.panels_saved {
+            return;
+        }
+        self.panels_saved = now;
+        if let Err(e) = layout::write_panels(now.0, now.1) {
+            eprintln!("mswidgets: {e}");
+        }
+        self.note_own_write();
+    }
 
     unsafe fn on_key(&mut self, msg: u32, wp: usize) {
         if !self.ui.edit {
@@ -1532,6 +1692,7 @@ impl App {
                         self.esc_down = true;
                         return if self.ui.settings { self.close_settings() } else { self.leave_edit() };
                     }
+                    _ if !ctrl && self.slider_key_vk(vk) => return,
                     _ if !self.ui.gallery => return,
                     VK_BACK => {
                         self.ui.st.query.backspace();
@@ -1570,6 +1731,7 @@ impl App {
             _ => return,
         }
         self.ui.st.focus = true;
+        self.ui.sfocus = None;
         self.ui.caret_on = true;
         if changed {
             self.ui.query_changed();
@@ -2111,6 +2273,7 @@ impl App {
         self.ui.dim_mode = self.settings.dim;
         self.ui.live = self.settings.live;
         self.ui.autostart = crate::autostart::enabled();
+        self.ui.check_start = self.settings.check_updates;
     }
 
     /// Swap the open panel in place (gallery <-> settings) inside the running edit mode; the new panel fades in.
@@ -2121,6 +2284,8 @@ impl App {
         if self.drag.is_some() {
             self.end_drag();
         }
+        self.flush_look_commit();
+        self.ui.sfocus = None;
         self.ui.settings = settings;
         self.ui.gallery = !settings;
         self.settings_back = settings;
@@ -2175,6 +2340,7 @@ impl App {
         self.ui.gallery = !settings;
         self.ui.settings = settings;
         self.settings_back = false;
+        self.ui.sfocus = None;
         self.ui.st.focus = !settings;
         self.ui.caret_on = true;
         self.ui.anim = 0.0;
@@ -2205,6 +2371,8 @@ impl App {
             return;
         }
         self.editing = false;
+        self.flush_look_commit();
+        self.ui.sfocus = None;
         if self.drag.is_some() {
             self.end_drag();
         }
@@ -2288,6 +2456,8 @@ impl App {
     unsafe fn show_toast(&mut self, msg: String) {
         self.ui.toast = Some(msg);
         SetTimer(self.hwnd, T_TOAST, 2000, None);
+        let r = self.desired_window();
+        self.set_window(r); // live mode: the layer only covers the cards, the toast sits mid-screen
         let d = self.toast_rect();
         self.frame(d);
     }
@@ -2346,6 +2516,11 @@ impl App {
         }
         SetTimer(self.hwnd, T_LOOK, wait.as_millis().max(1) as u32, None);
         // only the row of the slider is redrawn meanwhile: the knob and the value follow the pointer
+        self.frame_row(i);
+    }
+
+    /// Repaint row `i` of the settings panel.
+    unsafe fn frame_row(&mut self, i: usize) {
         let s = self.s;
         if let Some(r) = self.ui.set_lay().rows.get(i).map(|r| r.row) {
             self.frame(RECT { left: ((r.x - 8.0) * s) as i32, top: ((r.y - 4.0) * s) as i32, right: ((r.right() + 8.0) * s).ceil() as i32, bottom: ((r.bottom() + 4.0) * s).ceil() as i32 });
@@ -2463,6 +2638,41 @@ impl App {
         }
         if let Some(d) = self.hover_dirty(Hit::Panel) {
             self.frame(d);
+        }
+    }
+
+    /// The "Check for updates on start" switch (`checkUpdates`, off by default).
+    unsafe fn toggle_check_start(&mut self) {
+        let on = !self.ui.check_start;
+        self.ui.check_start = on;
+        self.settings.check_updates = on;
+        self.write_setting("checkUpdates", serde_json::json!(on));
+        self.redraw_ui();
+    }
+
+    /// One GET of the latest release on a worker thread (`silent` = the check at start: only an available update is announced, as a toast).
+    unsafe fn start_update_check(&mut self, silent: bool) {
+        if self.ui.update == UpdateState::Checking {
+            return;
+        }
+        self.update_silent = silent;
+        self.ui.update = UpdateState::Checking;
+        update::start(self.hwnd.0 as isize);
+        if self.ui.settings {
+            self.redraw_ui();
+        }
+    }
+
+    unsafe fn update_done(&mut self) {
+        let Some(r) = update::take() else { return };
+        let silent = std::mem::take(&mut self.update_silent);
+        self.ui.update = if silent && r.is_err() { UpdateState::Idle } else { update::state_from(r, env!("CARGO_PKG_VERSION")) };
+        if let (true, UpdateState::Available { version, .. }) = (silent, &self.ui.update) {
+            let msg = self.ui.lang.pick(&format!("Доступна новая версия {version}"), &format!("Version {version} is available")).to_string();
+            self.show_toast(msg);
+        }
+        if self.ui.settings {
+            self.redraw_ui();
         }
     }
 
@@ -2587,6 +2797,7 @@ impl App {
         }
         self.ui.appearance = new.appearance;
         self.ui.dim_mode = new.dim;
+        self.ui.check_start = new.check_updates;
         if new.live != old.live {
             self.ui.live = new.live;
             self.rebuild(true);

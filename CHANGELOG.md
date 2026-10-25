@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- The gallery and the settings panel remember where you dragged them (`widgetsPanels` in config.json).
+- Settings sliders work from the keyboard (Up / Down / Tab move the focus, Left / Right 1 %, Shift 10 %, Home / End, Backspace / Delete = reset) and with the mouse wheel (2 % a notch); the glass slider under the gallery too (Tab from the search box).
+- Update check, opt-in: a "Check for updates" button and a "Check for updates on start" switch (`checkUpdates`, off by default) in the settings panel. One request to the GitHub releases API; a newer version is offered as a "Download" button that opens the release page. Nothing is downloaded or installed.
+
 ## [0.2.1] - 2026-10-25
 
 ### Changed

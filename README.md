@@ -56,7 +56,13 @@ the settings panel; right click shows a menu: **Settings**, **Edit Widgets**, **
 
 The panel has sliders that change the look of the widgets live: glass amount, blur, refraction, chromatic fringe, saturation, brightness,
 frosting, highlights, glow, corner roundness and card size. It also switches dark / light / auto glass, dimming, live or plain glass
-and autostart. "Reset look" brings everything back to the defaults.
+and autostart. "Reset look" brings everything back to the defaults. Drag the panel (or the gallery) by an empty spot: it remembers
+where you left it. The sliders also work from the keyboard (`Up` / `Down` / `Tab` pick one, `Left` / `Right` change it by 1 %, with
+`Shift` by 10 %, `Home` / `End` jump, `Backspace` resets it) and with the mouse wheel.
+
+**Updates.** "Check for updates" asks GitHub once for the latest release and offers a **Download** button that opens the release page
+in your browser. Nothing is downloaded or installed by the app. "Check for updates on start" (off by default) does the same check silently
+when Glass Widgets starts and shows a small notice if a newer version exists.
 
 ## Settings file
 
@@ -70,8 +76,11 @@ Everything lives in `%APPDATA%\macshell\config.json` (written by the edit mode; 
 | `widgetsDim` | `auto` (default), `never`, `always` |
 | `widgetsGlass` | glass amount, `0`..`1` (default `0.5`) |
 | `widgetsLook` | the other sliders of the settings panel (only the changed ones) |
+| `widgetsPanels` | where the gallery / settings panel were dragged: `{"gallery":[dx,dy],"settings":[dx,dy]}` (only non-zero ones) |
+| `checkUpdates` | `true` = one silent update check at start (default `false`) |
 
-Network is used only by the widgets that need it (weather, rates, quote, site icons of shortcut tiles); nothing else phones home.
+Network is used only by the widgets that need it (weather, rates, quote, site icons of shortcut tiles) and by the update check, which runs only
+when you press "Check for updates" or turn on `checkUpdates`; nothing else phones home.
 Advanced knobs are environment variables, for example `MSW_CAPTURE=gdi|dxgi` (older capture paths) and `MSW_TEXT_GAMMA`.
 
 ## Build from source

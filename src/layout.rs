@@ -221,7 +221,7 @@ pub fn appearance_key(p: crate::motion::AppearancePref) -> &'static str {
 }
 
 /// The host settings of config.json: `widgetsGlass` 0..1, `widgetsDim`, `widgetsGlassMode` ("plain" = no desktop capture, anything else = live glass),
-/// `widgetsAppearance` ("auto" | "dark" | "light").
+/// `widgetsAppearance` ("auto" | "dark" | "light"), `checkUpdates` (bool).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Settings {
     pub glass: f32,
@@ -229,10 +229,12 @@ pub struct Settings {
     pub live: bool,
     /// `widgetsAppearance`: auto (from the backdrop) / dark / light glass
     pub appearance: crate::motion::AppearancePref,
+    /// `checkUpdates`: one silent update check at start (off unless the user turned it on)
+    pub check_updates: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
-        Settings { glass: 0.5, dim: Dim::Auto, live: true, appearance: crate::motion::AppearancePref::Dark }
+        Settings { glass: 0.5, dim: Dim::Auto, live: true, appearance: crate::motion::AppearancePref::Dark, check_updates: false }
     }
 }
 impl Settings {
@@ -247,6 +249,7 @@ impl Settings {
             },
             live: v.get("widgetsGlassMode").and_then(|g| g.as_str()) != Some("plain"),
             appearance: v.get("widgetsAppearance").and_then(|g| g.as_str()).and_then(crate::motion::AppearancePref::parse).unwrap_or_default(),
+            check_updates: v.get("checkUpdates").and_then(|g| g.as_bool()).unwrap_or(d.check_updates),
         }
     }
 }
@@ -330,6 +333,48 @@ pub fn write_look_to(p: &std::path::Path, diff: &Value) -> Result<(), String> {
         }
     } else {
         obj.insert("widgetsLook".into(), merged);
+    }
+    write_root(p, &root)
+}
+
+/// `widgetsPanels` of a parsed config.json: how far the gallery and the settings panel were dragged from where they open
+/// (`{"gallery":[dx,dy],"settings":[dx,dy]}`, logical px; a missing or malformed entry is (0, 0)).
+pub fn panels_from_value(v: &Value) -> ((f32, f32), (f32, f32)) {
+    let get = |k: &str| {
+        let a = v.get("widgetsPanels").and_then(|p| p.get(k)).and_then(|a| a.as_array());
+        match a.map(|a| (a.first().and_then(|x| x.as_f64()), a.get(1).and_then(|x| x.as_f64()))) {
+            Some((Some(x), Some(y))) if x.is_finite() && y.is_finite() => (x as f32, y as f32),
+            _ => (0.0, 0.0),
+        }
+    };
+    (get("gallery"), get("settings"))
+}
+
+/// `widgetsPanels` from the user's config.json.
+pub fn read_panels() -> ((f32, f32), (f32, f32)) {
+    config_path().and_then(|p| read_root(&p).ok()).map(|v| panels_from_value(&v)).unwrap_or_default()
+}
+
+/// Write `widgetsPanels` (whole pixels; only the panels that are off their home position, none = the key is removed), everything else untouched.
+pub fn write_panels(gallery: (f32, f32), settings: (f32, f32)) -> Result<(), String> {
+    write_panels_to(&config_path().ok_or("no APPDATA")?, gallery, settings)
+}
+pub fn write_panels_to(p: &std::path::Path, gallery: (f32, f32), settings: (f32, f32)) -> Result<(), String> {
+    let mut root = read_root(p)?;
+    let obj = root.as_object_mut().ok_or("config root is not an object")?;
+    let mut m = serde_json::Map::new();
+    for (k, (x, y)) in [("gallery", gallery), ("settings", settings)] {
+        let (x, y) = (x.round() as i64, y.round() as i64);
+        if (x, y) != (0, 0) {
+            m.insert(k.into(), json!([x, y]));
+        }
+    }
+    if m.is_empty() {
+        if obj.remove("widgetsPanels").is_none() {
+            return Ok(()); // nothing there, nothing to write
+        }
+    } else {
+        obj.insert("widgetsPanels".into(), Value::Object(m));
     }
     write_root(p, &root)
 }
@@ -539,6 +584,42 @@ mod tests {
         assert!(write_look_to(&f, &json!({"sat": 1.2})).is_err());
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "{ nope");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `widgetsPanels`: only non-zero offsets are stored, an all-zero state removes the key, everything else in the file survives.
+    #[test]
+    fn panel_offsets_round_trip() {
+        let dir = std::env::temp_dir().join(format!("mswidgets-panels-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config.json");
+        std::fs::write(&f, r#"{"widgetsGlass":0.7,"widgetsLook":{"blur":9.0}}"#).unwrap();
+        write_panels_to(&f, (12.4, -30.6), (0.0, 0.0)).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        assert_eq!(v["widgetsPanels"], json!({"gallery": [12, -31]}));
+        assert_eq!((v["widgetsGlass"].as_f64(), v["widgetsLook"]["blur"].as_f64()), (Some(0.7), Some(9.0)));
+        assert_eq!(panels_from_value(&v), ((12.0, -31.0), (0.0, 0.0)));
+        write_panels_to(&f, (12.0, -31.0), (-5.0, 0.0)).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        assert_eq!(panels_from_value(&v), ((12.0, -31.0), (-5.0, 0.0)));
+        write_panels_to(&f, (0.0, 0.0), (0.2, -0.3)).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        assert!(v.get("widgetsPanels").is_none() && v["widgetsGlass"] == 0.7);
+        // no key and nothing to store: the file is not rewritten; garbage entries read as zero; an unparsable file is refused
+        std::fs::write(&f, "{\"a\":  1}").unwrap();
+        write_panels_to(&f, (0.0, 0.0), (0.0, 0.0)).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "{\"a\":  1}");
+        assert_eq!(panels_from_value(&json!({"widgetsPanels": {"gallery": [1], "settings": "x"}})), ((0.0, 0.0), (0.0, 0.0)));
+        std::fs::write(&f, "{ nope").unwrap();
+        assert!(write_panels_to(&f, (1.0, 1.0), (0.0, 0.0)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_updates_is_opt_in() {
+        assert!(!Settings::from_value(&json!({})).check_updates);
+        assert!(!Settings::from_value(&json!({"checkUpdates": "yes"})).check_updates);
+        assert!(Settings::from_value(&json!({"checkUpdates": true})).check_updates);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::grid;
 use crate::layout::Dim;
 use crate::motion::AppearancePref;
 use crate::registry::{self, WidgetDef};
+use crate::update::UpdateState;
 use crate::widget::*;
 use std::collections::HashMap;
 use windows::Foundation::Numerics::Matrix3x2;
@@ -174,6 +175,10 @@ pub enum Hit {
     Look(usize, f32),
     Opt(Opt, usize),
     Autostart,
+    /// the "Check on start" switch, the "Check for updates" button, the "Download" button of an available update
+    CheckStart,
+    UpdBtn,
+    UpdDownload,
     ResetLook,
     EditBtn,
     QuitBtn,
@@ -239,6 +244,11 @@ pub struct Ui {
     pub appearance: AppearancePref,
     pub dim_mode: Dim,
     pub autostart: bool,
+    /// settings panel: `checkUpdates` and the state of the update check
+    pub check_start: bool,
+    pub update: UpdateState,
+    /// keyboard focus on a slider: the settings panel's row (0 = Glass), or 0 = the glass slider of the strip while the gallery is open
+    pub sfocus: Option<usize>,
     /// how far the gallery / the settings panel were dragged from where they open, logical px
     pub gal_off: (f32, f32),
     pub set_off: (f32, f32),
@@ -334,6 +344,33 @@ pub struct TbLay {
     pub btn_settings: Rect,
 }
 
+/// Keys the sliders react to (the host maps the virtual keys).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SKey {
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    /// Backspace / Delete
+    Reset,
+    Tab,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SAct {
+    /// the focus moved
+    Focus,
+    /// slider i goes to position t (0..1)
+    Set(usize, f32),
+}
+
+/// Position of a slider after `notches` of the mouse wheel (+ = up = more): 2 % per notch.
+pub fn wheel_pos(p: f32, notches: f32) -> f32 {
+    (p + notches * 0.02).clamp(0.0, 1.0)
+}
+
 /// One look slider row of the settings panel.
 #[derive(Clone, Copy, Debug)]
 pub struct SliderRow {
@@ -363,11 +400,16 @@ pub struct SetLay {
     pub opts: Vec<OptRow>,
     pub auto_row: Rect,
     pub auto_sw: Rect,
+    pub check_row: Rect,
+    pub check_sw: Rect,
     pub edit_btn: Rect,
     pub quit_btn: Rect,
     pub keys: Rect,
     pub done: Rect,
-    pub hint: Rect,
+    /// footer: "Check for updates", its status line, "Download" (only offered for an available update)
+    pub upd_btn: Rect,
+    pub upd_status: Rect,
+    pub upd_dl: Rect,
     pub foot: Rect,
 }
 
@@ -404,6 +446,9 @@ impl Ui {
             appearance: AppearancePref::default(),
             dim_mode: Dim::Auto,
             autostart: false,
+            check_start: false,
+            update: UpdateState::Idle,
+            sfocus: None,
             gal_off: (0.0, 0.0),
             set_off: (0.0, 0.0),
             groups,
@@ -609,8 +654,14 @@ impl Ui {
             })
             .collect();
         let ay = top + 3.0 * OPT_ROW;
-        let by = top + 4.0 * OPT_ROW + 10.0;
+        let cy = top + 4.0 * OPT_ROW;
+        let by = top + 5.0 * OPT_ROW + 10.0;
         let bw = ((rw - 8.0) * 0.6).round();
+        let fy = p.bottom() - SET_FOOT + 13.0;
+        let done = Rect::new(p.right() - 16.0 - 82.0, fy, 82.0, 30.0);
+        let upd_btn = Rect::new(p.x + 22.0, fy, 176.0, 30.0);
+        let upd_dl = Rect::new(done.x - 8.0 - 112.0, fy, 112.0, 30.0);
+        let sx = upd_btn.right() + 12.0;
         SetLay {
             panel: p,
             title: Rect::new(p.x + 22.0, p.y + 14.0, 300.0, 28.0),
@@ -622,11 +673,15 @@ impl Ui {
             opts,
             auto_row: Rect::new(rx, ay, rw, 28.0),
             auto_sw: Rect::new(rx + rw - 44.0, ay + 2.0, 44.0, 24.0),
+            check_row: Rect::new(rx, cy, rw, 28.0),
+            check_sw: Rect::new(rx + rw - 44.0, cy + 2.0, 44.0, 24.0),
             edit_btn: Rect::new(rx, by, bw, 30.0),
             quit_btn: Rect::new(rx + bw + 8.0, by, rw - bw - 8.0, 30.0),
             keys: Rect::new(rx, by + 44.0, rw, (p.bottom() - SET_FOOT - 10.0 - (by + 44.0)).max(0.0)),
-            done: Rect::new(p.right() - 16.0 - 82.0, p.bottom() - SET_FOOT + 13.0, 82.0, 30.0),
-            hint: Rect::new(p.x + 22.0, p.bottom() - SET_FOOT, p.w - 140.0, SET_FOOT),
+            done,
+            upd_btn,
+            upd_status: Rect::new(sx, p.bottom() - SET_FOOT, upd_dl.x - 8.0 - sx, SET_FOOT),
+            upd_dl,
             foot: Rect::new(p.x + 14.0, p.bottom() - SET_FOOT, p.w - 28.0, 0.8),
         }
     }
@@ -643,6 +698,12 @@ impl Ui {
         if l.reset.contains(lx, ly) {
             return Hit::ResetLook;
         }
+        if l.upd_btn.contains(lx, ly) {
+            return Hit::UpdBtn;
+        }
+        if l.upd_dl.contains(lx, ly) && matches!(self.update, UpdateState::Available { .. }) {
+            return Hit::UpdDownload;
+        }
         if let Some(i) = l.rows.iter().position(|r| r.track.inset_xy(-12.0, -(r.row.h / 2.0 - 2.0)).contains(lx, ly)) {
             return Hit::Look(i, ((lx - l.rows[i].track.x) / l.rows[i].track.w).clamp(0.0, 1.0));
         }
@@ -654,6 +715,9 @@ impl Ui {
         }
         if l.auto_row.contains(lx, ly) {
             return Hit::Autostart;
+        }
+        if l.check_row.contains(lx, ly) {
+            return Hit::CheckStart;
         }
         if l.edit_btn.contains(lx, ly) {
             return Hit::EditBtn;
@@ -707,13 +771,58 @@ impl Ui {
     }
 
     /// The k-th control of the settings panel in reading order (headless `--hover k`): the sliders, "Reset look", one option of each
-    /// segmented control, the switch, "Edit widgets", "Quit", "Done".
+    /// segmented control, the switches, "Edit widgets", "Quit", "Check for updates", "Download", "Done".
     pub fn nth_control(&self, k: usize) -> Hit {
         let n = 1 + LOOK.len();
         if k < n {
             return Hit::Look(k, self.set_pos(k));
         }
-        [Hit::ResetLook, Hit::Opt(Opt::Appearance, 1), Hit::Opt(Opt::Dim, 0), Hit::Opt(Opt::Source, 1), Hit::Autostart, Hit::EditBtn, Hit::QuitBtn, Hit::Done].get(k - n).copied().unwrap_or(Hit::None)
+        [Hit::ResetLook, Hit::Opt(Opt::Appearance, 1), Hit::Opt(Opt::Dim, 0), Hit::Opt(Opt::Source, 1), Hit::Autostart, Hit::CheckStart, Hit::EditBtn, Hit::QuitBtn, Hit::UpdBtn, Hit::UpdDownload, Hit::Done].get(k - n).copied().unwrap_or(Hit::None)
+    }
+
+    // ------------------------------------------------ keyboard / wheel on the sliders
+
+    /// How many sliders the keyboard can reach: the settings panel's rows, or the glass slider of the strip.
+    pub fn slider_count(&self) -> usize {
+        if self.settings {
+            1 + LOOK.len()
+        } else {
+            1
+        }
+    }
+
+    /// The slider row of the settings panel under (lx, ly): the whole row counts for the wheel, not just the track.
+    pub fn row_at(&self, lx: f32, ly: f32) -> Option<usize> {
+        self.set_lay().rows.iter().position(|r| r.row.contains(lx, ly))
+    }
+
+    /// A key for the sliders. Up / Down / Tab / Shift+Tab move the focus (`SAct::Focus`); Left / Right (1 %, Shift 10 %), Home / End and
+    /// Backspace / Delete (back to the base look) give the new position of the focused slider. None = nothing to do.
+    pub fn slider_key(&mut self, k: SKey, shift: bool) -> Option<SAct> {
+        let n = self.slider_count();
+        let f = self.sfocus.filter(|i| *i < n);
+        if matches!(k, SKey::Up | SKey::Down | SKey::Tab) {
+            let back = k == SKey::Up || (k == SKey::Tab && shift);
+            let to = match (f, back) {
+                (None, false) => 0,
+                (None, true) => n - 1,
+                (Some(i), false) => (i + 1) % n,
+                (Some(i), true) => (i + n - 1) % n,
+            };
+            self.sfocus = Some(to);
+            return Some(SAct::Focus);
+        }
+        let i = f?;
+        let step = if shift { 0.10 } else { 0.01 };
+        let p = self.set_pos(i);
+        let t = match k {
+            SKey::Left => p - step,
+            SKey::Right => p + step,
+            SKey::Home => 0.0,
+            SKey::End => 1.0,
+            _ => self.set_default_pos(i),
+        };
+        Some(SAct::Set(i, t.clamp(0.0, 1.0)))
     }
 
     /// The selected option of a segmented control.
@@ -1185,6 +1294,9 @@ impl Ui {
             let kx = tb.track.x + tb.track.w * v;
             cx.circle((kx, tb.track.cy() + 1.5), 9.0, Color::rgba(0.0, 0.0, 0.0, 0.25));
             cx.circle((kx, tb.track.cy()), 8.0, Color::rgba(1.0, 1.0, 1.0, 0.97));
+            if self.sfocus == Some(0) {
+                cx.circle_stroke((kx, tb.track.cy()), 11.5, 2.0, BLUE.alpha(0.95));
+            }
             cx.rect(tb.sep, FILL);
             cx.text(tb.label_bg, self.t("Фон", "Back"), Style::new(12.5, 500), TEXT);
             let seg = Rect::new(tb.seg_live.x, tb.seg_live.y, tb.seg_live.w + tb.seg_plain.w, tb.seg_live.h);
@@ -1200,8 +1312,11 @@ impl Ui {
     }
 
     /// The glass slider of the strip, restyled for the settings rows: track, fill, base-look tick and a knob that grows under the pointer.
-    fn set_slider(&self, cx: &Cx, r: &SliderRow, v: f32, def: f32, hot: bool, down: bool) {
+    fn set_slider(&self, cx: &Cx, r: &SliderRow, v: f32, def: f32, hot: bool, down: bool, focus: bool) {
         let t = r.track;
+        if focus {
+            cx.rrect(r.row.inset_xy(-8.0, 1.0), 8.0, Color::rgba(1.0, 1.0, 1.0, 0.07));
+        }
         cx.pill(t, FILL);
         cx.pill(Rect::new(t.x, t.y, (t.w * v).max(4.0), t.h), Color::rgba(1.0, 1.0, 1.0, if hot || down { 0.70 } else { 0.55 }));
         let dx = t.x + t.w * def;
@@ -1213,6 +1328,19 @@ impl Ui {
         }
         cx.circle((kx, t.cy() + 1.5), kr + 1.0, Color::rgba(0.0, 0.0, 0.0, 0.25));
         cx.circle((kx, t.cy()), kr, Color::rgba(1.0, 1.0, 1.0, 0.97));
+        if focus {
+            cx.circle_stroke((kx, t.cy()), kr + 3.5, 2.0, BLUE.alpha(0.95));
+        }
+    }
+
+    /// A label with an on / off switch on the right.
+    fn set_switch(&self, cx: &Cx, row: Rect, sw: Rect, label: &str, on: bool, hot: bool) {
+        cx.text(Rect::new(row.x, row.y, row.w - 52.0, row.h), label, Style::new(12.5, 500).ellipsis(), TEXT);
+        let sw = sw.centered(40.0, 24.0);
+        cx.pill(sw, if on { Color::rgb8(52, 199, 89) } else if hot { Color::rgba(1.0, 1.0, 1.0, 0.26) } else { FILL });
+        let kx = if on { sw.right() - 12.0 } else { sw.x + 12.0 };
+        cx.circle((kx, sw.cy() + 1.2), 10.0, Color::rgba(0.0, 0.0, 0.0, 0.22));
+        cx.circle((kx, sw.cy()), 9.5, Color::rgba(1.0, 1.0, 1.0, 0.98));
     }
 
     fn set_button(&self, cx: &Cx, r: Rect, label: &str, hot: bool, down: bool, color: Color) {
@@ -1242,7 +1370,7 @@ impl Ui {
                 let (hot, down) = (look_at(hv, i), look_at(pr, i));
                 let (ru, en) = names.get(i).copied().unwrap_or(("", ""));
                 cx.text(r.label, self.t(ru, en), Style::new(12.5, 500).ellipsis(), TEXT);
-                self.set_slider(cx, r, self.set_pos(i), self.set_default_pos(i), hot, down);
+                self.set_slider(cx, r, self.set_pos(i), self.set_default_pos(i), hot, down, self.sfocus == Some(i));
                 cx.text(r.value, &self.set_value_text(i), Style::new(11.5, 500).right().mono(), if hot || down { TEXT } else { DIM });
             }
             let hot = hv == Hit::ResetLook;
@@ -1263,15 +1391,11 @@ impl Ui {
                 self.seg(cx, o.seg, &items, 2.0, hot);
             }
 
-            // start with Windows: label + switch
+            // start with Windows, check for updates on start: label + switch
             let hot = hv == Hit::Autostart || pr == Hit::Autostart;
-            cx.text(Rect::new(l.auto_row.x, l.auto_row.y, l.auto_row.w - 52.0, l.auto_row.h), self.t("Запускать с Windows", "Start with Windows"), Style::new(12.5, 500).ellipsis(), TEXT);
-            let sw = l.auto_sw.centered(40.0, 24.0);
-            let on = self.autostart;
-            cx.pill(sw, if on { Color::rgb8(52, 199, 89) } else if hot { Color::rgba(1.0, 1.0, 1.0, 0.26) } else { FILL });
-            let kx = if on { sw.right() - 12.0 } else { sw.x + 12.0 };
-            cx.circle((kx, sw.cy() + 1.2), 10.0, Color::rgba(0.0, 0.0, 0.0, 0.22));
-            cx.circle((kx, sw.cy()), 9.5, Color::rgba(1.0, 1.0, 1.0, 0.98));
+            self.set_switch(cx, l.auto_row, l.auto_sw, self.t("Запускать с Windows", "Start with Windows"), self.autostart, hot);
+            let hot = hv == Hit::CheckStart || pr == Hit::CheckStart;
+            self.set_switch(cx, l.check_row, l.check_sw, self.t("Проверять обновления при запуске", "Check for updates on start"), self.check_start, hot);
 
             // buttons
             self.set_button(cx, l.edit_btn, self.t("Изменить виджеты", "Edit widgets"), hv == Hit::EditBtn, pr == Hit::EditBtn, TEXT);
@@ -1279,16 +1403,37 @@ impl Ui {
 
             // shortcuts
             let k = Style::new(11.0, 400);
-            let lines = [("Ctrl+Alt+G", ("Настройки", "Settings")), ("Ctrl+Alt+W", ("Изменить виджеты", "Edit widgets")), ("Ctrl+Alt+Q", ("Выйти", "Quit"))];
+            let lines = [
+                ("Ctrl+Alt+G", ("Настройки", "Settings")),
+                ("Ctrl+Alt+W", ("Изменить виджеты", "Edit widgets")),
+                ("Ctrl+Alt+Q", ("Выйти", "Quit")),
+                ("Esc", ("Закрыть (или щелчок снаружи)", "Close (or click outside)")),
+                ("Tab / ← →", ("Ползунки с клавиатуры", "Sliders by keyboard")),
+            ];
             for (n, (keys, (ru, en))) in lines.iter().enumerate() {
                 let r = Rect::new(l.keys.x, l.keys.y + n as f32 * 20.0, l.keys.w, 20.0);
+                if r.bottom() > l.keys.bottom() + 0.5 {
+                    break;
+                }
                 cx.text(Rect::new(r.x, r.y, 84.0, r.h), keys, k.mono(), FAINT);
                 cx.text(Rect::new(r.x + 90.0, r.y, r.w - 90.0, r.h), self.t(ru, en), k.ellipsis(), FAINT);
             }
 
             // footer
             cx.rect(l.foot, FILL);
-            cx.text(l.hint, self.t("Esc или щелчок снаружи закрывает панель", "Esc or a click outside closes the panel"), Style::new(12.0, 500).ellipsis(), DIM);
+            let busy = self.update == UpdateState::Checking;
+            self.set_button(cx, l.upd_btn, self.t("Проверить обновления", "Check for updates"), hv == Hit::UpdBtn && !busy, pr == Hit::UpdBtn && !busy, if busy { DIM } else { TEXT });
+            let (msg, color) = match &self.update {
+                UpdateState::Idle => (format!("{} {}", self.t("Версия", "Version"), env!("CARGO_PKG_VERSION")), FAINT),
+                UpdateState::Checking => (self.t("Проверка…", "Checking…").to_string(), DIM),
+                UpdateState::Latest => (self.t("У вас последняя версия", "You have the latest version").to_string(), Color::rgb8(52, 199, 89)),
+                UpdateState::Available { version, .. } => (if self.lang == Lang::Ru { format!("Доступна версия {version}") } else { format!("Version {version} is available") }, TEXT),
+                UpdateState::Failed => (self.t("Не удалось проверить", "Could not check").to_string(), ORANGE),
+            };
+            cx.text(l.upd_status, &msg, Style::new(12.0, 500).ellipsis(), color);
+            if matches!(self.update, UpdateState::Available { .. }) {
+                self.set_button(cx, l.upd_dl, self.t("Скачать", "Download"), hv == Hit::UpdDownload, pr == Hit::UpdDownload, Color::rgb8(100, 190, 255));
+            }
             let hot = hv == Hit::Done || pr == Hit::Done;
             cx.pill(l.done.offset(0.0, 2.0).inset_xy(2.0, 0.0), BLUE.alpha(0.40));
             cx.pill(l.done, if hot { Color::rgb8(43, 149, 255) } else { Color::rgb8(10, 132, 255) });
@@ -1607,9 +1752,12 @@ mod tests {
             for o in &l.opts {
                 assert!(inside(o.seg) && inside(o.label) && o.label.right() <= o.seg.x + 0.01);
             }
-            for r in [l.reset, l.auto_row, l.auto_sw, l.edit_btn, l.quit_btn, l.done] {
+            for r in [l.reset, l.auto_row, l.auto_sw, l.check_row, l.check_sw, l.edit_btn, l.quit_btn, l.done, l.upd_btn, l.upd_status, l.upd_dl] {
                 assert!(inside(r), "{r:?}");
             }
+            // the footer line is one row: update button, status, download, Done, none over another; the right column does not run into the footer
+            assert!(l.upd_btn.right() <= l.upd_status.x && l.upd_status.right() <= l.upd_dl.x && l.upd_dl.right() <= l.done.x && l.upd_status.w > 150.0);
+            assert!(l.auto_row.bottom() <= l.check_row.y && l.check_row.bottom() <= l.edit_btn.y && l.edit_btn.bottom() <= l.foot.y && l.keys.bottom() <= l.foot.y + 0.01);
             assert!(l.edit_btn.right() <= l.quit_btn.x && l.rows.iter().all(|r| r.value.right() <= l.sep.x));
             // sliders: the track ends map to 0 / 1, the middle to ~0.5; a click in the label column does not move a slider
             let t = l.rows[3].track;
@@ -1634,11 +1782,17 @@ mod tests {
             assert_eq!(ui.set_hit(l.edit_btn.cx(), l.edit_btn.cy()), Hit::EditBtn);
             assert_eq!(ui.set_hit(l.quit_btn.cx(), l.quit_btn.cy()), Hit::QuitBtn);
             assert_eq!(ui.set_hit(l.done.cx(), l.done.cy()), Hit::Done);
-            assert_eq!(ui.set_hit(l.hint.x + 2.0, l.hint.y + 2.0), Hit::Panel);
+            assert_eq!(ui.set_hit(l.check_sw.cx(), l.check_sw.cy()), Hit::CheckStart);
+            assert_eq!(ui.set_hit(l.upd_btn.cx(), l.upd_btn.cy()), Hit::UpdBtn);
+            assert_eq!(ui.set_hit(l.upd_status.x + 2.0, l.upd_status.cy()), Hit::Panel);
+            // "Download" exists only for an available update
+            assert_eq!(ui.set_hit(l.upd_dl.cx(), l.upd_dl.cy()), Hit::Panel);
+            ui.update = UpdateState::Available { version: "9.9.9".into(), url: "https://github.com/x".into() };
+            assert_eq!(ui.set_hit(l.upd_dl.cx(), l.upd_dl.cy()), Hit::UpdDownload);
             assert_eq!(ui.set_hit(p.x - 1.0, p.cy()), Hit::None);
             assert_eq!(ui.set_hit(1.0, 1.0), Hit::None);
             // reading order for the headless --hover
-            assert!(matches!(ui.nth_control(0), Hit::Look(0, _)) && ui.nth_control(l.rows.len() + 7) == Hit::Done && ui.nth_control(99) == Hit::None);
+            assert!(matches!(ui.nth_control(0), Hit::Look(0, _)) && ui.nth_control(l.rows.len() + 10) == Hit::Done && ui.nth_control(99) == Hit::None);
         }
     }
 
@@ -1666,6 +1820,59 @@ mod tests {
         ui.settings = true;
         assert_eq!(ui.panel_rect(), ui.settings_rect());
         assert!(!ui.wheel(500.0, 400.0, 1.0));
+    }
+
+    /// Keyboard on the sliders: focus moves with wrap-around, Left / Right step 1 % (Shift 10 %), Home / End jump, Reset goes to the base look.
+    #[test]
+    fn slider_keys_move_focus_and_values() {
+        let mut ui = Ui::new(Lang::En, 1.0, 1600.0, 900.0);
+        ui.edit = true;
+        ui.settings = true;
+        let n = ui.slider_count();
+        assert_eq!(n, 1 + LOOK.len());
+        // no focus yet: values are untouched, Down / Tab take the first slider, Up / Shift+Tab the last
+        assert_eq!(ui.slider_key(SKey::Left, false), None);
+        assert_eq!(ui.slider_key(SKey::Down, false), Some(SAct::Focus));
+        assert_eq!(ui.sfocus, Some(0));
+        ui.slider_key(SKey::Tab, false);
+        assert_eq!(ui.sfocus, Some(1));
+        ui.slider_key(SKey::Up, false);
+        ui.slider_key(SKey::Tab, true);
+        assert_eq!(ui.sfocus, Some(n - 1));
+        ui.slider_key(SKey::Down, false);
+        assert_eq!(ui.sfocus, Some(0)); // wraps
+        // the glass slider (index 0, base 0.5)
+        ui.glass = 0.40;
+        let Some(SAct::Set(0, t)) = ui.slider_key(SKey::Right, false) else { panic!() };
+        assert!((t - 0.41).abs() < 1e-6);
+        let Some(SAct::Set(0, t)) = ui.slider_key(SKey::Left, true) else { panic!() };
+        assert!((t - 0.30).abs() < 1e-6);
+        assert_eq!(ui.slider_key(SKey::Home, false), Some(SAct::Set(0, 0.0)));
+        assert_eq!(ui.slider_key(SKey::End, true), Some(SAct::Set(0, 1.0)));
+        assert_eq!(ui.slider_key(SKey::Reset, false), Some(SAct::Set(0, 0.5)));
+        ui.glass = 0.995;
+        assert_eq!(ui.slider_key(SKey::Right, false), Some(SAct::Set(0, 1.0))); // clamped
+        // a look slider resets to where the base look sits
+        ui.sfocus = Some(3);
+        glass::LOOK[2].set_pos(&mut ui.look, &ui.base.clone(), 0.9);
+        let Some(SAct::Set(3, t)) = ui.slider_key(SKey::Reset, false) else { panic!() };
+        assert!((t - ui.set_default_pos(3)).abs() < 1e-6 && t < 0.9);
+        // the strip of the gallery has the one slider
+        ui.settings = false;
+        ui.gallery = true;
+        ui.sfocus = None;
+        assert_eq!(ui.slider_count(), 1);
+        ui.slider_key(SKey::Tab, false);
+        ui.slider_key(SKey::Tab, false);
+        assert_eq!(ui.sfocus, Some(0));
+        // 2 % per wheel notch
+        assert!((wheel_pos(0.5, 1.0) - 0.52).abs() < 1e-6 && (wheel_pos(0.5, -3.0) - 0.44).abs() < 1e-6);
+        assert_eq!((wheel_pos(0.99, 5.0), wheel_pos(0.01, -5.0)), (1.0, 0.0));
+        // the whole row answers the wheel
+        ui.settings = true;
+        let l = ui.set_lay();
+        assert_eq!(ui.row_at(l.rows[2].label.x + 3.0, l.rows[2].row.cy()), Some(2));
+        assert_eq!(ui.row_at(l.title.x, l.title.y), None);
     }
 
     #[test]
@@ -1714,6 +1921,8 @@ pub struct DumpArgs {
     pub appearance: Option<crate::motion::AppearancePref>,
     /// `--look '{"blur":9,...}'`: a `widgetsLook` object for the render (default: the user's config.json; a sample for `--state settings`)
     pub look: Option<String>,
+    /// `--update-state idle|checking|latest|available|failed`: the update line of the settings panel (sample)
+    pub update_state: Option<String>,
 }
 
 /// `--dump-ui`: compose the host UI of a state (live | edit | gallery | menu) headless into a PNG with the SAME scene / UI code as the live host:
@@ -1784,6 +1993,14 @@ pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
     ui.appearance = a.appearance.unwrap_or(settings.appearance);
     ui.dim_mode = settings.dim;
     ui.autostart = true; // sample state: the registry is never read by a headless render
+    ui.check_start = settings.check_updates;
+    ui.update = match a.update_state.as_deref() {
+        Some("checking") => UpdateState::Checking,
+        Some("latest") => UpdateState::Latest,
+        Some("available") => UpdateState::Available { version: "0.3.0".into(), url: "https://github.com/".into() },
+        Some("failed") => UpdateState::Failed,
+        _ => UpdateState::Idle,
+    };
     ui.anim = 1.0;
     ui.dim = if ui.settings { SETTINGS_DIM } else if edit { 0.28 } else { 0.0 };
     ui.st.focus = a.search.is_some();
@@ -1799,6 +2016,9 @@ pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
         ui.select_size(sz);
     }
     ui.hover = a.hover.map_or(Hit::None, |k| if ui.settings { ui.nth_control(k % 100) } else { Hit::Item(k) });
+    if let (true, Hit::Look(i, _)) = (ui.settings, ui.hover) {
+        ui.sfocus = Some(i); // the hovered slider shows its keyboard focus ring
+    }
     if ui.settings && a.hover.is_some_and(|k| k >= 100) {
         ui.press = ui.hover; // --hover 100+k: control k pressed
     }

@@ -1,7 +1,7 @@
 //! mswidgets - native (no WebView) Direct2D renderer for the macshell desktop widgets. See native/NATIVE.md.
 //!   mswidgets --dump out.png --backdrop bd.png --cards "clock:s@0,0;calendar:m@1,0" [--scale 1] [--w W --h H] [--time "2026-10-24 10:08:35"]
 //!   mswidgets --sheet out.png --backdrop bd.png [--only clock,calendar] [--scale 1] [--time "..."]    contact sheet: every widget x every size
-//!   mswidgets --dump-ui out.png [--backdrop bd.png] --state live|edit|gallery|settings|menu [--look '{"blur":9}'] [--size WxH] [--search txt] [--group id] [--psize s|m|l] [--hover n] [--dim] [--scale S] [--cards ...]
+//!   mswidgets --dump-ui out.png [--backdrop bd.png] --state live|edit|gallery|settings|menu [--look '{"blur":9}'] [--update-state idle|checking|latest|available|failed] [--size WxH] [--search txt] [--group id] [--psize s|m|l] [--hover n] [--dim] [--scale S] [--cards ...]
 //!                                                                     the host UI (edit mode, gallery with live previews) rendered headless
 //!   mswidgets [--backdrop-fps 30] [--scale S] [--no-config] [--no-hotkeys]   live mode (Ctrl+Alt+Q quits, Ctrl+Alt+W edits; a second instance exits silently)
 //!   mswidgets --bench SECONDS [--backdrop-fps N]                    live mode that prints stats and exits
@@ -31,6 +31,7 @@ mod sys;
 mod tray;
 pub mod tz;
 mod ui;
+mod update;
 mod widget;
 mod widgets;
 
@@ -75,6 +76,7 @@ struct Args {
     appearance: Option<motion::AppearancePref>,
     glass_params: Option<String>,
     look: Option<String>,
+    update_state: Option<String>,
     calib: Option<String>,
     calib_dir: Option<String>,
     calib_out: Option<String>,
@@ -133,6 +135,7 @@ fn parse_args() -> Args {
             }
             "--glass-params" => a.glass_params = Some(val()),
             "--look" => a.look = Some(val()),
+            "--update-state" => a.update_state = Some(val()),
             "--anim-strip" => a.anim_strip = Some(val()),
             "--times" => a.times = Some(val().split(',').filter_map(|t| t.trim().parse().ok()).collect()),
             "--anim-out" => a.anim_out = true,
@@ -218,6 +221,7 @@ fn main() {
             dim: a.dim,
             appearance: a.appearance,
             look: a.look.clone(),
+            update_state: a.update_state.clone(),
         }))
     } else {
         // one live instance per session (a bench run may coexist with a live one)
