@@ -1,8 +1,31 @@
 # Glass Widgets
 
+[![Release](https://img.shields.io/github/v/release/chvdbhcx-del/glass-widgets?color=3b82f6)](../../releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4)
+
+![Glass Widgets on a wallpaper](docs/images/hero.png)
+
 Native desktop widgets for Windows 10/11 with a Liquid-Glass look: translucent, refracting cards that float over your wallpaper
-(an animated one too). No WebView, no Electron: one transparent layered window drawn with Direct2D on the GPU, a ~4 MB installer
+(an animated one too). No WebView, no Electron: one transparent layered window drawn with Direct2D on the GPU, a 0.7 MB installer
 and roughly 100 MB of RAM and under 10 % of one CPU core while the wallpaper moves.
+
+*По-русски: нативные виджеты рабочего стола для Windows 10/11 в стиле «жидкого стекла»: полупрозрачные карточки с преломлением
+поверх обоев (в том числе живых). Без WebView и Electron, на Direct2D, установщик меньше 1 МБ.*
+
+## Highlights
+
+- **Real glass**: each card refracts and blurs the wallpaper behind it, with a chromatic fringe, a specular highlight that follows
+  the light and a soft materialise animation. Cards that touch merge into one blob.
+- **Dark or light glass** (`dark` by default) and crisp Segoe UI Variable typography.
+- **Live wallpapers work**: the glass reads the wallpaper window itself, so it follows videos and animated wallpapers.
+- **Visible to screenshots and screen recorders**: the layer never captures itself.
+- **Light**: about 100 MB of RAM and under 10 % of one core with an animated wallpaper.
+- **Private**: the network is used only by the widgets that need it (weather, rates, quote, site icons); no telemetry.
+
+| Dark glass, edit mode and the widget gallery (`Ctrl+Alt+W`) | Light glass |
+| --- | --- |
+| ![Widget gallery](docs/images/gallery.png) | ![Light appearance](docs/images/light.png) |
 
 ## Widgets
 
