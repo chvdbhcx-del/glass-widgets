@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.6] - 2026-10-25
+
+### Fixed
+- Edit mode: the jiggle has the same swing of the edges for every card size (the angle of M and L cards is smaller, it used to be the same 1.2 degrees and looked much wider on big cards).
+
 ## [0.5.5] - 2026-10-25
 
 ### Fixed

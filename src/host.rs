@@ -2276,7 +2276,9 @@ impl App {
             let c = &self.scene.cards[i];
             let dragging = self.drag.as_ref().is_some_and(|d| d.uid == c.uid);
             let lift = if dragging { (c.xf.lift + dt / 0.12).min(1.0) } else { (c.xf.lift - dt / 0.18).max(0.0) };
-            let rot = if amp > 0.0 && !dragging { ui::jiggle(i, jig_t) * amp } else { 0.0 };
+            // the same swing of the edges for every size: the angle shrinks with the card's half-diagonal (S = 1.2 degrees)
+            let k = (170.0 * self.cs * std::f32::consts::SQRT_2) / (c.w as f32).hypot(c.h as f32);
+            let rot = if amp > 0.0 && !dragging { ui::jiggle(i, jig_t) * amp * k.min(1.0) } else { 0.0 };
             let xf = match self.pops.get(&c.uid) {
                 Some(p) => mat_xf(&p.at(t, reduced), rot, lift),
                 None => Xf { rot, scale: 1.0 + 0.03 * lift, alpha: 1.0, lift, blur: 0.0, sweep: -1.0 },
