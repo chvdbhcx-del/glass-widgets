@@ -40,13 +40,25 @@ administrator rights) and can start Glass Widgets with Windows. The installer is
 
 | Keys | Action |
 | --- | --- |
-| `Ctrl+Alt+W` | edit mode: gallery to add widgets, resize, remove, settings |
+| `Ctrl+Alt+G` | settings panel |
+| `Ctrl+Alt+W` | edit mode: gallery to add widgets, resize, remove |
 | `Ctrl+Alt+Q` | quit (if another program already owns this combination, close the process from Task Manager) |
 
 The layer sits above the wallpaper and under your windows, like desktop widgets should. It is visible to screenshots and screen
 recorders: the glass reads the wallpaper window itself (Windows Graphics Capture), never the screen, so it does not see itself.
 
-## Settings
+## Tray icon and settings panel
+
+Glass Widgets lives in the notification area (Windows 11 may keep it under the `^` chevron: drag it out to pin it). Left click opens
+the settings panel; right click shows a menu: **Settings**, **Edit Widgets**, **Hide / Show Widgets**, **Start with Windows**, **Quit**.
+
+![Settings panel](docs/images/settings.png)
+
+The panel has sliders that change the look of the widgets live: glass amount, blur, refraction, chromatic fringe, saturation, brightness,
+frosting, highlights, glow, corner roundness and card size. It also switches dark / light / auto glass, dimming, live or plain glass
+and autostart. "Reset look" brings everything back to the defaults.
+
+## Settings file
 
 Everything lives in `%APPDATA%\macshell\config.json` (written by the edit mode; you rarely need to touch it):
 
@@ -57,6 +69,7 @@ Everything lives in `%APPDATA%\macshell\config.json` (written by the edit mode; 
 | `widgetsAppearance` | `dark` (default), `light` or `auto` (follows the brightness under each card) |
 | `widgetsDim` | `auto` (default), `never`, `always` |
 | `widgetsGlass` | glass amount, `0`..`1` (default `0.5`) |
+| `widgetsLook` | the other sliders of the settings panel (only the changed ones) |
 
 Network is used only by the widgets that need it (weather, rates, quote, site icons of shortcut tiles); nothing else phones home.
 Advanced knobs are environment variables, for example `MSW_CAPTURE=gdi|dxgi` (older capture paths) and `MSW_TEXT_GAMMA`.

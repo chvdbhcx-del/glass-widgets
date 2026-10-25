@@ -54,7 +54,7 @@ glass_params! {
     /// lens gaussian sigma
     blur: 4.19, 1.0, 14.0;
     /// refraction strength multiplier (x the size dependent shift)
-    refr: 1.0, 0.6, 1.5;
+    refr: 1.0, 0.0, 1.6;
     /// refraction band width multiplier
     refr_edge: 1.0, 0.5, 1.8;
     /// refraction profile exponent: displacement ~ (1 - t)^pow
@@ -64,7 +64,7 @@ glass_params! {
     chroma_b: 0.06, 0.0, 0.2;
     /// lens colour matrix: saturation and brightness
     sat: 1.92, 0.8, 2.8;
-    bright: 0.81, 0.8, 1.4;
+    bright: 0.81, 0.5, 1.4;
     /// white tint gradient: alpha at the start / end plus the slider (glass) slope
     tint0: 0.0, 0.0, 0.2;
     tint0_g: 0.13, 0.0, 0.3;
@@ -74,7 +74,7 @@ glass_params! {
     sheen: 0.22, 0.12, 0.5;
     sheen_mid: 0.05, 0.02, 0.2;
     /// inner glow (white, gaussian sigma)
-    glow: 0.06, 0.04, 0.3;
+    glow: 0.06, 0.0, 0.3;
     glow_sigma: 11.5, 4.0, 24.0;
     /// adaptive dark veil over bright backdrops: gain, luminance threshold, ceiling
     veil_gain: 0.79, 0.0, 2.5;
@@ -86,7 +86,7 @@ glass_params! {
     /// thin dark edge line under the rim (the references show a dark 1 px outline on the sides)
     edge_dark: 0.134, 0.0, 0.7;
     /// specular rim: peak alpha, stroke width, extent along the light axis (0..1), strength of the opposite (counter) highlight
-    spec: 0.75, 0.45, 1.0;
+    spec: 0.75, 0.0, 1.0;
     spec_w: 0.9, 0.6, 3.0;
     spec_len: 0.20, 0.05, 0.35;
     spec_back: 0.30, 0.0, 1.0;
@@ -112,6 +112,10 @@ glass_params! {
     sh_dy: 9.0, 0.0, 36.0;
     sh_b_blur: 5.0, 1.0, 14.0;
     sh_b_dy: 2.0, 0.0, 8.0;
+    /// corner radius multiplier of the cards (the settings panel's "Corners")
+    radius_k: 1.0, 0.15, 1.7;
+    /// card scale multiplier (the settings panel's "Card size"): the host lays the desk out with it, the glass renderer never reads it
+    card_k: 1.0, 0.7, 1.5;
 }
 
 impl GlassParams {
@@ -175,6 +179,91 @@ pub fn init_params(path: Option<&str>) {
 /// The parameters in force (`init_params` is called at start; tests / tools that skip it get the defaults).
 pub fn global_params() -> GlassParams {
     *GLOBAL.get_or_init(GlassParams::default)
+}
+
+// ---------------------------------------------------------------- the user's look (settings panel sliders, config.json `widgetsLook`)
+
+/// One look slider: its `primary` parameter runs over lo..hi (a sub-range of the calibration range, so both ends still look good);
+/// the `follow` parameters keep their ratio to the primary relative to the base values (the chromatic fringe moves both channels together).
+pub struct LookDef {
+    pub primary: &'static str,
+    pub lo: f32,
+    pub hi: f32,
+    pub follow: &'static [&'static str],
+}
+
+/// The sliders of the settings panel, in panel order (after "Glass", which is `widgetsGlass`).
+pub const LOOK: [LookDef; 10] = [
+    LookDef { primary: "blur", lo: 1.0, hi: 12.0, follow: &[] },
+    LookDef { primary: "refr", lo: 0.0, hi: 1.6, follow: &[] },
+    LookDef { primary: "chroma_r", lo: 0.0, hi: 0.12, follow: &["chroma_b"] },
+    LookDef { primary: "sat", lo: 0.8, hi: 2.6, follow: &[] },
+    LookDef { primary: "bright", lo: 0.6, hi: 1.2, follow: &[] },
+    LookDef { primary: "tint0_g", lo: 0.0, hi: 0.26, follow: &["tint1_g"] },
+    LookDef { primary: "spec", lo: 0.0, hi: 1.0, follow: &["sheen", "sheen_mid"] },
+    LookDef { primary: "glow", lo: 0.0, hi: 0.25, follow: &[] },
+    LookDef { primary: "radius_k", lo: 0.15, hi: 1.7, follow: &[] },
+    LookDef { primary: "card_k", lo: 0.7, hi: 1.5, follow: &[] },
+];
+
+impl LookDef {
+    /// Every parameter this slider owns.
+    pub fn names(&self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.primary).chain(self.follow.iter().copied())
+    }
+    /// Slider position 0..1 of the primary parameter in `p`.
+    pub fn pos(&self, p: &GlassParams) -> f32 {
+        ((p.get(self.primary).unwrap_or(self.lo) - self.lo) / (self.hi - self.lo)).clamp(0.0, 1.0)
+    }
+    /// Move the slider to `t` (0..1): sets the primary and scales the followers. Near the base value the knob snaps to it exactly.
+    pub fn set_pos(&self, p: &mut GlassParams, base: &GlassParams, t: f32) {
+        let mut v = self.lo + (self.hi - self.lo) * t.clamp(0.0, 1.0);
+        let b = base.get(self.primary).unwrap_or(v);
+        if (v - b).abs() < (self.hi - self.lo) * 0.02 {
+            v = b;
+        }
+        p.set(self.primary, v);
+        if b.abs() > 1e-6 {
+            for f in self.follow {
+                if let Some(bf) = base.get(f) {
+                    p.set(f, bf * v / b);
+                }
+            }
+        }
+    }
+    /// Primary value relative to the base (1.0 = unchanged).
+    pub fn ratio(&self, p: &GlassParams, base: &GlassParams) -> f32 {
+        let b = base.get(self.primary).unwrap_or(1.0);
+        if b.abs() > 1e-6 {
+            p.get(self.primary).unwrap_or(b) / b
+        } else {
+            1.0
+        }
+    }
+}
+
+/// The `widgetsLook` object for `cur`: only the look parameters that differ from `base` (the defaults + glass.json).
+pub fn look_diff(base: &GlassParams, cur: &GlassParams) -> Value {
+    let mut o = serde_json::Map::new();
+    for n in LOOK.iter().flat_map(|d| d.names()) {
+        if let (Some(b), Some(c)) = (base.get(n), cur.get(n)) {
+            if (b - c).abs() > 1e-4 {
+                o.insert(n.to_string(), json!((c * 10000.0).round() as f64 / 10000.0));
+            }
+        }
+    }
+    Value::Object(o)
+}
+
+/// `base` + the `widgetsLook` object: only the look parameters are honoured, each clamped to its calibration range.
+pub fn apply_look(base: &GlassParams, look: &Value) -> GlassParams {
+    let mut p = *base;
+    for n in LOOK.iter().flat_map(|d| d.names()) {
+        if let (Some(v), Some((lo, hi))) = (look.get(n).and_then(|v| v.as_f64()), GlassParams::range(n)) {
+            p.set(n, (v as f32).clamp(lo, hi));
+        }
+    }
+    p
 }
 
 // ---------------------------------------------------------------- styles and per-draw inputs
@@ -816,6 +905,60 @@ mod tests {
             let d = GlassParams::default().get(n).unwrap();
             assert!(lo <= d && d <= hi, "{n}: {d} not in {lo}..{hi}");
         }
+    }
+
+    /// The slider <-> parameter mapping: sub-ranges inside the calibration ranges around the base value, followers scale with the
+    /// primary, the knob snaps to the base, the `widgetsLook` diff round-trips and only carries changed look keys.
+    #[test]
+    fn look_sliders_map_to_params() {
+        let base = GlassParams::default();
+        for d in &LOOK {
+            let (rl, rh) = GlassParams::range(d.primary).unwrap();
+            assert!(rl <= d.lo && d.hi <= rh && d.lo < d.hi, "{}", d.primary);
+            let t = d.pos(&base);
+            assert!(t > 0.0 && t < 1.0, "{}: base at the end of its slider", d.primary);
+            for f in d.follow {
+                assert!(GlassParams::range(f).is_some());
+            }
+        }
+        let chroma = &LOOK[2];
+        let mut p = base;
+        chroma.set_pos(&mut p, &base, 1.0);
+        assert!((p.chroma_r - 0.12).abs() < 1e-5 && (p.chroma_b - base.chroma_b * 3.0).abs() < 1e-4, "{p:?}");
+        chroma.set_pos(&mut p, &base, 0.0);
+        assert_eq!((p.chroma_r, p.chroma_b), (0.0, 0.0));
+        // near the base value the knob snaps to it exactly (so "back at default" leaves no key behind)
+        let blur = &LOOK[0];
+        blur.set_pos(&mut p, &base, blur.pos(&base) + 0.01);
+        assert_eq!(p.blur, base.blur);
+        assert_eq!(look_diff(&base, &p).as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()), Some(vec!["chroma_b".to_string(), "chroma_r".to_string()]));
+        // out of range positions are clamped; position <-> value round trip
+        blur.set_pos(&mut p, &base, 7.0);
+        assert_eq!(p.blur, blur.hi);
+        blur.set_pos(&mut p, &base, 0.5);
+        assert!((blur.pos(&p) - 0.5).abs() < 1e-5);
+        // widgetsLook: only differences, applying them gives the same look back
+        let mut q = base;
+        LOOK[6].set_pos(&mut q, &base, 1.0); // highlights: spec + sheen + sheen_mid
+        LOOK[8].set_pos(&mut q, &base, 0.9);
+        let diff = look_diff(&base, &q);
+        let keys: Vec<&str> = diff.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys.len(), 4, "{keys:?}");
+        for k in ["spec", "sheen", "sheen_mid", "radius_k"] {
+            assert!(keys.contains(&k), "{k}");
+        }
+        let back = apply_look(&base, &diff);
+        for n in GlassParams::NAMES {
+            assert!((back.get(n).unwrap() - q.get(n).unwrap()).abs() < 1e-3, "{n}");
+        }
+        assert_eq!(look_diff(&base, &base), json!({}));
+        // the base is glass.json + defaults: a diff is relative to it; foreign / out of range entries cannot break the look
+        let mut gj = base;
+        gj.blur = 6.0;
+        assert_eq!(look_diff(&gj, &gj), json!({}));
+        let wild = apply_look(&gj, &json!({"blur": 900, "sat": -3, "nonsense": 1, "light_angle": 10, "refr": "x"}));
+        assert_eq!((wild.blur, wild.sat), (14.0, 0.8));
+        assert_eq!((wild.light_angle, wild.refr), (gj.light_angle, gj.refr)); // not a look key / not a number
     }
 
     #[test]

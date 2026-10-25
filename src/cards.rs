@@ -226,6 +226,8 @@ pub struct Scene {
     cpu: Option<(i32, i32, ID2D1Bitmap1)>,
     probe: Probe,
     pub params: GlassParams,
+    /// the base look (defaults + glass.json): the host panels (gallery, settings) are built with it, whatever the user's look sliders say
+    panel_params: GlassParams,
     /// global appearance preference (`widgetsAppearance` / `--appearance`)
     pref: AppearancePref,
     /// merging neighbours (index, index, amount) and the liquid neck renderer
@@ -386,6 +388,7 @@ impl Scene {
             cpu: None,
             probe: Probe::new(gfx, backdrop)?,
             params: crate::glass::global_params(),
+            panel_params: crate::glass::global_params(),
             pref: AppearancePref::Auto,
             merge: Vec::new(),
             liquid: None,
@@ -457,14 +460,25 @@ impl Scene {
 
     // ------------------------------------------------ run-time editing
 
-    fn gpu(&mut self, gfx: &Gfx, size: Size, x: i32, y: i32, w: i32, h: i32) -> Result<(Glass, ID2D1Bitmap1, ID2D1Effect)> {
+    /// Corner radius (logical px) of a card of `size` with the current look (`radius_k`).
+    pub fn radius_of(&self, size: Size) -> f32 {
+        size.radius() * self.params.radius_k
+    }
+
+    /// A fresh glass effect graph for a card rectangle, with the scene's current parameters.
+    fn new_glass(&mut self, gfx: &Gfx, size: Size, x: i32, y: i32, w: i32, h: i32) -> Result<Glass> {
         let (s, m, g) = (self.s, self.m, self.g);
-        let radius = size.radius();
+        let radius = self.radius_of(size);
         let key = (w, h, radius.to_bits());
         if !self.maps.contains_key(&key) {
             self.maps.insert(key, Glass::make_map(gfx, w, h, s, radius, &self.params)?);
         }
-        let glass = Glass::new(gfx, &self.backdrop, x, y, w, h, s, m, g, radius, &self.maps[&key], &self.params)?;
+        Glass::new(gfx, &self.backdrop, x, y, w, h, s, m, g, radius, &self.maps[&key], &self.params)
+    }
+
+    fn gpu(&mut self, gfx: &Gfx, size: Size, x: i32, y: i32, w: i32, h: i32) -> Result<(Glass, ID2D1Bitmap1, ID2D1Effect)> {
+        let (s, m) = (self.s, self.m);
+        let glass = self.new_glass(gfx, size, x, y, w, h)?;
         let layer = gfx.target((w + 2 * m) as u32, (h + 2 * m) as u32)?;
         let tshadow = unsafe { gfx.dc.CreateEffect(&CLSID_D2D1Shadow)? };
         fx_f32(&tshadow, 0, 4.0 * s)?;
@@ -604,6 +618,29 @@ impl Scene {
         Ok(())
     }
 
+    /// A new glass look (the settings sliders): every card gets a fresh effect graph for `p`; layers, widget instances and their state stay.
+    /// The glass panels keep the base look. The caller re-renders the layers.
+    pub fn set_params(&mut self, gfx: &Gfx, p: &GlassParams) -> Result<()> {
+        if *p == self.params {
+            return Ok(());
+        }
+        // the displacement maps depend on the corner radius and the refraction profile only
+        if (p.radius_k, p.refr_edge, p.refr_pow) != (self.params.radius_k, self.params.refr_edge, self.params.refr_pow) {
+            self.maps.clear();
+        }
+        self.params = *p;
+        for i in 0..self.cards.len() {
+            let (size, x, y, w, h) = (self.cards[i].size, self.cards[i].x, self.cards[i].y, self.cards[i].w, self.cards[i].h);
+            self.cards[i].glass = self.new_glass(gfx, size, x, y, w, h)?;
+            self.cards[i].scratch_ok = false;
+        }
+        self.update_merge();
+        Ok(())
+    }
+    pub fn params(&self) -> &GlassParams {
+        &self.params
+    }
+
     /// New canvas / scale / backdrop (monitor or DPI change, live <-> plain glass): every GPU object is rebuilt, the widget instances
     /// (state, settings, jobs) stay. `rects` = the new (x, y, w, h) of every card, in card order.
     pub fn reconfigure(&mut self, gfx: &Gfx, w: i32, h: i32, s: f32, backdrop: &ID2D1Bitmap1, rects: &[(i32, i32, i32, i32)]) -> Result<()> {
@@ -663,8 +700,8 @@ impl Scene {
             }
         }
         let (s, m) = (self.s, self.m);
-        let map = Glass::make_map(gfx, p.w, p.h, s, p.radius, &self.params)?;
-        let glass = Glass::styled(gfx, &self.backdrop, p.x, p.y, p.w, p.h, s, m, p.g, p.radius, &map, style, &self.params)?;
+        let map = Glass::make_map(gfx, p.w, p.h, s, p.radius, &self.panel_params)?;
+        let glass = Glass::styled(gfx, &self.backdrop, p.x, p.y, p.w, p.h, s, m, p.g, p.radius, &map, style, &self.panel_params)?;
         let layer = gfx.target((p.w + 2 * m) as u32, (p.h + 2 * m) as u32)?;
         self.panels[slot] = Some(GlassPanel { x: p.x, y: p.y, w: p.w, h: p.h, radius: p.radius, glass, layer, lum: 0.3 });
         Ok(())
@@ -1175,7 +1212,7 @@ impl Scene {
             if self.cards[i].scratch_ok && !animated {
                 continue;
             }
-            let shadow = if self.cards[i].xf.lift > 0.0 { Some(self.lift_shadow(gfx, self.cards[i].w, self.cards[i].h, self.cards[i].size.radius())?) } else { None };
+            let shadow = if self.cards[i].xf.lift > 0.0 { Some(self.lift_shadow(gfx, self.cards[i].w, self.cards[i].h, self.radius_of(self.cards[i].size))?) } else { None };
             let sh = &self.sh;
             let c = &mut self.cards[i];
             let Some(scratch) = c.scratch.clone() else { continue };
@@ -1508,6 +1545,46 @@ mod tests {
             guard += 1;
         }
         assert!(guard > 5 && guard < 25 && sc.look(0) == 0.0, "cross-fade took {guard} steps");
+    }
+
+    /// The settings sliders: `set_params` swaps every card's effect graph at run time; the widget instances stay, the pixels change
+    /// (a rounder corner is transparent where the square one was opaque), the corner radius follows `radius_k`, and it is cheap enough for 10 Hz.
+    #[test]
+    fn set_params_changes_the_look_live() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        let gfx = Gfx::new(None).unwrap();
+        let bd = PlainBackdrop::new(&gfx, 800, 400).unwrap();
+        let env = SceneEnv { preview: true, hwnd: 0, lang: Lang::Ru, utc_off: 0 };
+        let specs: Vec<CardSpec> = (0..4).map(|k| CardSpec { id: format!("clock-{k}"), type_id: "clock".into(), size: Size::S, cfg: json!({}), x: 20 + 190 * k, y: 60, w: 170, h: 170 }).collect();
+        let mut sc = Scene::new(&gfx, 800, 400, 1.0, 0.5, bd.bitmap(), &specs, &env).unwrap();
+        let now = Now::sample();
+        let full = RECT { left: 0, top: 0, right: 800, bottom: 400 };
+        let render = |sc: &mut Scene| {
+            for i in 0..sc.len() {
+                sc.render_card(&gfx, i, &now).unwrap();
+            }
+            sc.composite(&gfx, full, None, &now).unwrap();
+        };
+        render(&mut sc);
+        let uids: Vec<usize> = sc.cards.iter().map(|c| c.uid).collect();
+        assert!(alpha_at(&mut sc, &gfx, 20 + 3, 60 + 3) < 40, "default corner is rounded");
+        let mut p = *sc.params();
+        p.radius_k = 0.15;
+        p.blur = 9.0;
+        let t = std::time::Instant::now();
+        sc.set_params(&gfx, &p).unwrap();
+        render(&mut sc);
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("set_params + render of 4 cards: {ms:.1} ms");
+        assert!(ms < 400.0, "{ms} ms");
+        assert!(alpha_at(&mut sc, &gfx, 20 + 3, 60 + 3) > 150, "the square corner is opaque");
+        assert_eq!(sc.params().blur, 9.0);
+        assert_eq!(sc.cards.iter().map(|c| c.uid).collect::<Vec<_>>(), uids);
+        assert!((sc.radius_of(Size::S) - 28.0 * 0.15).abs() < 1e-4);
+        // the same params again are a no-op
+        sc.set_params(&gfx, &p).unwrap();
     }
 
     /// Run-time edits of a scene on the GPU: add / move / lift + rotate (scratch path) / resize / glass slider / panel / reconfigure / remove.

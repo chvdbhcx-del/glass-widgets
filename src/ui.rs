@@ -4,8 +4,10 @@
 //! The gallery previews are tiny one-card `Scene`s in preview mode (the same draw / overlay code as the desk) cached per (widget, size).
 use crate::cards::*;
 use crate::gfx::*;
-use crate::glass::GlassStyle;
+use crate::glass::{self, GlassParams, GlassStyle, LOOK};
 use crate::grid;
+use crate::layout::Dim;
+use crate::motion::AppearancePref;
 use crate::registry::{self, WidgetDef};
 use crate::widget::*;
 use std::collections::HashMap;
@@ -21,9 +23,18 @@ const PANEL_H: f32 = 430.0;
 const PANEL_R: f32 = 26.0;
 const SIDE_W: f32 = 200.0;
 const FOOT_H: f32 = 58.0;
-const TB_W: f32 = 440.0;
+const TB_W: f32 = 552.0;
 const TB_H: f32 = 40.0;
 const MINUS_R: f32 = 13.0;
+/// settings panel: width, height of the title + column header block above the first row, row pitch, footer height
+const SET_W: f32 = 760.0;
+const SET_TOP: f32 = 74.0;
+const SET_ROW: f32 = 31.0;
+const SET_FOOT: f32 = 56.0;
+/// rows of the right column (segmented controls, the autostart switch)
+const OPT_ROW: f32 = 38.0;
+/// dim over the desktop while the settings panel is up (lighter than the edit mode's: the look is being judged)
+pub const SETTINGS_DIM: f32 = 0.12;
 pub const SLOT_GALLERY: usize = 0;
 pub const SLOT_TOOLBAR: usize = 1;
 
@@ -111,6 +122,35 @@ impl TextInput {
 
 // ---------------------------------------------------------------- model
 
+/// The segmented controls of the settings panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Opt {
+    /// dark / light / auto glass (`widgetsAppearance`)
+    Appearance,
+    /// auto / never / always (`widgetsDim`)
+    Dim,
+    /// live / plain (`widgetsGlassMode`)
+    Source,
+}
+impl Opt {
+    pub const ALL: [Opt; 3] = [Opt::Appearance, Opt::Dim, Opt::Source];
+    pub fn count(self) -> usize {
+        if self == Opt::Source {
+            2
+        } else {
+            3
+        }
+    }
+    /// Option `k` as the appearance preference (Dark, Light, Auto).
+    pub fn appearance(k: usize) -> AppearancePref {
+        [AppearancePref::Dark, AppearancePref::Light, AppearancePref::Auto][k.min(2)]
+    }
+    /// Option `k` as the dimming mode (Auto, Never, Always).
+    pub fn dim(k: usize) -> Dim {
+        [Dim::Auto, Dim::Never, Dim::Always][k.min(2)]
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Hit {
     None,
@@ -126,7 +166,17 @@ pub enum Hit {
     /// settings strip: glass slider (value 0..1), backdrop mode (true = live), the rest of the strip
     Slider(f32),
     Seg(bool),
+    /// the "Settings" button of the strip
+    SettingsBtn,
     Toolbar,
+    /// settings panel: look slider i (0 = Glass, i >= 1 = `LOOK[i - 1]`) with the value 0..1 at the pointer, option k of a
+    /// segmented control, the autostart switch, "Reset look", "Edit widgets", "Quit"
+    Look(usize, f32),
+    Opt(Opt, usize),
+    Autostart,
+    ResetLook,
+    EditBtn,
+    QuitBtn,
     /// the "−" of card index i
     Minus(usize),
     Card(usize),
@@ -165,6 +215,8 @@ pub struct Ui {
     pub mh: f32,
     pub edit: bool,
     pub gallery: bool,
+    /// the settings panel is open (edit mode machinery without the gallery: no jiggle, no "−", the desk is not interactive)
+    pub settings: bool,
     /// open / close progress 0..1 of the gallery + settings strip (eased by the host)
     pub anim: f32,
     /// 0..1: the gallery fades while a card is dragged out of it
@@ -181,6 +233,12 @@ pub struct Ui {
     /// values shown by the settings strip
     pub glass: f32,
     pub live: bool,
+    /// settings panel: the look being edited, the base look it resets to, the behaviour options, the "Start with Windows" state
+    pub look: GlassParams,
+    pub base: GlassParams,
+    pub appearance: AppearancePref,
+    pub dim_mode: Dim,
+    pub autostart: bool,
     groups: Vec<Group>,
     pv: HashMap<(&'static str, Size), Pv>,
     pv_bd: HashMap<(i32, i32), ID2D1Bitmap1>,
@@ -269,6 +327,45 @@ pub struct TbLay {
     pub label_bg: Rect,
     pub seg_live: Rect,
     pub seg_plain: Rect,
+    pub sep2: Rect,
+    pub btn_settings: Rect,
+}
+
+/// One look slider row of the settings panel.
+#[derive(Clone, Copy, Debug)]
+pub struct SliderRow {
+    pub row: Rect,
+    pub label: Rect,
+    pub track: Rect,
+    pub value: Rect,
+}
+
+/// A segmented control row of the settings panel.
+#[derive(Clone, Copy, Debug)]
+pub struct OptRow {
+    pub which: Opt,
+    pub label: Rect,
+    pub seg: Rect,
+}
+
+/// Layout of the settings panel (logical px, absolute screen coordinates).
+pub struct SetLay {
+    pub panel: Rect,
+    pub title: Rect,
+    pub look_hdr: Rect,
+    pub beh_hdr: Rect,
+    pub reset: Rect,
+    pub sep: Rect,
+    pub rows: Vec<SliderRow>,
+    pub opts: Vec<OptRow>,
+    pub auto_row: Rect,
+    pub auto_sw: Rect,
+    pub edit_btn: Rect,
+    pub quit_btn: Rect,
+    pub keys: Rect,
+    pub done: Rect,
+    pub hint: Rect,
+    pub foot: Rect,
 }
 
 impl Ui {
@@ -287,6 +384,7 @@ impl Ui {
             mh,
             edit: false,
             gallery: false,
+            settings: false,
             anim: 0.0,
             away: 0.0,
             dim: 0.0,
@@ -298,6 +396,11 @@ impl Ui {
             caret_on: true,
             glass: 0.5,
             live: true,
+            look: glass::global_params(),
+            base: glass::global_params(),
+            appearance: AppearancePref::default(),
+            dim_mode: Dim::Auto,
+            autostart: false,
             groups,
             pv: HashMap::new(),
             pv_bd: HashMap::new(),
@@ -370,6 +473,9 @@ impl Ui {
     }
     /// Wheel over the gallery (notches, + = up). Returns true when something scrolled.
     pub fn wheel(&mut self, lx: f32, ly: f32, delta: f32) -> bool {
+        if self.settings {
+            return false;
+        }
         let lay = self.lay();
         let step = -delta * 54.0;
         if lay.grid.contains(lx, ly) {
@@ -391,16 +497,32 @@ impl Ui {
 
     // ------------------------------------------------ geometry (logical px)
 
+    /// The open glass panel: the settings panel while it is up, else the gallery.
     pub fn panel_rect(&self) -> Rect {
+        if self.settings {
+            self.settings_rect()
+        } else {
+            self.gallery_rect()
+        }
+    }
+
+    pub fn gallery_rect(&self) -> Rect {
         let w = PANEL_W.min(self.mw * 0.88);
         let h = PANEL_H.min(self.mh * 0.72);
         Rect::new((self.mw * 0.06).min(self.mw - w - 8.0).max(0.0), self.mh - self.mh * 0.06 - h, w, h)
     }
 
+    /// The settings panel sits at the right edge, vertically centred: the cards (top left of the desk) stay visible to judge the look.
+    pub fn settings_rect(&self) -> Rect {
+        let w = SET_W.min(self.mw - 16.0);
+        let h = (SET_TOP + (1 + LOOK.len()) as f32 * SET_ROW + 14.0 + SET_FOOT).min(self.mh - 24.0);
+        Rect::new((self.mw - w - (self.mw * 0.04).max(8.0)).max(8.0), ((self.mh - h) / 2.0).max(8.0), w, h)
+    }
+
     /// The settings strip sits at the bottom, right of the gallery and level with its lower edge: clear of the card grid and of the top bar.
     pub fn toolbar_rect(&self) -> Rect {
         let w = TB_W.min(self.mw - 16.0);
-        let p = self.panel_rect();
+        let p = self.gallery_rect();
         if p.right() + 24.0 + w + 16.0 <= self.mw {
             Rect::new(p.right() + 24.0, p.bottom() - TB_H, w, TB_H)
         } else {
@@ -426,11 +548,151 @@ impl Ui {
             label_bg: Rect::new(bar.x + 248.0, cy - 10.0, 32.0, 20.0),
             seg_live: Rect::new(bar.x + 286.0, cy - 12.0, 68.0, 24.0),
             seg_plain: Rect::new(bar.x + 354.0, cy - 12.0, 68.0, 24.0),
+            sep2: Rect::new(bar.x + 442.0, cy - 9.0, 1.0, 18.0),
+            btn_settings: Rect::new(bar.x + 458.0, cy - 12.0, 78.0, 24.0),
+        }
+    }
+
+    // ------------------------------------------------ settings panel geometry and values
+
+    pub fn set_lay(&self) -> SetLay {
+        let p = self.settings_rect();
+        let n = 1 + LOOK.len();
+        let top = p.y + SET_TOP;
+        let rh = ((p.bottom() - SET_FOOT - 12.0 - top) / n as f32).clamp(22.0, SET_ROW);
+        let lx = p.x + 22.0;
+        let lw = (p.w * 0.5).round();
+        let rx = p.x + lw + 60.0;
+        let rw = p.right() - 22.0 - rx;
+        let rows = (0..n)
+            .map(|i| {
+                let row = Rect::new(lx, top + i as f32 * rh, lw, rh);
+                SliderRow { row, label: Rect::new(lx, row.y, 116.0, rh), track: Rect::new(lx + 124.0, row.cy() - 2.0, lw - 124.0 - 56.0 - 12.0, 4.0), value: Rect::new(row.right() - 54.0, row.y, 54.0, rh) }
+            })
+            .collect();
+        let opts = Opt::ALL
+            .iter()
+            .enumerate()
+            .map(|(k, o)| {
+                let y = top + k as f32 * OPT_ROW;
+                OptRow { which: *o, label: Rect::new(rx, y, 112.0, 28.0), seg: Rect::new(rx + 112.0, y + 2.0, rw - 112.0, 24.0) }
+            })
+            .collect();
+        let ay = top + 3.0 * OPT_ROW;
+        let by = top + 4.0 * OPT_ROW + 10.0;
+        let bw = ((rw - 8.0) * 0.6).round();
+        SetLay {
+            panel: p,
+            title: Rect::new(p.x + 22.0, p.y + 14.0, 300.0, 28.0),
+            look_hdr: Rect::new(lx, p.y + 48.0, 200.0, 20.0),
+            beh_hdr: Rect::new(rx, p.y + 48.0, 200.0, 20.0),
+            reset: Rect::new(lx + lw - 92.0, p.y + 46.0, 92.0, 24.0),
+            sep: Rect::new(p.x + lw + 30.0, p.y + 50.0, 0.8, p.h - SET_FOOT - 58.0),
+            rows,
+            opts,
+            auto_row: Rect::new(rx, ay, rw, 28.0),
+            auto_sw: Rect::new(rx + rw - 44.0, ay + 2.0, 44.0, 24.0),
+            edit_btn: Rect::new(rx, by, bw, 30.0),
+            quit_btn: Rect::new(rx + bw + 8.0, by, rw - bw - 8.0, 30.0),
+            keys: Rect::new(rx, by + 44.0, rw, (p.bottom() - SET_FOOT - 10.0 - (by + 44.0)).max(0.0)),
+            done: Rect::new(p.right() - 16.0 - 82.0, p.bottom() - SET_FOOT + 13.0, 82.0, 30.0),
+            hint: Rect::new(p.x + 22.0, p.bottom() - SET_FOOT, p.w - 140.0, SET_FOOT),
+            foot: Rect::new(p.x + 14.0, p.bottom() - SET_FOOT, p.w - 28.0, 0.8),
+        }
+    }
+
+    /// What the settings panel has at (lx, ly) (logical px); `Panel` for the empty parts.
+    pub fn set_hit(&self, lx: f32, ly: f32) -> Hit {
+        let l = self.set_lay();
+        if !l.panel.contains(lx, ly) {
+            return Hit::None;
+        }
+        if l.done.contains(lx, ly) {
+            return Hit::Done;
+        }
+        if l.reset.contains(lx, ly) {
+            return Hit::ResetLook;
+        }
+        if let Some(i) = l.rows.iter().position(|r| r.track.inset_xy(-12.0, -(r.row.h / 2.0 - 2.0)).contains(lx, ly)) {
+            return Hit::Look(i, ((lx - l.rows[i].track.x) / l.rows[i].track.w).clamp(0.0, 1.0));
+        }
+        for o in &l.opts {
+            if o.seg.contains(lx, ly) {
+                let k = (((lx - o.seg.x) / o.seg.w) * o.which.count() as f32) as usize;
+                return Hit::Opt(o.which, k.min(o.which.count() - 1));
+            }
+        }
+        if l.auto_row.contains(lx, ly) {
+            return Hit::Autostart;
+        }
+        if l.edit_btn.contains(lx, ly) {
+            return Hit::EditBtn;
+        }
+        if l.quit_btn.contains(lx, ly) {
+            return Hit::QuitBtn;
+        }
+        Hit::Panel
+    }
+
+    /// Slider `i` of the settings panel at canvas px `x`, as 0..1.
+    pub fn set_value_at(&self, i: usize, x: i32) -> f32 {
+        let t = self.set_lay().rows[i].track;
+        ((x as f32 / self.s - t.x) / t.w).clamp(0.0, 1.0)
+    }
+
+    /// Position 0..1 of slider `i` (0 = Glass) for the values the panel currently shows.
+    pub fn set_pos(&self, i: usize) -> f32 {
+        match i {
+            0 => self.glass.clamp(0.0, 1.0),
+            _ => LOOK[i - 1].pos(&self.look),
+        }
+    }
+
+    /// Where slider `i` sits at the base look (the small tick under the track).
+    pub fn set_default_pos(&self, i: usize) -> f32 {
+        match i {
+            0 => 0.5,
+            _ => LOOK[i - 1].pos(&self.base),
+        }
+    }
+
+    /// The value text of slider `i`: Glass in %, Blur in px, Corners as the radius in px, the rest relative to the base look in %.
+    pub fn set_value_text(&self, i: usize) -> String {
+        match i {
+            0 => format!("{:.0}%", self.glass * 100.0),
+            _ => {
+                let d = &LOOK[i - 1];
+                match d.primary {
+                    "blur" => format!("{:.1} px", self.look.blur),
+                    "radius_k" => format!("{:.0} px", Size::S.radius() * self.look.radius_k),
+                    "card_k" => format!("{:.0}%", self.look.card_k * 100.0),
+                    _ => format!("{:.0}%", d.ratio(&self.look, &self.base) * 100.0),
+                }
+            }
+        }
+    }
+
+    /// The k-th control of the settings panel in reading order (headless `--hover k`): the sliders, "Reset look", one option of each
+    /// segmented control, the switch, "Edit widgets", "Quit", "Done".
+    pub fn nth_control(&self, k: usize) -> Hit {
+        let n = 1 + LOOK.len();
+        if k < n {
+            return Hit::Look(k, self.set_pos(k));
+        }
+        [Hit::ResetLook, Hit::Opt(Opt::Appearance, 1), Hit::Opt(Opt::Dim, 0), Hit::Opt(Opt::Source, 1), Hit::Autostart, Hit::EditBtn, Hit::QuitBtn, Hit::Done].get(k - n).copied().unwrap_or(Hit::None)
+    }
+
+    /// The selected option of a segmented control.
+    pub fn opt_sel(&self, o: Opt) -> usize {
+        match o {
+            Opt::Appearance => [AppearancePref::Dark, AppearancePref::Light, AppearancePref::Auto].iter().position(|a| *a == self.appearance).unwrap_or(0),
+            Opt::Dim => [Dim::Auto, Dim::Never, Dim::Always].iter().position(|d| *d == self.dim_mode).unwrap_or(0),
+            Opt::Source => usize::from(!self.live),
         }
     }
 
     pub fn lay(&self) -> Lay {
-        let p = self.panel_rect();
+        let p = self.gallery_rect();
         let search = Rect::new(p.x + 12.0, p.y + 12.0, SIDE_W - 22.0, 30.0);
         let list = Rect::new(p.x + 6.0, p.y + 50.0, SIDE_W - 10.0, (p.h - FOOT_H - 54.0).max(0.0));
         let rows: Vec<Rect> = (0..self.groups.len()).map(|i| Rect::new(list.x + 4.0, list.y + 2.0 + i as f32 * 34.0 - self.st.side_scroll, list.w - 8.0, 32.0)).collect();
@@ -505,9 +767,16 @@ impl Ui {
     /// What is under the canvas-px point (x, y).
     pub fn hit(&self, scene: &Scene, x: i32, y: i32) -> Hit {
         let (lx, ly) = (x as f32 / self.s, y as f32 / self.s);
+        if self.edit && self.settings {
+            // the desk is not interactive while the panel is up; a click outside closes it
+            return self.set_hit(lx, ly);
+        }
         if self.edit {
             let tb = self.tb_lay();
             if tb.bar.contains(lx, ly) {
+                if tb.btn_settings.contains(lx, ly) {
+                    return Hit::SettingsBtn;
+                }
                 if tb.track.inset_xy(-10.0, -14.0).contains(lx, ly) {
                     return Hit::Slider(((lx - tb.track.x) / tb.track.w).clamp(0.0, 1.0));
                 }
@@ -720,8 +989,8 @@ impl Ui {
             let (x, y, w, h) = px(r);
             PanelSpec { x, y, w, h, radius, g: 0.9 }
         };
-        let g = if self.edit && self.gallery { Some(spec(self.panel_rect(), PANEL_R)) } else { None };
-        let t = if self.edit { Some(spec(self.toolbar_rect(), TB_H / 2.0)) } else { None };
+        let g = if self.edit && (self.gallery || self.settings) { Some(spec(self.panel_rect(), PANEL_R)) } else { None };
+        let t = if self.edit && !self.settings { Some(spec(self.toolbar_rect(), TB_H / 2.0)) } else { None };
         for (slot, sp) in [(SLOT_GALLERY, g), (SLOT_TOOLBAR, t)] {
             if let Err(e) = scene.set_panel(gfx, slot, sp, GlassStyle::frosted()) {
                 eprintln!("mswidgets: panel {slot}: {e}");
@@ -742,7 +1011,7 @@ impl Ui {
         let s = self.s;
         let m = scene.margin() + (30.0 * s) as i32;
         let r = |r: Rect| RECT { left: (r.x * s) as i32 - m, top: (r.y * s) as i32 - m, right: (r.right() * s).ceil() as i32 + m, bottom: (r.bottom() * s).ceil() as i32 + m };
-        let mut d = r(self.toolbar_rect());
+        let mut d = r(if self.settings { self.panel_rect() } else { self.toolbar_rect() });
         if self.gallery {
             d = union(d, r(self.panel_rect()));
         }
@@ -781,7 +1050,11 @@ impl Ui {
             let (l, t, rr, b) = ((r.x * s - pad) as i32, (r.y * s - pad) as i32, (r.right() * s + pad) as i32, (r.bottom() * s + pad) as i32);
             l < clip_px.right && clip_px.left < rr && t < clip_px.bottom && clip_px.top < b
         };
-        if self.edit {
+        if self.edit && self.settings {
+            if hits(self.panel_rect(), 40.0 * s) {
+                self.draw_settings(scene, gfx, now);
+            }
+        } else if self.edit {
             scene.with_ui_cx(gfx, base, self.lang, now, |cx| {
                 for i in 0..scene.cards.len() {
                     let c = &scene.cards[i];
@@ -823,11 +1096,14 @@ impl Ui {
         cx.line((c.0 - 5.2, c.1), (c.0 + 5.2, c.1), 2.2, WHITE.fade(alpha));
     }
 
-    fn seg(&self, cx: &Cx, r: Rect, labels: &[(&str, bool)], pad: f32) {
+    fn seg(&self, cx: &Cx, r: Rect, labels: &[(&str, bool)], pad: f32, hot: Option<usize>) {
         cx.pill(r, FILL);
         for (i, (txt, on)) in labels.iter().enumerate() {
             let n = labels.len() as f32;
             let c = Rect::new(r.x + pad + (r.w - 2.0 * pad) / n * i as f32, r.y + pad, (r.w - 2.0 * pad) / n, r.h - 2.0 * pad);
+            if hot == Some(i) && !*on {
+                cx.pill(c, Color::rgba(1.0, 1.0, 1.0, 0.13));
+            }
             if *on {
                 cx.pill(c.offset(0.0, 1.0), Color::rgba(0.0, 0.0, 0.0, 0.18));
                 cx.pill(c, Color::rgba(1.0, 1.0, 1.0, 0.92));
@@ -878,7 +1154,111 @@ impl Ui {
             cx.rect(tb.sep, FILL);
             cx.text(tb.label_bg, self.t("Фон", "Back"), Style::new(12.5, 500), TEXT);
             let seg = Rect::new(tb.seg_live.x, tb.seg_live.y, tb.seg_live.w + tb.seg_plain.w, tb.seg_live.h);
-            self.seg(cx, seg, &[(self.t("Живое", "Live"), self.live), (self.t("Простой", "Plain"), !self.live)], 2.0);
+            self.seg(cx, seg, &[(self.t("Живое", "Live"), self.live), (self.t("Простой", "Plain"), !self.live)], 2.0, if let Hit::Seg(l) = self.hover { Some(usize::from(!l)) } else { None });
+            cx.rect(tb.sep2, FILL);
+            let hot = self.hover == Hit::SettingsBtn || self.press == Hit::SettingsBtn;
+            cx.pill(tb.btn_settings, if hot { Color::rgba(1.0, 1.0, 1.0, 0.30) } else { FILL });
+            cx.text(tb.btn_settings, self.t("Настройки", "Settings"), Style::new(11.5, 600).center(), TEXT);
+        });
+        if layer {
+            unsafe { gfx.dc.PopLayer() };
+        }
+    }
+
+    /// The glass slider of the strip, restyled for the settings rows: track, fill, base-look tick and a knob that grows under the pointer.
+    fn set_slider(&self, cx: &Cx, r: &SliderRow, v: f32, def: f32, hot: bool, down: bool) {
+        let t = r.track;
+        cx.pill(t, FILL);
+        cx.pill(Rect::new(t.x, t.y, (t.w * v).max(4.0), t.h), Color::rgba(1.0, 1.0, 1.0, if hot || down { 0.70 } else { 0.55 }));
+        let dx = t.x + t.w * def;
+        cx.line((dx, t.cy() + 5.0), (dx, t.cy() + 8.0), 1.2, FAINT);
+        let kx = t.x + t.w * v;
+        let kr = if down { 9.0 } else if hot { 8.6 } else { 8.0 };
+        if down {
+            cx.circle_stroke((kx, t.cy()), kr + 3.0, 3.0, Color::rgba(1.0, 1.0, 1.0, 0.20));
+        }
+        cx.circle((kx, t.cy() + 1.5), kr + 1.0, Color::rgba(0.0, 0.0, 0.0, 0.25));
+        cx.circle((kx, t.cy()), kr, Color::rgba(1.0, 1.0, 1.0, 0.97));
+    }
+
+    fn set_button(&self, cx: &Cx, r: Rect, label: &str, hot: bool, down: bool, color: Color) {
+        let a = if down { 0.34 } else if hot { 0.27 } else { 0.18 };
+        cx.pill(r, Color::rgba(1.0, 1.0, 1.0, a));
+        cx.text(r, label, Style::new(12.5, 600).center().ellipsis(), color);
+    }
+
+    fn draw_settings(&self, scene: &Scene, gfx: &Gfx, now: &Now) {
+        let a = self.anim.clamp(0.0, 1.0);
+        let xf = self.open_xf();
+        let to_canvas = mul(&mat(self.s, 0.0, 0.0), &xf);
+        scene.draw_panel(gfx, SLOT_GALLERY, a, Some(xf));
+        let layer = self.push_alpha(gfx, a);
+        let l = self.set_lay();
+        let (hv, pr) = (self.hover, self.press);
+        let look_at = |h: Hit, i: usize| matches!(h, Hit::Look(j, _) if j == i);
+        scene.with_ui_cx(gfx, to_canvas, self.lang, now, |cx| {
+            cx.text(l.title, self.t("Настройки", "Settings"), Style::new(15.0, 600), TEXT);
+            cx.text(l.look_hdr, &self.t("Вид стекла", "Glass look").to_uppercase(), Style::LABEL.size(11.0), DIM);
+            cx.text(l.beh_hdr, &self.t("Поведение", "Behaviour").to_uppercase(), Style::LABEL.size(11.0), DIM);
+            cx.rect(l.sep, FILL);
+
+            // look sliders
+            let names = [("Стекло", "Glass"), ("Размытие", "Blur"), ("Преломление", "Refraction"), ("Цветная кайма", "Chromatic fringe"), ("Насыщенность", "Saturation"), ("Яркость", "Brightness"), ("Матовость", "Frosting"), ("Блики", "Highlights"), ("Свечение", "Glow"), ("Скругление", "Corner roundness"), ("Размер карточек", "Card size")];
+            for (i, r) in l.rows.iter().enumerate() {
+                let (hot, down) = (look_at(hv, i), look_at(pr, i));
+                let (ru, en) = names.get(i).copied().unwrap_or(("", ""));
+                cx.text(r.label, self.t(ru, en), Style::new(12.5, 500).ellipsis(), TEXT);
+                self.set_slider(cx, r, self.set_pos(i), self.set_default_pos(i), hot, down);
+                cx.text(r.value, &self.set_value_text(i), Style::new(11.5, 500).right().mono(), if hot || down { TEXT } else { DIM });
+            }
+            let hot = hv == Hit::ResetLook;
+            self.set_button(cx, l.reset, self.t("Сбросить вид", "Reset look"), hot, pr == Hit::ResetLook, TEXT);
+
+            // behaviour: segmented controls
+            let labels: [(Opt, (&str, &str), [(&str, &str); 3]); 3] = [
+                (Opt::Appearance, ("Оформление", "Appearance"), [("Тёмное", "Dark"), ("Светлое", "Light"), ("Авто", "Auto")]),
+                (Opt::Dim, ("Приглушение", "Dimming"), [("Авто", "Auto"), ("Никогда", "Never"), ("Всегда", "Always")]),
+                (Opt::Source, ("Источник стекла", "Glass source"), [("Живой", "Live"), ("Простой", "Plain"), ("", "")]),
+            ];
+            for o in &l.opts {
+                let Some((_, (ru, en), opts)) = labels.iter().find(|x| x.0 == o.which) else { continue };
+                cx.text(o.label, self.t(ru, en), Style::new(12.5, 500).ellipsis(), TEXT);
+                let sel = self.opt_sel(o.which);
+                let items: Vec<(&str, bool)> = opts.iter().take(o.which.count()).enumerate().map(|(k, (r, e))| (self.t(r, e), k == sel)).collect();
+                let hot = if let Hit::Opt(w, k) = hv { (w == o.which).then_some(k) } else { None };
+                self.seg(cx, o.seg, &items, 2.0, hot);
+            }
+
+            // start with Windows: label + switch
+            let hot = hv == Hit::Autostart || pr == Hit::Autostart;
+            cx.text(Rect::new(l.auto_row.x, l.auto_row.y, l.auto_row.w - 52.0, l.auto_row.h), self.t("Запускать с Windows", "Start with Windows"), Style::new(12.5, 500).ellipsis(), TEXT);
+            let sw = l.auto_sw.centered(40.0, 24.0);
+            let on = self.autostart;
+            cx.pill(sw, if on { Color::rgb8(52, 199, 89) } else if hot { Color::rgba(1.0, 1.0, 1.0, 0.26) } else { FILL });
+            let kx = if on { sw.right() - 12.0 } else { sw.x + 12.0 };
+            cx.circle((kx, sw.cy() + 1.2), 10.0, Color::rgba(0.0, 0.0, 0.0, 0.22));
+            cx.circle((kx, sw.cy()), 9.5, Color::rgba(1.0, 1.0, 1.0, 0.98));
+
+            // buttons
+            self.set_button(cx, l.edit_btn, self.t("Изменить виджеты", "Edit widgets"), hv == Hit::EditBtn, pr == Hit::EditBtn, TEXT);
+            self.set_button(cx, l.quit_btn, self.t("Выйти", "Quit"), hv == Hit::QuitBtn, pr == Hit::QuitBtn, Color::rgb8(255, 105, 97));
+
+            // shortcuts
+            let k = Style::new(11.0, 400);
+            let lines = [("Ctrl+Alt+G", ("Настройки", "Settings")), ("Ctrl+Alt+W", ("Изменить виджеты", "Edit widgets")), ("Ctrl+Alt+Q", ("Выйти", "Quit"))];
+            for (n, (keys, (ru, en))) in lines.iter().enumerate() {
+                let r = Rect::new(l.keys.x, l.keys.y + n as f32 * 20.0, l.keys.w, 20.0);
+                cx.text(Rect::new(r.x, r.y, 84.0, r.h), keys, k.mono(), FAINT);
+                cx.text(Rect::new(r.x + 90.0, r.y, r.w - 90.0, r.h), self.t(ru, en), k.ellipsis(), FAINT);
+            }
+
+            // footer
+            cx.rect(l.foot, FILL);
+            cx.text(l.hint, self.t("Esc или щелчок снаружи закрывает панель", "Esc or a click outside closes the panel"), Style::new(12.0, 500).ellipsis(), DIM);
+            let hot = hv == Hit::Done || pr == Hit::Done;
+            cx.pill(l.done.offset(0.0, 2.0).inset_xy(2.0, 0.0), BLUE.alpha(0.40));
+            cx.pill(l.done, if hot { Color::rgb8(43, 149, 255) } else { Color::rgb8(10, 132, 255) });
+            cx.text(l.done, self.t("Готово", "Done"), Style::new(13.0, 600).center(), WHITE);
         });
         if layer {
             unsafe { gfx.dc.PopLayer() };
@@ -957,7 +1337,7 @@ impl Ui {
                 let labels: Vec<(&str, bool)> = l.chips.iter().map(|(s, _)| (s.key(), *s == size)).collect();
                 let up: Vec<String> = labels.iter().map(|(k, _)| k.to_uppercase()).collect();
                 let lab: Vec<(&str, bool)> = up.iter().zip(labels.iter()).map(|(u, (_, on))| (u.as_str(), *on)).collect();
-                self.seg(cx, r, &lab, 2.0);
+                self.seg(cx, r, &lab, 2.0, None);
             }
 
             // previews
@@ -1147,6 +1527,90 @@ mod tests {
         assert_eq!(ui.hit(&scene, 24, 54), Hit::Card(0));
     }
 
+    /// The settings panel: every control sits inside the panel, rows do not overlap, hits map to the right control and value, the panel fits
+    /// small screens, a click outside is `Hit::None`.
+    #[test]
+    fn settings_panel_layout_and_hits() {
+        for (mw, mh) in [(1920.0, 1080.0), (1366.0, 768.0), (800.0, 500.0)] {
+            let mut ui = Ui::new(Lang::En, 1.0, mw, mh);
+            ui.edit = true;
+            ui.settings = true;
+            let l = ui.set_lay();
+            let p = l.panel;
+            assert!(p.x >= 0.0 && p.y >= 0.0 && p.right() <= mw && p.bottom() <= mh, "{mw}x{mh}: {p:?}");
+            assert_eq!(l.rows.len(), 1 + LOOK.len());
+            let inside = |r: Rect| r.x >= p.x && r.y >= p.y && r.right() <= p.right() + 0.01 && r.bottom() <= p.bottom() + 0.01;
+            for r in &l.rows {
+                assert!(inside(r.row) && inside(r.track) && inside(r.value) && inside(r.label));
+                assert!(r.label.right() <= r.track.x && r.track.right() <= r.value.x, "{r:?}");
+            }
+            for w in l.rows.windows(2) {
+                assert!(w[0].row.bottom() <= w[1].row.y + 0.01);
+            }
+            for o in &l.opts {
+                assert!(inside(o.seg) && inside(o.label) && o.label.right() <= o.seg.x + 0.01);
+            }
+            for r in [l.reset, l.auto_row, l.auto_sw, l.edit_btn, l.quit_btn, l.done] {
+                assert!(inside(r), "{r:?}");
+            }
+            assert!(l.edit_btn.right() <= l.quit_btn.x && l.rows.iter().all(|r| r.value.right() <= l.sep.x));
+            // sliders: the track ends map to 0 / 1, the middle to ~0.5; a click in the label column does not move a slider
+            let t = l.rows[3].track;
+            assert_eq!(ui.set_hit(t.x, t.cy()), Hit::Look(3, 0.0));
+            assert!(matches!(ui.set_hit(t.right() - 0.01, t.cy()), Hit::Look(3, v) if v > 0.999));
+            match ui.set_hit(t.cx(), l.rows[3].row.y + 2.0) {
+                Hit::Look(3, v) => assert!((v - 0.5).abs() < 0.01),
+                h => panic!("{h:?}"),
+            }
+            assert_eq!(ui.set_hit(l.rows[3].label.x + 4.0, l.rows[3].row.cy()), Hit::Panel);
+            assert!((ui.set_value_at(3, (t.x + t.w * 0.25) as i32) - 0.25).abs() < 0.01);
+            // segmented controls pick the option under the pointer
+            for o in &l.opts {
+                for k in 0..o.which.count() {
+                    let x = o.seg.x + o.seg.w * (k as f32 + 0.5) / o.which.count() as f32;
+                    assert_eq!(ui.set_hit(x, o.seg.cy()), Hit::Opt(o.which, k));
+                }
+            }
+            assert_eq!(ui.set_hit(l.auto_sw.cx(), l.auto_sw.cy()), Hit::Autostart);
+            assert_eq!(ui.set_hit(l.auto_row.x + 5.0, l.auto_row.cy()), Hit::Autostart);
+            assert_eq!(ui.set_hit(l.reset.cx(), l.reset.cy()), Hit::ResetLook);
+            assert_eq!(ui.set_hit(l.edit_btn.cx(), l.edit_btn.cy()), Hit::EditBtn);
+            assert_eq!(ui.set_hit(l.quit_btn.cx(), l.quit_btn.cy()), Hit::QuitBtn);
+            assert_eq!(ui.set_hit(l.done.cx(), l.done.cy()), Hit::Done);
+            assert_eq!(ui.set_hit(l.hint.x + 2.0, l.hint.y + 2.0), Hit::Panel);
+            assert_eq!(ui.set_hit(p.x - 1.0, p.cy()), Hit::None);
+            assert_eq!(ui.set_hit(1.0, 1.0), Hit::None);
+            // reading order for the headless --hover
+            assert!(matches!(ui.nth_control(0), Hit::Look(0, _)) && ui.nth_control(l.rows.len() + 7) == Hit::Done && ui.nth_control(99) == Hit::None);
+        }
+    }
+
+    /// The shown values follow the look: positions, texts, the selected options, the base tick.
+    #[test]
+    fn settings_values_follow_the_look() {
+        let mut ui = Ui::new(Lang::En, 1.0, 1600.0, 900.0);
+        let base = ui.base;
+        assert_eq!(ui.set_value_text(0), "50%");
+        assert_eq!(ui.set_value_text(2), "100%"); // refraction at the base look
+        assert_eq!(ui.set_value_text(1), format!("{:.1} px", base.blur));
+        assert_eq!(ui.set_value_text(LOOK.len()), "100%"); // card size
+        glass::LOOK[2].set_pos(&mut ui.look, &base, 1.0); // fringe, index 3 in the panel
+        assert_eq!(ui.set_value_text(3), "300%");
+        assert!((ui.set_pos(3) - 1.0).abs() < 1e-6 && ui.set_default_pos(3) < 0.5);
+        ui.glass = 0.25;
+        assert_eq!((ui.set_pos(0), ui.set_default_pos(0)), (0.25, 0.5));
+        ui.appearance = AppearancePref::Light;
+        ui.dim_mode = Dim::Always;
+        ui.live = false;
+        assert_eq!((ui.opt_sel(Opt::Appearance), ui.opt_sel(Opt::Dim), ui.opt_sel(Opt::Source)), (1, 2, 1));
+        assert_eq!((Opt::appearance(2), Opt::dim(1), Opt::count(Opt::Source)), (AppearancePref::Auto, Dim::Never, 2));
+        // panel geometry: the settings panel replaces the gallery rect only while it is up
+        assert_eq!(ui.panel_rect(), ui.gallery_rect());
+        ui.settings = true;
+        assert_eq!(ui.panel_rect(), ui.settings_rect());
+        assert!(!ui.wheel(500.0, 400.0, 1.0));
+    }
+
     #[test]
     fn gallery_layout_and_hits() {
         let mut ui = Ui::new(Lang::Ru, 1.0, 1920.0, 1080.0);
@@ -1191,6 +1655,8 @@ pub struct DumpArgs {
     /// `--dim`: draw the cards as "Dim widgets on desktop" does
     pub dim: bool,
     pub appearance: Option<crate::motion::AppearancePref>,
+    /// `--look '{"blur":9,...}'`: a `widgetsLook` object for the render (default: the user's config.json; a sample for `--state settings`)
+    pub look: Option<String>,
 }
 
 /// `--dump-ui`: compose the host UI of a state (live | edit | gallery | menu) headless into a PNG with the SAME scene / UI code as the live host:
@@ -1215,17 +1681,29 @@ pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
         None => crate::layout::load(!a.no_config),
     };
     let (lw, lh) = (w as f32 / s, h as f32 / s);
-    let dims = grid::dims(lw, lh);
+    // the look: glass.json / defaults, then `widgetsLook` (--look, else the user's config; a sample look for the settings panel)
+    let base = glass::global_params();
+    let look_json: Value = match &a.look {
+        Some(t) => serde_json::from_str(t).map_err(|e| format!("--look: {e}"))?,
+        None if a.state == "settings" => json!({"blur": 7.5, "sat": 1.45, "chroma_r": 0.09, "chroma_b": 0.135, "spec": 0.95, "sheen": 0.29, "sheen_mid": 0.066, "radius_k": 0.8}),
+        None if a.no_config => json!({}),
+        None => crate::layout::read_look(),
+    };
+    let look = glass::apply_look(&base, &look_json);
+    // the cards follow the look's card scale, the host UI keeps the plain scale
+    let cs = s * look.card_k;
+    let dims = grid::dims(w as f32 / cs, h as f32 / cs);
     let placed = grid::resolve_all(&dims, &items.iter().map(|i| (i.size, i.col as i32, i.row as i32)).collect::<Vec<_>>());
     let mut specs = Vec::new();
     for (it, p) in items.iter().zip(placed) {
         if let Some(p) = p {
-            let (x, y, cw, ch) = cell_rect(it.size, p.col, p.row, s);
+            let (x, y, cw, ch) = cell_rect(it.size, p.col, p.row, cs);
             specs.push(CardSpec { id: it.id.clone(), type_id: it.type_id.clone(), size: it.size, cfg: it.cfg.clone(), x, y, w: cw, h: ch });
         }
     }
     let env = SceneEnv { preview: true, hwnd: 0, lang: crate::layout::lang(), utc_off: crate::sys::local_utc_offset_min() };
-    let mut scene = Scene::new(&gfx, w as i32, h as i32, s, settings.glass, backdrop.bitmap(), &specs, &env).map_err(e("scene"))?;
+    let mut scene = Scene::new(&gfx, w as i32, h as i32, cs, settings.glass, backdrop.bitmap(), &specs, &env).map_err(e("scene"))?;
+    scene.set_params(&gfx, &look).map_err(e("look"))?;
     let now = a.time.unwrap_or_else(Now::sample);
     scene.set_appearance_pref(a.appearance.unwrap_or(settings.appearance));
     for i in 0..scene.len() {
@@ -1240,11 +1718,17 @@ pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
     let mut ui = Ui::new(env.lang, s, lw, lh);
     ui.glass = settings.glass;
     ui.live = settings.live;
-    let edit = matches!(a.state.as_str(), "edit" | "gallery");
+    let edit = matches!(a.state.as_str(), "edit" | "gallery" | "settings");
     ui.edit = edit;
     ui.gallery = a.state == "gallery";
+    ui.settings = a.state == "settings";
+    ui.look = look;
+    ui.base = base;
+    ui.appearance = a.appearance.unwrap_or(settings.appearance);
+    ui.dim_mode = settings.dim;
+    ui.autostart = true; // sample state: the registry is never read by a headless render
     ui.anim = 1.0;
-    ui.dim = if edit { 0.28 } else { 0.0 };
+    ui.dim = if ui.settings { SETTINGS_DIM } else if edit { 0.28 } else { 0.0 };
     ui.st.focus = a.search.is_some();
     if let Some(q) = &a.search {
         ui.st.query.insert_str(q);
@@ -1257,8 +1741,11 @@ pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
     if let Some(sz) = a.size {
         ui.select_size(sz);
     }
-    ui.hover = a.hover.map_or(Hit::None, Hit::Item);
-    if edit {
+    ui.hover = a.hover.map_or(Hit::None, |k| if ui.settings { ui.nth_control(k % 100) } else { Hit::Item(k) });
+    if ui.settings && a.hover.is_some_and(|k| k >= 100) {
+        ui.press = ui.hover; // --hover 100+k: control k pressed
+    }
+    if edit && !ui.settings {
         for i in 0..scene.len() {
             scene.set_xf(i, Xf { rot: jiggle(i, 0.13), ..Xf::ID });
         }

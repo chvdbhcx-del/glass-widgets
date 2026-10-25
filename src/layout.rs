@@ -200,6 +200,26 @@ pub enum Dim {
     Never,
 }
 
+impl Dim {
+    /// The `widgetsDim` value.
+    pub fn key(self) -> &'static str {
+        match self {
+            Dim::Auto => "auto",
+            Dim::Always => "always",
+            Dim::Never => "never",
+        }
+    }
+}
+
+/// The `widgetsAppearance` value.
+pub fn appearance_key(p: crate::motion::AppearancePref) -> &'static str {
+    match p {
+        crate::motion::AppearancePref::Auto => "auto",
+        crate::motion::AppearancePref::Dark => "dark",
+        crate::motion::AppearancePref::Light => "light",
+    }
+}
+
 /// The host settings of config.json: `widgetsGlass` 0..1, `widgetsDim`, `widgetsGlassMode` ("plain" = no desktop capture, anything else = live glass),
 /// `widgetsAppearance` ("auto" | "dark" | "light").
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -270,6 +290,47 @@ pub fn write_setting(key: &str, val: Value) -> Result<(), String> {
 pub fn write_setting_to(p: &std::path::Path, key: &str, val: Value) -> Result<(), String> {
     let mut root = read_root(p)?;
     root.as_object_mut().ok_or("config root is not an object")?.insert(key.to_string(), val);
+    write_root(p, &root)
+}
+
+/// `widgetsLook` of a parsed config.json: the object, or `{}`.
+pub fn look_from_value(v: &Value) -> Value {
+    v.get("widgetsLook").filter(|l| l.is_object()).cloned().unwrap_or_else(|| json!({}))
+}
+
+/// `widgetsLook` from the user's config.json.
+pub fn read_look() -> Value {
+    config_path().and_then(|p| read_root(&p).ok()).map(|v| look_from_value(&v)).unwrap_or_else(|| json!({}))
+}
+
+/// The new `widgetsLook`: the entries of `old` the sliders do not own (hand-written keys survive) plus `diff`.
+pub fn merge_look(old: &Value, diff: &Value) -> Value {
+    let owned: Vec<&str> = crate::glass::LOOK.iter().flat_map(|d| d.names()).collect();
+    let mut out = serde_json::Map::new();
+    for (k, v) in old.as_object().into_iter().flatten().filter(|(k, _)| !owned.contains(&k.as_str())) {
+        out.insert(k.clone(), v.clone());
+    }
+    for (k, v) in diff.as_object().into_iter().flatten() {
+        out.insert(k.clone(), v.clone());
+    }
+    Value::Object(out)
+}
+
+/// Write `widgetsLook` (merged with what the file has; an empty result removes the key), everything else untouched.
+pub fn write_look(diff: &Value) -> Result<(), String> {
+    write_look_to(&config_path().ok_or("no APPDATA")?, diff)
+}
+pub fn write_look_to(p: &std::path::Path, diff: &Value) -> Result<(), String> {
+    let mut root = read_root(p)?;
+    let obj = root.as_object_mut().ok_or("config root is not an object")?;
+    let merged = merge_look(&obj.get("widgetsLook").cloned().unwrap_or_else(|| json!({})), diff);
+    if merged.as_object().is_some_and(|m| m.is_empty()) {
+        if obj.remove("widgetsLook").is_none() {
+            return Ok(()); // nothing there, nothing to write
+        }
+    } else {
+        obj.insert("widgetsLook".into(), merged);
+    }
     write_root(p, &root)
 }
 
@@ -441,6 +502,43 @@ mod tests {
         assert_ne!(new_id_time("clock", &taken), a);
         assert_eq!(base36(35), "z");
         assert_eq!(base36(36), "10");
+    }
+
+    /// `widgetsLook` write-back: only the slider-owned keys change, hand-written keys, other settings and the layout survive;
+    /// an empty diff removes the object; an unparsable file is refused.
+    #[test]
+    fn look_write_back_merges() {
+        let dir = std::env::temp_dir().join(format!("mswidgets-look-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config.json");
+        std::fs::write(&f, r#"{"mode":"widgets","widgetsGlass":0.7,"widgetsLayout":[{"id":"clock-1","type":"clock","size":"s","col":0,"row":0,"cfg":{}}],"widgetsLook":{"spec_len":0.3,"blur":9.0}}"#).unwrap();
+        write_look_to(&f, &json!({"blur": 6.5, "chroma_r": 0.08, "chroma_b": 0.12})).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        assert_eq!(v["widgetsLook"], json!({"spec_len": 0.3, "blur": 6.5, "chroma_r": 0.08, "chroma_b": 0.12}));
+        assert_eq!((v["mode"].as_str(), v["widgetsGlass"].as_f64(), v["widgetsLayout"].as_array().map(|a| a.len())), (Some("widgets"), Some(0.7), Some(1)));
+        assert_eq!(look_from_value(&v)["blur"], 6.5);
+        // sliders back at the base: the owned keys go, the hand-written one stays
+        write_look_to(&f, &json!({})).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        assert_eq!(v["widgetsLook"], json!({"spec_len": 0.3}));
+        // nothing left: the key is removed
+        std::fs::write(&f, r#"{"widgetsLook":{"blur":9}}"#).unwrap();
+        write_look_to(&f, &json!({})).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        assert!(v.get("widgetsLook").is_none());
+        // a file without the key and an empty diff is not rewritten
+        std::fs::write(&f, "{\"a\":  1}").unwrap();
+        write_look_to(&f, &json!({})).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "{\"a\":  1}");
+        // a missing file is created, an unparsable one is refused
+        let g = dir.join("new").join("config.json");
+        write_look_to(&g, &json!({"sat": 1.2})).unwrap();
+        assert_eq!(look_from_value(&serde_json::from_str(&std::fs::read_to_string(&g).unwrap()).unwrap())["sat"], 1.2);
+        std::fs::write(&f, "{ nope").unwrap();
+        assert!(write_look_to(&f, &json!({"sat": 1.2})).is_err());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "{ nope");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

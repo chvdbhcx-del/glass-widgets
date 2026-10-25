@@ -15,6 +15,7 @@ use crate::gfx::*;
 use crate::grid;
 use crate::layout;
 use crate::motion::{self, MatState};
+use crate::tray::{self, TrayCmd};
 use crate::ui::{self, Hit, Ui};
 use crate::widget::{Button, Lang, MouseKind, Now, Rect, Size, WM_WIDGET};
 use std::cell::RefCell;
@@ -47,6 +48,10 @@ const T_CFG: usize = 8;
 const T_SHRINK: usize = 9;
 const T_TOAST: usize = 10;
 const T_REPLACE: usize = 11;
+/// throttled apply of the look sliders (settings panel)
+const T_LOOK: usize = 40;
+/// at most one live look apply per this long while a slider is dragged
+const LOOK_EVERY: Duration = Duration::from_millis(100);
 const NEAR_PX: i32 = 8;
 /// bits 62 / 63 of the backdrop dirty mask belong to the gallery panel and the settings strip
 const BIT_GALLERY: u64 = 1 << 62;
@@ -171,6 +176,8 @@ struct App {
     mon: RECT,  // monitor, desktop px
     work: RECT, // work area, desktop px
     s: f32,
+    /// scale of the cards (`s` x the look's `card_k`); `s` is the host UI / DPI scale
+    cs: f32,
     dims: grid::Dims,
     win: RECT, // window rect inside the canvas (monitor px)
     win_dirty: bool,
@@ -188,6 +195,8 @@ struct App {
     interactive: bool,
     near: bool,
     visible: bool,
+    /// hidden from the tray menu ("Hide Widgets"): the guard keeps the layer hidden until it is shown again
+    user_hidden: bool,
     first_present: bool,
     last_lum: Instant,
     last_day: u32,
@@ -210,6 +219,13 @@ struct App {
     app_front: bool,
     /// the layer has been the foreground window at least once in this edit session (else no auto-exit on focus loss)
     was_fg: bool,
+    /// settings panel: the look as stored (`widgetsLook`), the base look it is relative to (defaults + glass.json), slider changes
+    /// not yet applied to the cards, the time of the last apply, and whether the panel was opened from the gallery (Done goes back there)
+    look_cfg: serde_json::Value,
+    look_base: crate::glass::GlassParams,
+    look_dirty: bool,
+    look_last: Instant,
+    settings_back: bool,
     st: Stats,
     bench: Option<u32>,
     t0: Instant,
@@ -218,6 +234,8 @@ struct App {
 }
 
 thread_local! { static APP: RefCell<Option<App>> = const { RefCell::new(None) }; }
+/// Registered id of Explorer's `TaskbarCreated` broadcast (0 until the tray icon is set up): the tray icon is added again on it.
+static TASKBAR_CREATED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub fn run(o: Opts) -> i32 {
     match unsafe { setup(&o) } {
@@ -333,11 +351,16 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     };
     let s = o.scale.unwrap_or(GetDpiForSystem() as f32 / 96.0);
     let settings = layout::read_settings();
-    let dims = grid_dims(&mon.rect, &mon.work, s);
+    // the look: defaults -> glass.json (the process-wide base) -> `widgetsLook` of config.json; its `card_k` scales the cards (not the host UI)
+    let look_base = crate::glass::global_params();
+    let look_cfg = if o.no_config { serde_json::json!({}) } else { layout::read_look() };
+    let look = crate::glass::apply_look(&look_base, &look_cfg);
+    let cs = s * look.card_k;
+    let dims = grid_dims(&mon.rect, &mon.work, cs);
 
     let mut items = layout::load(!o.no_config);
-    let specs = place_items(&mut items, &dims, s);
-    let m = (MARGIN * s).round() as i32;
+    let specs = place_items(&mut items, &dims, cs);
+    let m = (MARGIN * cs).round() as i32;
     let card_rects: Vec<RECT> = specs.iter().map(|c| c.rect()).collect();
     let win = window_rect(&card_rects, m, mw, mh);
 
@@ -372,8 +395,9 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     eprintln!("mswidgets: backdrop = {}, scale {s:.2}, monitor {mw}x{mh}, window {}x{} at {},{}", backdrop.name(), win.right - win.left, win.bottom - win.top, mon.rect.left + win.left, mon.rect.top + win.top);
 
     let env = SceneEnv { preview: false, hwnd: hwnd.0 as isize, lang: layout::lang(), utc_off: crate::sys::local_utc_offset_min() };
-    let mut scene = Scene::new(&gfx, mw, mh, s, settings.glass, backdrop.bitmap(), &specs, &env)?;
+    let mut scene = Scene::new(&gfx, mw, mh, cs, settings.glass, backdrop.bitmap(), &specs, &env)?;
     scene.set_appearance_pref(o.appearance.unwrap_or(settings.appearance));
+    scene.set_params(&gfx, &look)?;
     // start-up: every card condenses out of the glass (staggered), a plain fade with reduced motion
     let reduced0 = reduced_motion();
     let mut pops = HashMap::new();
@@ -390,6 +414,10 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     let mut ui = Ui::new(env.lang, s, mw as f32 / s, mh as f32 / s);
     ui.glass = settings.glass;
     ui.live = settings.live;
+    ui.look = look;
+    ui.base = look_base;
+    ui.appearance = settings.appearance;
+    ui.dim_mode = settings.dim;
 
     // premultiplied BGRA DIB the layered window is fed from (only the dirty rect is copied per frame)
     let screen = GetDC(None);
@@ -410,6 +438,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         mon: mon.rect,
         work: mon.work,
         s,
+        cs,
         dims,
         win,
         win_dirty: true,
@@ -427,6 +456,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         interactive: false,
         near: false,
         visible: false,
+        user_hidden: false,
         first_present: true,
         last_lum: Instant::now() - Duration::from_secs(1),
         last_day: 0,
@@ -447,6 +477,11 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         in_menu: false,
         app_front: false,
         was_fg: false,
+        look_cfg,
+        look_base,
+        look_dirty: false,
+        look_last: Instant::now() - Duration::from_secs(1),
+        settings_back: false,
         st: Stats::default(),
         bench: o.bench,
         t0: Instant::now(),
@@ -481,6 +516,13 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         if RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W' as u32).is_err() {
             eprintln!("mswidgets: Ctrl+Alt+W could not be registered (macshell holds it?); edit mode via the context menu only");
         }
+        if RegisterHotKey(hwnd, 3, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G' as u32).is_err() {
+            eprintln!("mswidgets: Ctrl+Alt+G could not be registered; the settings stay reachable from the tray icon");
+        }
+    }
+    TASKBAR_CREATED.store(tray::taskbar_created_msg(), std::sync::atomic::Ordering::Relaxed);
+    if !tray::add(hwnd) {
+        eprintln!("mswidgets: tray icon could not be added (the settings stay reachable with Ctrl+Alt+W)");
     }
     SetTimer(hwnd, T_HIT, 100, None);
     SetTimer(hwnd, T_GUARD, 500, None);
@@ -567,11 +609,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(MA_NOACTIVATE as isize)
             }
         }
+        tray::WM_TRAY => {
+            match (lp.0 & 0xFFFF) as u32 {
+                WM_LBUTTONUP => with_app(|app| app.apply_tray(TrayCmd::Settings)),
+                WM_RBUTTONUP | WM_CONTEXTMENU => {
+                    // the popup is modal: it runs without the App borrowed, the choice is applied afterwards
+                    let st = APP.with(|a| a.try_borrow().ok().and_then(|g| g.as_ref().map(|app| app.tray_state())));
+                    if let Some(st) = st {
+                        let cmd = tray::run_menu(hwnd, &st, |h| force_foreground(h));
+                        with_app(|app| app.apply_tray(cmd));
+                    }
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        m if m != 0 && m == TASKBAR_CREATED.load(std::sync::atomic::Ordering::Relaxed) => {
+            tray::add(hwnd); // Explorer restarted: its notification area is empty again
+            LRESULT(0)
+        }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
+            tray::remove(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -685,7 +747,7 @@ impl App {
     }
 
     fn ext(&self) -> i32 {
-        (60.0 * self.s) as i32
+        (60.0 * self.cs) as i32
     }
 
     fn bd(&self) -> &dyn Backdrop {
@@ -699,6 +761,13 @@ impl App {
                     self.leave_edit();
                 } else {
                     self.enter_edit();
+                }
+            }
+            (WM_HOTKEY, 3) => {
+                if self.ui.settings {
+                    self.close_settings();
+                } else {
+                    self.open_settings();
                 }
             }
             (WM_HOTKEY, _) => {
@@ -720,6 +789,12 @@ impl App {
             (_, T_ANIM) => self.anim_step(),
             (_, T_UI) => self.ui_timer(),
             (_, T_CFG) => self.poll_config(),
+            (_, T_LOOK) => {
+                let _ = KillTimer(self.hwnd, T_LOOK);
+                if self.look_dirty {
+                    self.apply_look_now();
+                }
+            }
             (_, T_SHRINK) => {
                 let _ = KillTimer(self.hwnd, T_SHRINK);
                 self.fit_window();
@@ -777,8 +852,8 @@ impl App {
     fn sync_regions(&self) {
         let s = self.s;
         let px = |r: Rect| RECT { left: (r.x * s) as i32, top: (r.y * s) as i32, right: (r.right() * s).ceil() as i32, bottom: (r.bottom() * s).ceil() as i32 };
-        let g = (self.ui.edit && self.ui.gallery).then(|| px(self.ui.panel_rect()));
-        let t = self.ui.edit.then(|| px(self.ui.toolbar_rect()));
+        let g = (self.ui.edit && (self.ui.gallery || self.ui.settings)).then(|| px(self.ui.panel_rect()));
+        let t = (self.ui.edit && !self.ui.settings).then(|| px(self.ui.toolbar_rect()));
         if let Some(b) = &self.backdrop {
             b.set_regions(&region_list(&self.card_rects(), g, t));
         }
@@ -1219,7 +1294,7 @@ impl App {
         let px = |r: Rect| RECT { left: (r.x * s) as i32 - 8, top: (r.y * s) as i32 - 8, right: (r.right() * s).ceil() as i32 + 8, bottom: (r.bottom() * s).ceil() as i32 + 8 };
         match h {
             Hit::Minus(i) | Hit::Card(i) => (i < self.scene.len()).then(|| self.scene.layer_rect_ext(i, self.ext())),
-            Hit::Slider(_) | Hit::Seg(_) | Hit::Toolbar => Some(px(self.ui.toolbar_rect())),
+            Hit::Slider(_) | Hit::Seg(_) | Hit::SettingsBtn | Hit::Toolbar => Some(px(self.ui.toolbar_rect())),
             Hit::None => None,
             _ => Some(px(self.ui.panel_rect())),
         }
@@ -1229,6 +1304,7 @@ impl App {
         let same = |a: Hit, b: Hit| match (a, b) {
             (Hit::Slider(_), Hit::Slider(_)) => true,
             (Hit::Search(_), Hit::Search(_)) => true,
+            (Hit::Look(i, _), Hit::Look(j, _)) => i == j,
             _ => a == b,
         };
         if same(self.ui.hover, h) {
@@ -1237,7 +1313,7 @@ impl App {
         let old = self.ui.hover;
         self.ui.hover = h;
         // only hovers that change how something looks need a frame
-        let looks = |h: Hit| matches!(h, Hit::Minus(_) | Hit::Group(_) | Hit::Item(_) | Hit::Done);
+        let looks = |h: Hit| matches!(h, Hit::Minus(_) | Hit::Group(_) | Hit::Item(_) | Hit::Done | Hit::SettingsBtn | Hit::Look(..) | Hit::Opt(..) | Hit::Autostart | Hit::ResetLook | Hit::EditBtn | Hit::QuitBtn);
         if looks(old) || looks(h) {
             let mut d: Option<RECT> = None;
             for r in [self.hover_dirty(old), self.hover_dirty(h)].into_iter().flatten() {
@@ -1277,6 +1353,11 @@ impl App {
                         self.apply_glass(v);
                         return;
                     }
+                    Press::Ui(Hit::Look(i, _)) => {
+                        let t = self.ui.set_value_at(i, x);
+                        self.set_look_slider(i, t);
+                        return;
+                    }
                     _ => {}
                 }
                 self.set_hover(hit);
@@ -1305,6 +1386,11 @@ impl App {
                             self.frame(d);
                         }
                     }
+                    Hit::Look(i, t) => {
+                        self.press = Press::Ui(hit);
+                        self.set_look_slider(i, t);
+                    }
+                    Hit::None if self.ui.settings => self.press = Press::Ui(Hit::None), // a click outside the panel closes it on release
                     Hit::None => self.ui.st.focus = false,
                     _ => {
                         self.press = Press::Ui(hit);
@@ -1331,6 +1417,11 @@ impl App {
                         let v = (v * 100.0).round() / 100.0;
                         self.write_setting("widgetsGlass", serde_json::json!(v));
                         self.settings.glass = v;
+                    }
+                    Press::Ui(Hit::Look(i, _)) => {
+                        let t = self.ui.set_value_at(i, x);
+                        self.set_look_slider(i, t);
+                        self.commit_look(i);
                     }
                     Press::Ui(h) => {
                         let same = match (h, hit) {
@@ -1368,6 +1459,16 @@ impl App {
 
     unsafe fn ui_click(&mut self, h: Hit) {
         match h {
+            Hit::Done if self.ui.settings => self.close_settings(),
+            Hit::None if self.ui.settings => self.close_settings(),
+            Hit::SettingsBtn => self.open_settings(),
+            Hit::ResetLook => self.reset_look(),
+            Hit::Opt(o, k) => self.set_option(o, k),
+            Hit::Autostart => self.toggle_autostart(),
+            Hit::EditBtn => self.switch_panel(false),
+            Hit::QuitBtn => {
+                let _ = DestroyWindow(self.hwnd); // the Ctrl+Alt+Q path
+            }
             Hit::Done => self.leave_edit(),
             Hit::Minus(i) => {
                 if let Some(c) = self.scene.cards.get(i) {
@@ -1411,7 +1512,7 @@ impl App {
                 match vk {
                     VK_ESCAPE => {
                         self.esc_down = true;
-                        return self.leave_edit();
+                        return if self.ui.settings { self.close_settings() } else { self.leave_edit() };
                     }
                     _ if !self.ui.gallery => return,
                     VK_BACK => {
@@ -1493,7 +1594,7 @@ impl App {
             return self.show_toast(self.ui.lang.pick("Слишком много виджетов", "Too many widgets").to_string());
         }
         let (lw, lh) = size.logical();
-        let (w, h) = ((lw * self.s).round() as i32, (lh * self.s).round() as i32);
+        let (w, h) = ((lw * self.cs).round() as i32, (lh * self.cs).round() as i32);
         let id = layout::new_id_time(def.type_id, &self.items);
         let spec = CardSpec { id: id.clone(), type_id: def.type_id.to_string(), size, cfg: serde_json::json!({}), x: x - w / 2, y: y - h / 2, w, h };
         let Some(uid) = self.spawn_card(&spec, false) else { return };
@@ -1548,7 +1649,7 @@ impl App {
                     it.col = col as u32;
                     it.row = row as u32;
                 }
-                let (x, y, _, _) = cell_rect(size, col, row, self.s);
+                let (x, y, _, _) = cell_rect(size, col, row, self.cs);
                 let c = &self.scene.cards[i];
                 self.springs.insert(d.uid, Spring { x: c.x as f32, y: c.y as f32, vx: 0.0, vy: 0.0, tx: x as f32, ty: y as f32 });
                 self.save_layout();
@@ -1596,7 +1697,7 @@ impl App {
             return self.show_toast(self.ui.lang.pick("На рабочем столе нет свободного места", "No free space on the desktop").to_string());
         };
         let id = layout::new_id_time(def.type_id, &self.items);
-        let (x, y, w, h) = cell_rect(size, p.col, p.row, self.s);
+        let (x, y, w, h) = cell_rect(size, p.col, p.row, self.cs);
         let spec = CardSpec { id: id.clone(), type_id: def.type_id.to_string(), size, cfg: serde_json::json!({}), x, y, w, h };
         let Some(uid) = self.spawn_card(&spec, true) else { return };
         self.items.push(layout::Item { id, type_id: def.type_id.to_string(), size, col: p.col as u32, row: p.row as u32, cfg: serde_json::json!({}) });
@@ -1641,7 +1742,7 @@ impl App {
             return self.show_toast(self.ui.lang.pick("Нет места для этого размера", "No room for this size").to_string());
         };
         let old = self.scene.layer_rect_ext(i, self.ext());
-        let (x, y, _, _) = cell_rect(size, p.col, p.row, self.s);
+        let (x, y, _, _) = cell_rect(size, p.col, p.row, self.cs);
         if let Err(e) = self.scene.resize_card(&self.gfx, i, size, x, y) {
             eprintln!("mswidgets: resize: {e}");
             return;
@@ -1726,7 +1827,7 @@ impl App {
     unsafe fn arm_anim(&mut self) {
         let period = if self.anim_busy() {
             16
-        } else if self.ui.edit && !self.reduced {
+        } else if self.ui.edit && !self.ui.settings && !self.reduced {
             100
         } else {
             0
@@ -1767,7 +1868,7 @@ impl App {
             }
         }
         // the dim covers the whole monitor: it fades in 6 steps (each one a full-monitor compose + present)
-        let dim = DIM_ALPHA * (self.dim_t * 6.0).round() / 6.0;
+        let dim = (if self.ui.settings { ui::SETTINGS_DIM } else { DIM_ALPHA }) * (self.dim_t * 6.0).round() / 6.0;
         if (self.ui.dim - dim).abs() > 1e-4 {
             self.ui.dim = dim;
             add(&mut dirty, RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h });
@@ -1783,11 +1884,11 @@ impl App {
                 let ny = (d.cur.1 - d.off.1).clamp(-c.h / 2, self.scene.h - c.h / 2);
                 let (size, id) = (c.size, c.id.clone());
                 let occ = self.items.iter().filter(|it| it.id != id && self.scene.index_of_id(&it.id).is_some()).map(|it| grid::Place::new(it.size, it.col as i32, it.row as i32)).collect::<Vec<_>>();
-                let target = grid::target_for(&self.dims, &occ, size, nx, ny, self.s);
+                let target = grid::target_for(&self.dims, &occ, size, nx, ny, self.cs);
                 let ph_old = self.ui.placeholder;
                 self.ui.placeholder = target.map(|p| {
-                    let (x, y, w, h) = cell_rect(size, p.col, p.row, self.s);
-                    (RECT { left: x, top: y, right: x + w, bottom: y + h }, size.radius() * self.s)
+                    let (x, y, w, h) = cell_rect(size, p.col, p.row, self.cs);
+                    (RECT { left: x, top: y, right: x + w, bottom: y + h }, self.scene.radius_of(size) * self.cs)
                 });
                 if let Some((r, _)) = ph_old {
                     add(&mut dirty, RECT { left: r.left - 4, top: r.top - 4, right: r.right + 4, bottom: r.bottom + 4 });
@@ -1881,7 +1982,7 @@ impl App {
 
         // per-card visual transform: jiggle, lift, pop
         let jig_t = t.saturating_duration_since(self.t_edit).as_secs_f32();
-        let edit_on = self.ui.edit && self.editing && !self.reduced;
+        let edit_on = self.ui.edit && !self.ui.settings && self.editing && !self.reduced;
         for i in 0..self.scene.len() {
             let c = &self.scene.cards[i];
             let dragging = self.drag.as_ref().is_some_and(|d| d.uid == c.uid);
@@ -1926,7 +2027,112 @@ impl App {
         self.interactive = !on;
     }
 
+    fn tray_state(&self) -> tray::MenuState {
+        tray::MenuState { lang: self.ui.lang, editing: self.editing, hidden: self.user_hidden, autostart: crate::autostart::enabled() }
+    }
+
+    /// A tray click / menu choice.
+    unsafe fn apply_tray(&mut self, cmd: TrayCmd) {
+        if matches!(cmd, TrayCmd::Settings | TrayCmd::Edit) && self.user_hidden {
+            self.user_hidden = false; // asking for the settings brings the widgets back
+            self.guard();
+        }
+        match cmd {
+            TrayCmd::None => {}
+            TrayCmd::Settings => self.open_settings(),
+            TrayCmd::Edit => {
+                if self.editing {
+                    self.leave_edit();
+                } else {
+                    self.enter_edit();
+                }
+            }
+            TrayCmd::ToggleVisible => {
+                self.user_hidden = !self.user_hidden;
+                self.guard();
+            }
+            TrayCmd::ToggleAutostart => {
+                if let Err(e) = crate::autostart::set(!crate::autostart::enabled()) {
+                    self.show_toast(format!("{}: {e}", self.ui.lang.pick("Автозапуск не изменён", "Autostart not changed")));
+                }
+            }
+            TrayCmd::Quit => {
+                let _ = DestroyWindow(self.hwnd);
+            }
+        }
+    }
+
+    /// Entry point of the settings panel (tray menu, Ctrl+Alt+G, the strip's button): from the live desk the layer becomes interactive
+    /// exactly as for edit mode (activatable, raised, click-through off); inside edit mode the panel replaces the gallery.
+    unsafe fn open_settings(&mut self) {
+        if self.ui.settings {
+            return;
+        }
+        if self.editing {
+            self.switch_panel(true);
+        } else {
+            self.enter_edit_as(true);
+        }
+    }
+
+    /// Esc / Done / click outside / Ctrl+Alt+G: back to the gallery when the panel came from it, else out of edit mode altogether.
+    unsafe fn close_settings(&mut self) {
+        if !self.ui.settings {
+            return;
+        }
+        if self.settings_back {
+            self.switch_panel(false);
+        } else {
+            self.leave_edit();
+        }
+    }
+
+    /// The values the settings panel shows (behaviour options, the autostart switch); the look sliders are kept in `ui` all the time.
+    fn sync_settings_ui(&mut self) {
+        self.ui.appearance = self.settings.appearance;
+        self.ui.dim_mode = self.settings.dim;
+        self.ui.live = self.settings.live;
+        self.ui.autostart = crate::autostart::enabled();
+    }
+
+    /// Swap the open panel in place (gallery <-> settings) inside the running edit mode; the new panel fades in.
+    unsafe fn switch_panel(&mut self, settings: bool) {
+        if !self.editing || self.ui.settings == settings {
+            return;
+        }
+        if self.drag.is_some() {
+            self.end_drag();
+        }
+        self.ui.settings = settings;
+        self.ui.gallery = !settings;
+        self.settings_back = settings;
+        self.ui.hover = Hit::None;
+        self.ui.press = Hit::None;
+        self.press = Press::None;
+        self.ui.st.focus = !settings;
+        self.ui.caret_on = true;
+        if settings {
+            self.sync_settings_ui();
+        } else {
+            self.ui.sync_previews(&self.gfx, &Now::local());
+        }
+        self.ui.anim = 0.0;
+        self.gal_t = 0.0;
+        self.ui.sync_panels(&mut self.scene, &self.gfx);
+        self.sync_regions();
+        self.last_anim = Instant::now();
+        self.arm_ui_timer();
+        self.arm_anim();
+        self.anim_step();
+        let d = RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h };
+        self.frame(d);
+    }
+
     unsafe fn enter_edit(&mut self) {
+        self.enter_edit_as(false);
+    }
+
+    unsafe fn enter_edit_as(&mut self, settings: bool) {
         if self.editing || self.ui.edit || !self.visible {
             return;
         }
@@ -1948,8 +2154,10 @@ impl App {
         self.interactive = true;
         let _ = SetWindowPos(self.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         self.ui.edit = true;
-        self.ui.gallery = true;
-        self.ui.st.focus = true;
+        self.ui.gallery = !settings;
+        self.ui.settings = settings;
+        self.settings_back = false;
+        self.ui.st.focus = !settings;
         self.ui.caret_on = true;
         self.ui.anim = 0.0;
         self.ui.dim = 0.0;
@@ -1958,7 +2166,11 @@ impl App {
         let now = Now::local();
         let r = RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h };
         self.set_window(r);
-        self.ui.sync_previews(&self.gfx, &now);
+        if settings {
+            self.sync_settings_ui();
+        } else {
+            self.ui.sync_previews(&self.gfx, &now);
+        }
         self.ui.sync_panels(&mut self.scene, &self.gfx);
         self.sync_regions();
         force_foreground(self.hwnd);
@@ -1989,6 +2201,8 @@ impl App {
         self.ui.edit = false;
         self.update_dim();
         self.ui.gallery = false;
+        self.ui.settings = false;
+        self.settings_back = false;
         self.ui.anim = 0.0;
         self.ui.dim = 0.0;
         self.ui.st.focus = false;
@@ -2012,23 +2226,23 @@ impl App {
     // ------------------------------------------------ gallery timer / toast
 
     unsafe fn arm_ui_timer(&mut self) {
-        if self.ui.edit && self.ui.gallery {
+        if self.ui.edit && (self.ui.gallery || self.ui.settings) {
             SetTimer(self.hwnd, T_UI, 200, None);
         }
     }
 
     /// 200 ms while the gallery is open: animated previews (<= 5 fps), the search caret blink, Esc fallback.
     unsafe fn ui_timer(&mut self) {
-        if !(self.ui.edit && self.ui.gallery) {
+        if !(self.ui.edit && (self.ui.gallery || self.ui.settings)) {
             let _ = KillTimer(self.hwnd, T_UI);
             return;
         }
         let mut redraw = false;
-        if self.ui.refresh_previews(&self.gfx, &Now::local()) {
+        if self.ui.gallery && self.ui.refresh_previews(&self.gfx, &Now::local()) {
             redraw = true;
         }
         self.ui_tick += 1;
-        if self.ui.st.focus && self.ui_tick % 3 == 0 {
+        if self.ui.gallery && self.ui.st.focus && self.ui_tick % 3 == 0 {
             self.ui.caret_on = !self.ui.caret_on;
             redraw = true;
         }
@@ -2036,7 +2250,7 @@ impl App {
         let esc = GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0 && GetForegroundWindow() == self.hwnd;
         if esc && !self.esc_down {
             self.esc_down = true;
-            return self.leave_edit();
+            return if self.ui.settings { self.close_settings() } else { self.leave_edit() };
         }
         if !esc {
             self.esc_down = false;
@@ -2098,6 +2312,142 @@ impl App {
         self.frame(d);
     }
 
+    /// A look slider of the settings panel moved to `t` (0..1; slider 0 = Glass): the panel shows it at once, the cards follow at most
+    /// 10 times a second (`T_LOOK` applies a change that arrived too early; `commit_look` applies the final value on release).
+    unsafe fn set_look_slider(&mut self, i: usize, t: f32) {
+        if i == 0 {
+            self.ui.glass = t.clamp(0.0, 1.0);
+        } else if let Some(d) = crate::glass::LOOK.get(i - 1) {
+            d.set_pos(&mut self.ui.look, &self.ui.base, t);
+        }
+        self.look_dirty = true;
+        let wait = LOOK_EVERY.saturating_sub(self.look_last.elapsed());
+        if wait.is_zero() {
+            self.apply_look_now();
+            return;
+        }
+        SetTimer(self.hwnd, T_LOOK, wait.as_millis().max(1) as u32, None);
+        // only the row of the slider is redrawn meanwhile: the knob and the value follow the pointer
+        let s = self.s;
+        if let Some(r) = self.ui.set_lay().rows.get(i).map(|r| r.row) {
+            self.frame(RECT { left: ((r.x - 8.0) * s) as i32, top: ((r.y - 4.0) * s) as i32, right: ((r.right() + 8.0) * s).ceil() as i32, bottom: ((r.bottom() + 4.0) * s).ceil() as i32 });
+        }
+    }
+
+    /// Give the cards the look / glass value the panel shows: new effect graphs, every layer re-rendered, then the cards' area and the panel recomposed.
+    unsafe fn apply_look_now(&mut self) {
+        self.look_dirty = false;
+        self.look_last = Instant::now();
+        let _ = KillTimer(self.hwnd, T_LOOK);
+        // the card scale applies on release (`apply_card_scale`: it needs a new desk grid and capture); nothing else changed = nothing to do
+        let mut look = self.ui.look;
+        look.card_k = self.scene.params().card_k;
+        if look == *self.scene.params() && (self.ui.glass - self.scene.glass_value()).abs() < 1e-6 {
+            return;
+        }
+        let ok = self.scene.set_glass(&self.gfx, self.ui.glass).and_then(|_| self.scene.set_params(&self.gfx, &look));
+        if let Err(e) = ok {
+            eprintln!("mswidgets: look: {e}");
+            return;
+        }
+        let now = self.now();
+        let mut cards: Option<RECT> = None;
+        for i in 0..self.scene.len() {
+            let _ = self.scene.render_card(&self.gfx, i, &now);
+            let r = self.scene.layer_rect_ext(i, self.ext());
+            cards = Some(cards.map_or(r, |d| union(d, r)));
+        }
+        if let Some(d) = cards {
+            self.frame(d);
+        }
+        if let Some(u) = self.ui.dirty_rect(&self.scene) {
+            self.frame(u);
+        }
+    }
+
+    /// A look slider was released: the final value reaches the cards at once and config.json (`widgetsGlass` / `widgetsLook`).
+    unsafe fn commit_look(&mut self, i: usize) {
+        if self.look_dirty {
+            self.apply_look_now();
+        }
+        if i == 0 {
+            let v = (self.ui.glass * 100.0).round() / 100.0;
+            self.write_setting("widgetsGlass", serde_json::json!(v));
+            self.settings.glass = v;
+        } else {
+            self.save_look();
+            self.apply_card_scale();
+        }
+    }
+
+    /// The card scale slider settled: lay the desk out again (new grid, margin and capture regions; widgets and their state stay).
+    unsafe fn apply_card_scale(&mut self) {
+        if (self.ui.look.card_k - self.scene.params().card_k).abs() > 1e-4 {
+            self.rebuild(true);
+        }
+    }
+
+    /// Write the sliders' differences from the base look into `widgetsLook` (an empty diff removes the sliders' keys).
+    fn save_look(&mut self) {
+        let diff = crate::glass::look_diff(&self.look_base, &self.ui.look);
+        match layout::write_look(&diff) {
+            Ok(()) => self.look_cfg = layout::merge_look(&self.look_cfg, &diff),
+            Err(e) => eprintln!("mswidgets: {e}"),
+        }
+        self.note_own_write();
+    }
+
+    /// "Reset look": the base look (defaults + glass.json) and the default glass value.
+    unsafe fn reset_look(&mut self) {
+        self.ui.look = self.look_base;
+        self.ui.glass = layout::Settings::default().glass;
+        self.apply_look_now();
+        self.write_setting("widgetsGlass", serde_json::json!(self.ui.glass));
+        self.settings.glass = self.ui.glass;
+        self.save_look();
+        self.apply_card_scale();
+    }
+
+    /// A segmented control of the settings panel: appearance, dimming, glass source.
+    unsafe fn set_option(&mut self, o: ui::Opt, k: usize) {
+        match o {
+            ui::Opt::Appearance => {
+                let p = ui::Opt::appearance(k);
+                self.ui.appearance = p;
+                self.settings.appearance = p;
+                self.scene.set_appearance_pref(p);
+                self.last_anim = Instant::now();
+                self.arm_anim();
+                self.write_setting("widgetsAppearance", serde_json::json!(layout::appearance_key(p)));
+            }
+            ui::Opt::Dim => {
+                let d = ui::Opt::dim(k);
+                self.ui.dim_mode = d;
+                self.settings.dim = d;
+                self.write_setting("widgetsDim", serde_json::json!(d.key()));
+                self.update_dim(); // takes effect when the panel closes (the desk is not dimmed while editing)
+            }
+            ui::Opt::Source => self.set_live(k == 0),
+        }
+        if let Some(d) = self.hover_dirty(Hit::Panel) {
+            self.frame(d);
+        }
+    }
+
+    /// The "Start with Windows" switch: the per-user Run value is written / removed right now.
+    unsafe fn toggle_autostart(&mut self) {
+        match crate::autostart::set(!self.ui.autostart) {
+            Ok(()) => self.ui.autostart = crate::autostart::enabled(),
+            Err(e) => {
+                eprintln!("mswidgets: autostart: {e}");
+                self.show_toast(self.ui.lang.pick("Не удалось изменить автозапуск", "Could not change the autostart").to_string());
+            }
+        }
+        if let Some(d) = self.hover_dirty(Hit::Panel) {
+            self.frame(d);
+        }
+    }
+
     /// Live (desktop duplication) <-> plain glass.
     unsafe fn set_live(&mut self, live: bool) {
         if self.ui.live == live {
@@ -2117,11 +2467,21 @@ impl App {
         self.backdrop = None; // stops the capture thread before a new duplication is requested
         self.mon = mon.rect;
         self.work = mon.work;
+        let cs = s * self.ui.look.card_k;
         self.s = s;
-        self.dims = grid_dims(&self.mon, &self.work, s);
-        let m = (MARGIN * s).round() as i32;
+        self.cs = cs;
+        self.dims = grid_dims(&self.mon, &self.work, cs);
+        let m = (MARGIN * cs).round() as i32;
         // card positions: from the grid again (a new monitor / scale); the stored layout is not rewritten
-        let specs = place_items(&mut self.items, &self.dims, s);
+        let specs = place_items(&mut self.items, &self.dims, cs);
+        // a card that lost its room (bigger cards, a smaller monitor) leaves the desk, the stored layout keeps it
+        let gone: Vec<usize> = self.scene.cards.iter().filter(|c| !specs.iter().any(|sp| sp.id == c.id)).map(|c| c.uid).collect();
+        for uid in gone {
+            if let Some(i) = self.scene.index_of_uid(uid) {
+                self.scene.remove_card(i);
+            }
+            self.pops.remove(&uid);
+        }
         let mut rects = Vec::new();
         for c in &self.scene.cards {
             match specs.iter().find(|sp| sp.id == c.id) {
@@ -2133,10 +2493,17 @@ impl App {
         let bd = make_backdrop(&self.gfx, &mon, mw, mh, self.settings.live, self.fps, &region_list(&card_rects, None, None), m);
         bd.set_hwnd(self.hwnd);
         self.use_dupl = bd.name().starts_with("desktop");
-        if let Err(e) = self.scene.reconfigure(&self.gfx, mw, mh, s, bd.bitmap(), &rects) {
+        if let Err(e) = self.scene.reconfigure(&self.gfx, mw, mh, cs, bd.bitmap(), &rects) {
             eprintln!("mswidgets: rebuild: {e}");
         }
+        self.scene.params.card_k = self.ui.look.card_k; // the applied card scale
         self.backdrop = Some(bd);
+        // cards that got room again come back
+        for sp in &specs {
+            if self.scene.index_of_id(&sp.id).is_none() {
+                self.spawn_card(sp, false);
+            }
+        }
         self.ui.set_screen(s, mw as f32 / s, mh as f32 / s);
         self.springs.clear();
         let r = self.desired_window();
@@ -2197,9 +2564,19 @@ impl App {
         if (new.glass - old.glass).abs() > 1e-4 {
             self.apply_glass(new.glass);
         }
+        self.ui.appearance = new.appearance;
+        self.ui.dim_mode = new.dim;
         if new.live != old.live {
             self.ui.live = new.live;
             self.rebuild(true);
+        }
+        // `widgetsLook` edited behind our back (the sliders of the Tauri app / by hand)
+        let look = layout::read_look();
+        if look != self.look_cfg {
+            self.look_cfg = look;
+            self.ui.look = crate::glass::apply_look(&self.look_base, &self.look_cfg);
+            self.apply_look_now();
+            self.apply_card_scale();
         }
     }
 
@@ -2288,7 +2665,7 @@ impl App {
             self.app_front = front;
             self.update_dim();
         }
-        let fs = foreground_is_fullscreen(self.hwnd);
+        let fs = self.user_hidden || foreground_is_fullscreen(self.hwnd);
         if fs && self.visible {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
             self.visible = false;
