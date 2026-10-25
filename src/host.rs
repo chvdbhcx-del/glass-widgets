@@ -250,6 +250,8 @@ struct App {
     panels_saved: ((f32, f32), (f32, f32)),
     /// the update check in flight was the silent one at start (an available update is a toast, a failure is not shown)
     update_silent: bool,
+    /// the panel state to go back to when "Update now" fails (the available update with its asset)
+    update_prev: Option<UpdateState>,
     /// `accentMode` "wallpaper": the wallpaper file (and its time) the accent was taken from; a change recomputes it
     accent_key: Option<(String, Option<SystemTime>)>,
     /// live-backdrop accent: when it was last taken and what was picked (a new pick that is close to it is ignored: no flicker on video wallpapers)
@@ -570,6 +572,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         look_commit: None,
         panels_saved: panels,
         update_silent: false,
+        update_prev: None,
         accent_key,
         accent_last: Instant::now() - Duration::from_secs(60),
         accent_cur: accent_rgb,
@@ -671,7 +674,7 @@ fn unpack(lp: isize) -> (i32, i32) {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
-        WM_TIMER | WM_BACKDROP | WM_HOTKEY | WM_WIDGET | update::WM_UPDATE | WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
+        WM_TIMER | WM_BACKDROP | WM_HOTKEY | WM_WIDGET | update::WM_UPDATE | update::WM_UPDATE_DL | WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
             with_app(|app| app.on_msg(msg, wp.0));
             LRESULT(0)
         }
@@ -873,6 +876,7 @@ impl App {
                 let _ = DestroyWindow(self.hwnd);
             }
             (update::WM_UPDATE, _) => self.update_done(),
+            (update::WM_UPDATE_DL, p) => self.install_progress(p),
             (WM_BACKDROP, _) => {
                 let mask = self.bd().take_dirty();
                 if mask != 0 && self.visible {
@@ -1418,7 +1422,7 @@ impl App {
         let old = self.ui.hover;
         self.ui.hover = h;
         // only hovers that change how something looks need a frame
-        let looks = |h: Hit| matches!(h, Hit::Minus(_) | Hit::Group(_) | Hit::Item(_) | Hit::Done | Hit::SettingsBtn | Hit::Look(..) | Hit::Opt(..) | Hit::Autostart | Hit::CheckStart | Hit::UpdBtn | Hit::UpdDownload | Hit::ResetLook | Hit::EditBtn | Hit::QuitBtn);
+        let looks = |h: Hit| matches!(h, Hit::Minus(_) | Hit::Group(_) | Hit::Item(_) | Hit::Done | Hit::SettingsBtn | Hit::Look(..) | Hit::Opt(..) | Hit::Autostart | Hit::CheckStart | Hit::UpdBtn | Hit::UpdInstall | Hit::UpdPage | Hit::ResetLook | Hit::EditBtn | Hit::QuitBtn);
         if looks(old) || looks(h) {
             let mut d: Option<RECT> = None;
             for r in [self.hover_dirty(old), self.hover_dirty(h)].into_iter().flatten() {
@@ -1616,9 +1620,10 @@ impl App {
             Hit::Autostart => self.toggle_autostart(),
             Hit::CheckStart => self.toggle_check_start(),
             Hit::UpdBtn => self.start_update_check(false),
-            Hit::UpdDownload => {
+            Hit::UpdInstall => self.start_install(),
+            Hit::UpdPage => {
                 if let UpdateState::Available { url, .. } = self.ui.update.clone() {
-                    crate::sys::perform(&crate::sys::Action::Open(url)); // the release page in the browser; nothing is downloaded here
+                    crate::sys::perform(&crate::sys::Action::Open(url)); // the release page in the browser
                 }
             }
             Hit::EditBtn => self.switch_panel(false),
@@ -2749,7 +2754,7 @@ impl App {
 
     /// One GET of the latest release on a worker thread (`silent` = the check at start: only an available update is announced, as a toast).
     unsafe fn start_update_check(&mut self, silent: bool) {
-        if self.ui.update == UpdateState::Checking {
+        if matches!(self.ui.update, UpdateState::Checking | UpdateState::Downloading(_) | UpdateState::Verifying) {
             return;
         }
         self.update_silent = silent;
@@ -2768,6 +2773,55 @@ impl App {
             let msg = self.ui.lang.pick(&format!("Доступна новая версия {version}"), &format!("Version {version} is available")).to_string();
             self.show_toast(msg);
         }
+        if self.ui.settings {
+            self.redraw_ui();
+        }
+    }
+
+    /// "Update now" (the user's click): download the installer of the available update and check its SHA-256 on a worker thread.
+    unsafe fn start_install(&mut self) {
+        let UpdateState::Available { version, asset, .. } = self.ui.update.clone() else { return };
+        self.update_prev = Some(self.ui.update.clone());
+        let Some(asset) = asset else {
+            self.install_failed("the release has no installer with a checksum".into());
+            return;
+        };
+        self.ui.update = UpdateState::Downloading(0);
+        update::start_install(self.hwnd.0 as isize, &version, asset);
+        self.redraw_ui();
+    }
+
+    /// `WM_UPDATE_DL`: download percent, "verifying", or the end of the worker.
+    unsafe fn install_progress(&mut self, p: usize) {
+        match p {
+            update::DL_DONE => match update::take_install() {
+                Some(Ok(v)) => {
+                    self.flush_look_commit();
+                    match update::launch(v) {
+                        // the installer closes this copy itself; leaving now keeps its file replacement from racing with us
+                        Ok(()) => {
+                            let _ = DestroyWindow(self.hwnd);
+                        }
+                        Err(e) => self.install_failed(e),
+                    }
+                }
+                Some(Err(e)) => self.install_failed(e),
+                None => {}
+            },
+            update::DL_VERIFYING => self.ui.update = UpdateState::Verifying,
+            p => self.ui.update = UpdateState::Downloading(p.min(100) as u8),
+        }
+        if self.ui.settings {
+            self.redraw_ui();
+        }
+    }
+
+    /// Back to the available update, with the reason shown in the status line (the button stays for a retry).
+    unsafe fn install_failed(&mut self, why: String) {
+        self.ui.update = match self.update_prev.take() {
+            Some(UpdateState::Available { version, url, asset, .. }) => UpdateState::Available { version, url, asset, error: Some(why) },
+            _ => UpdateState::Failed,
+        };
         if self.ui.settings {
             self.redraw_ui();
         }

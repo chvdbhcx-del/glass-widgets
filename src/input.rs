@@ -264,7 +264,7 @@ const EM_GETLINECOUNT: u32 = 0x00BA;
 fn c8(c: (u8, u8, u8), a: f32) -> D2D1_COLOR_F {
     col(c.0 as f32 / 255.0, c.1 as f32 / 255.0, c.2 as f32 / 255.0, a)
 }
-fn acc(a: f32) -> D2D1_COLOR_F {
+pub(crate) fn acc(a: f32) -> D2D1_COLOR_F {
     col(accent().r, accent().g, accent().b, a)
 }
 fn white(a: f32) -> D2D1_COLOR_F {

@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- One-click self-update: when the update check finds a newer version, "Update now" downloads `GlassWidgets_<version>_x64-setup.exe` (HTTPS, github.com and its release CDN only, at most 20 MB, progress in the status line), verifies its SHA-256 against the `digest` GitHub publishes for the asset and, only if it matches, runs it with `/S /UPDATE`; the installer replaces the app and starts it again. A missing / malformed digest or a mismatch deletes the file and shows an error. "Release page" keeps the old behaviour (opens the release in the browser). Opt-in by the click, never automatic.
+
+### Changed
+- The accent colour (blue, or from the wallpaper) now also colours the chrome of the panels: the "Done" button, the selected gallery group, the add badge, the focus rings and the search selection (a deeper shade of the accent where white text sits on it). The switches stay green.
+
 ## [0.3.0] - 2026-10-25
 
 ### Added

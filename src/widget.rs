@@ -399,6 +399,13 @@ pub fn accent() -> Color {
 pub fn set_accent(rgb: Option<[u8; 3]>) -> bool {
     ACCENT_NOW.swap(pack_rgb(rgb.unwrap_or(ACCENT_RGB)), Ordering::Relaxed) != pack_rgb(rgb.unwrap_or(ACCENT_RGB))
 }
+/// The accent for the panels' chrome that carries white text or a selection (Done, the selected gallery group, the add badge): the same hue
+/// as `accent()`, darker so white reads on it; `hot` = lighter (pointer over it).
+pub fn accent_fill(hot: bool) -> Color {
+    let v = ACCENT_NOW.load(Ordering::Relaxed);
+    let c = crate::accent::fill([(v >> 16) as u8, (v >> 8) as u8, v as u8], if hot { 0.07 } else { 0.0 });
+    Color::rgb8(c[0], c[1], c[2])
+}
 /// dark text on a light/cream fill (today circle, buttons)
 pub const INK: Color = Color::rgba(20.0 / 255.0, 20.0 / 255.0, 24.0 / 255.0, 0.92);
 pub const BLACK: Color = Color::rgba(0.0, 0.0, 0.0, 1.0);

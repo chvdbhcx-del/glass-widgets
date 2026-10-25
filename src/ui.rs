@@ -186,10 +186,11 @@ pub enum Hit {
     Look(usize, f32),
     Opt(Opt, usize),
     Autostart,
-    /// the "Check on start" switch, the "Check for updates" button, the "Download" button of an available update
+    /// the "Check on start" switch, the "Check for updates" button, the "Update now" and "Release page" buttons of an available update
     CheckStart,
     UpdBtn,
-    UpdDownload,
+    UpdInstall,
+    UpdPage,
     ResetLook,
     EditBtn,
     QuitBtn,
@@ -421,9 +422,10 @@ pub struct SetLay {
     pub quit_btn: Rect,
     pub keys: Rect,
     pub done: Rect,
-    /// footer: "Check for updates", its status line, "Download" (only offered for an available update)
+    /// footer: "Check for updates", its status line, "Release page" and "Update now" (both only offered for an available update)
     pub upd_btn: Rect,
     pub upd_status: Rect,
+    pub upd_page: Rect,
     pub upd_dl: Rect,
     pub foot: Rect,
 }
@@ -679,6 +681,7 @@ impl Ui {
         let done = Rect::new(p.right() - 16.0 - 82.0, fy, 82.0, 30.0);
         let upd_btn = Rect::new(p.x + 22.0, fy, 176.0, 30.0);
         let upd_dl = Rect::new(done.x - 8.0 - 112.0, fy, 112.0, 30.0);
+        let upd_page = Rect::new(upd_dl.x - 8.0 - 100.0, fy, 100.0, 30.0);
         let sx = upd_btn.right() + 12.0;
         SetLay {
             panel: p,
@@ -698,7 +701,8 @@ impl Ui {
             keys: Rect::new(rx, by + 44.0, rw, (p.bottom() - SET_FOOT - 10.0 - (by + 44.0)).max(0.0)),
             done,
             upd_btn,
-            upd_status: Rect::new(sx, p.bottom() - SET_FOOT, upd_dl.x - 8.0 - sx, SET_FOOT),
+            upd_status: Rect::new(sx, p.bottom() - SET_FOOT, upd_page.x - 8.0 - sx, SET_FOOT),
+            upd_page,
             upd_dl,
             foot: Rect::new(p.x + 14.0, p.bottom() - SET_FOOT, p.w - 28.0, 0.8),
         }
@@ -719,8 +723,13 @@ impl Ui {
         if l.upd_btn.contains(lx, ly) {
             return Hit::UpdBtn;
         }
-        if l.upd_dl.contains(lx, ly) && matches!(self.update, UpdateState::Available { .. }) {
-            return Hit::UpdDownload;
+        if matches!(self.update, UpdateState::Available { .. }) {
+            if l.upd_dl.contains(lx, ly) {
+                return Hit::UpdInstall;
+            }
+            if l.upd_page.contains(lx, ly) {
+                return Hit::UpdPage;
+            }
         }
         if let Some(i) = l.rows.iter().position(|r| r.track.inset_xy(-12.0, -(r.row.h / 2.0 - 2.0)).contains(lx, ly)) {
             return Hit::Look(i, ((lx - l.rows[i].track.x) / l.rows[i].track.w).clamp(0.0, 1.0));
@@ -790,13 +799,13 @@ impl Ui {
     }
 
     /// The k-th control of the settings panel in reading order (headless `--hover k`): the sliders, "Reset look", one option of each
-    /// segmented control, the switches, "Edit widgets", "Quit", "Check for updates", "Download", "Done".
+    /// segmented control, the switches, "Edit widgets", "Quit", "Check for updates", "Update now", "Release page", "Done".
     pub fn nth_control(&self, k: usize) -> Hit {
         let n = 1 + LOOK.len();
         if k < n {
             return Hit::Look(k, self.set_pos(k));
         }
-        [Hit::ResetLook, Hit::Opt(Opt::Appearance, 1), Hit::Opt(Opt::Dim, 0), Hit::Opt(Opt::Source, 1), Hit::Opt(Opt::Accent, 1), Hit::Opt(Opt::Monitor, 0), Hit::Autostart, Hit::CheckStart, Hit::EditBtn, Hit::QuitBtn, Hit::UpdBtn, Hit::UpdDownload, Hit::Done].get(k - n).copied().unwrap_or(Hit::None)
+        [Hit::ResetLook, Hit::Opt(Opt::Appearance, 1), Hit::Opt(Opt::Dim, 0), Hit::Opt(Opt::Source, 1), Hit::Opt(Opt::Accent, 1), Hit::Opt(Opt::Monitor, 0), Hit::Autostart, Hit::CheckStart, Hit::EditBtn, Hit::QuitBtn, Hit::UpdBtn, Hit::UpdInstall, Hit::UpdPage, Hit::Done].get(k - n).copied().unwrap_or(Hit::None)
     }
 
     // ------------------------------------------------ keyboard / wheel on the sliders
@@ -1324,7 +1333,7 @@ impl Ui {
             cx.circle((kx, tb.track.cy() + 1.5), 9.0, Color::rgba(0.0, 0.0, 0.0, 0.25));
             cx.circle((kx, tb.track.cy()), 8.0, Color::rgba(1.0, 1.0, 1.0, 0.97));
             if self.sfocus == Some(0) {
-                cx.circle_stroke((kx, tb.track.cy()), 11.5, 2.0, BLUE.alpha(0.95));
+                cx.circle_stroke((kx, tb.track.cy()), 11.5, 2.0, accent().alpha(0.95));
             }
             cx.rect(tb.sep, FILL);
             cx.text(tb.label_bg, self.t("Фон", "Back"), Style::new(12.5, 500), TEXT);
@@ -1358,7 +1367,7 @@ impl Ui {
         cx.circle((kx, t.cy() + 1.5), kr + 1.0, Color::rgba(0.0, 0.0, 0.0, 0.25));
         cx.circle((kx, t.cy()), kr, Color::rgba(1.0, 1.0, 1.0, 0.97));
         if focus {
-            cx.circle_stroke((kx, t.cy()), kr + 3.5, 2.0, BLUE.alpha(0.95));
+            cx.circle_stroke((kx, t.cy()), kr + 3.5, 2.0, accent().alpha(0.95));
         }
     }
 
@@ -1457,22 +1466,26 @@ impl Ui {
 
             // footer
             cx.rect(l.foot, FILL);
-            let busy = self.update == UpdateState::Checking;
+            let busy = matches!(self.update, UpdateState::Checking | UpdateState::Downloading(_) | UpdateState::Verifying);
             self.set_button(cx, l.upd_btn, self.t("Проверить обновления", "Check for updates"), hv == Hit::UpdBtn && !busy, pr == Hit::UpdBtn && !busy, if busy { DIM } else { TEXT });
             let (msg, color) = match &self.update {
                 UpdateState::Idle => (format!("{} {}", self.t("Версия", "Version"), env!("CARGO_PKG_VERSION")), FAINT),
                 UpdateState::Checking => (self.t("Проверка…", "Checking…").to_string(), DIM),
                 UpdateState::Latest => (self.t("У вас последняя версия", "You have the latest version").to_string(), Color::rgb8(52, 199, 89)),
+                UpdateState::Available { error: Some(e), .. } => (if self.lang == Lang::Ru { format!("Не удалось обновить: {e}") } else { format!("Update failed: {e}") }, ORANGE),
                 UpdateState::Available { version, .. } => (if self.lang == Lang::Ru { format!("Доступна версия {version}") } else { format!("Version {version} is available") }, TEXT),
+                UpdateState::Downloading(p) => (if self.lang == Lang::Ru { format!("Загрузка обновления… {p}%") } else { format!("Downloading the update… {p}%") }, TEXT),
+                UpdateState::Verifying => (self.t("Проверка контрольной суммы…", "Verifying the checksum…").to_string(), TEXT),
                 UpdateState::Failed => (self.t("Не удалось проверить", "Could not check").to_string(), ORANGE),
             };
             cx.text(l.upd_status, &msg, Style::new(12.0, 500).ellipsis(), color);
             if matches!(self.update, UpdateState::Available { .. }) {
-                self.set_button(cx, l.upd_dl, self.t("Скачать", "Download"), hv == Hit::UpdDownload, pr == Hit::UpdDownload, Color::rgb8(100, 190, 255));
+                self.set_button(cx, l.upd_page, self.t("О релизе", "Release page"), hv == Hit::UpdPage, pr == Hit::UpdPage, DIM);
+                self.set_button(cx, l.upd_dl, self.t("Обновить", "Update now"), hv == Hit::UpdInstall, pr == Hit::UpdInstall, accent());
             }
             let hot = hv == Hit::Done || pr == Hit::Done;
-            cx.pill(l.done.offset(0.0, 2.0).inset_xy(2.0, 0.0), BLUE.alpha(0.40));
-            cx.pill(l.done, if hot { Color::rgb8(43, 149, 255) } else { Color::rgb8(10, 132, 255) });
+            cx.pill(l.done.offset(0.0, 2.0).inset_xy(2.0, 0.0), accent_fill(false).alpha(0.40));
+            cx.pill(l.done, accent_fill(hot));
             cx.text(l.done, self.t("Готово", "Done"), Style::new(13.0, 600).center(), WHITE);
         });
         if layer {
@@ -1497,8 +1510,8 @@ impl Ui {
             let focus = self.st.focus;
             cx.rrect(l.search, 9.0, Color::rgba(1.0, 1.0, 1.0, if focus { 0.16 } else { 0.12 }));
             if focus {
-                cx.rrect_stroke(l.search.inset(-2.0), 11.0, 3.0, BLUE.alpha(0.30));
-                cx.rrect_stroke(l.search, 9.0, 1.6, BLUE.alpha(0.95));
+                cx.rrect_stroke(l.search.inset(-2.0), 11.0, 3.0, accent().alpha(0.30));
+                cx.rrect_stroke(l.search, 9.0, 1.6, accent().alpha(0.95));
             }
             cx.icon(Glyph::Search, Rect::new(l.search.x + 9.0, l.search.cy() - 7.0, 14.0, 14.0), DIM);
             let text_area = Rect::new(l.search.x + 30.0, l.search.y, l.search.w - 38.0, l.search.h);
@@ -1510,7 +1523,7 @@ impl Ui {
             } else {
                 let tw = cx.measure(&q, Style::BODY, 4096.0).0;
                 if self.st.query.sel_all {
-                    cx.rrect(Rect::new(text_area.x - off - 1.0, text_area.cy() - 9.0, tw + 2.0, 18.0), 4.0, BLUE.alpha(0.55));
+                    cx.rrect(Rect::new(text_area.x - off - 1.0, text_area.cy() - 9.0, tw + 2.0, 18.0), 4.0, accent_fill(false).alpha(0.75));
                 }
                 cx.text(Rect::new(text_area.x - off, text_area.y, 4096.0, text_area.h), &q, Style::BODY, TEXT);
             }
@@ -1532,7 +1545,7 @@ impl Ui {
                 }
                 let sel = !searching && cur == Some(g.id);
                 if sel {
-                    cx.rrect(r, 9.0, Color::rgba(10.0 / 255.0, 132.0 / 255.0, 1.0, 0.92));
+                    cx.rrect(r, 9.0, accent_fill(false).alpha(0.92));
                 } else if self.hover == Hit::Group(i) {
                     cx.rrect(r, 9.0, FILL);
                 }
@@ -1580,7 +1593,7 @@ impl Ui {
                     cx.rrect_stroke(it.pv.inset(-2.0), 17.0 * K + 2.0, 1.4, Color::rgba(1.0, 1.0, 1.0, 0.35));
                     let b = (it.pv.x + 14.0, it.pv.y + 14.0);
                     cx.circle((b.0, b.1 + 1.0), 12.0, Color::rgba(0.0, 0.0, 0.0, 0.25));
-                    cx.circle(b, 11.0, Color::rgba(10.0 / 255.0, 132.0 / 255.0, 1.0, 0.97));
+                    cx.circle(b, 11.0, accent_fill(false).alpha(0.97));
                     cx.line((b.0 - 4.6, b.1), (b.0 + 4.6, b.1), 1.9, WHITE);
                     cx.line((b.0, b.1 - 4.6), (b.0, b.1 + 4.6), 1.9, WHITE);
                 }
@@ -1595,8 +1608,8 @@ impl Ui {
             cx.rect(Rect::new(p.x + 14.0, p.bottom() - FOOT_H, p.w - 28.0, 0.8), FILL);
             cx.text(l.hint, self.t("Перетащите виджет на рабочий стол…", "Drag a widget to place it on the desktop…"), Style::new(12.5, 600).ellipsis(), TEXT);
             let hot = self.hover == Hit::Done || self.press == Hit::Done;
-            cx.pill(l.done.offset(0.0, 2.0).inset_xy(2.0, 0.0), BLUE.alpha(0.40));
-            cx.pill(l.done, if hot { Color::rgb8(43, 149, 255) } else { Color::rgb8(10, 132, 255) });
+            cx.pill(l.done.offset(0.0, 2.0).inset_xy(2.0, 0.0), accent_fill(false).alpha(0.40));
+            cx.pill(l.done, accent_fill(hot));
             cx.text(l.done, self.t("Готово", "Done"), Style::new(13.0, 600).center(), WHITE);
         });
         if layer {
@@ -1702,6 +1715,24 @@ mod tests {
         assert!(ui.panel_rect().x < s0.x && ui.gallery_rect().y == p.y);
     }
 
+    /// The panel chrome (Done, selection, focus rings) and the text prompt's accent take the colour of `set_accent`, not a fixed blue. This is the only
+    /// test that moves the process-wide accent (it puts the default back).
+    #[test]
+    fn panel_chrome_follows_the_accent() {
+        set_accent(None);
+        let (blue, blue_hot, blue_ring, blue_prompt) = (accent_fill(false), accent_fill(true), accent(), crate::input::acc(1.0));
+        assert!(blue.b > blue.r && blue_ring.b > blue_ring.r && blue_prompt.b > blue_prompt.r);
+        assert!(blue_hot.r + blue_hot.g + blue_hot.b > blue.r + blue.g + blue.b, "hover is lighter");
+        assert!(set_accent(Some([230, 70, 70])), "a new accent reports a change");
+        let (red, red_hot, red_ring, red_prompt) = (accent_fill(false), accent_fill(true), accent(), crate::input::acc(1.0));
+        for c in [red.r > red.b && red.r > red.g, red_hot.r > red_hot.b, red_ring.r > red_ring.b && red_ring.r > red_ring.g, red_prompt.r > red_prompt.b && red_prompt.r > red_prompt.g] {
+            assert!(c, "chrome stays blue after set_accent");
+        }
+        assert!((red_ring.r, red_ring.g, red_ring.b) == (red_prompt.r, red_prompt.g, red_prompt.b) && red.r < red_ring.r + 0.01 && red.r + red.g + red.b < red_ring.r + red_ring.g + red_ring.b, "the fill is the deeper shade of the ring");
+        set_accent(None);
+        assert_eq!((accent_fill(false).b > accent_fill(false).r, accent().b > accent().r), (true, true));
+    }
+
     /// The hit map of edit mode on a real scene: card body, "−" button, gallery controls, previews, settings strip, empty desk.
     #[test]
     fn edit_mode_hit_map() {
@@ -1788,11 +1819,11 @@ mod tests {
             for o in &l.opts {
                 assert!(inside(o.seg) && inside(o.label) && o.label.right() <= o.seg.x + 0.01);
             }
-            for r in [l.reset, l.auto_row, l.auto_sw, l.check_row, l.check_sw, l.edit_btn, l.quit_btn, l.done, l.upd_btn, l.upd_status, l.upd_dl] {
+            for r in [l.reset, l.auto_row, l.auto_sw, l.check_row, l.check_sw, l.edit_btn, l.quit_btn, l.done, l.upd_btn, l.upd_status, l.upd_page, l.upd_dl] {
                 assert!(inside(r), "{r:?}");
             }
             // the footer line is one row: update button, status, download, Done, none over another; the right column does not run into the footer
-            assert!(l.upd_btn.right() <= l.upd_status.x && l.upd_status.right() <= l.upd_dl.x && l.upd_dl.right() <= l.done.x && l.upd_status.w > 150.0);
+            assert!(l.upd_btn.right() <= l.upd_status.x && l.upd_status.right() <= l.upd_page.x && l.upd_page.right() <= l.upd_dl.x && l.upd_dl.right() <= l.done.x && l.upd_status.w > 150.0);
             assert!(l.auto_row.bottom() <= l.check_row.y && l.check_row.bottom() <= l.edit_btn.y && l.edit_btn.bottom() <= l.foot.y && l.keys.bottom() <= l.foot.y + 0.01);
             assert!(l.edit_btn.right() <= l.quit_btn.x && l.rows.iter().all(|r| r.value.right() <= l.sep.x));
             // sliders: the track ends map to 0 / 1, the middle to ~0.5; a click in the label column does not move a slider
@@ -1821,14 +1852,16 @@ mod tests {
             assert_eq!(ui.set_hit(l.check_sw.cx(), l.check_sw.cy()), Hit::CheckStart);
             assert_eq!(ui.set_hit(l.upd_btn.cx(), l.upd_btn.cy()), Hit::UpdBtn);
             assert_eq!(ui.set_hit(l.upd_status.x + 2.0, l.upd_status.cy()), Hit::Panel);
-            // "Download" exists only for an available update
+            // "Update now" and "Release page" exist only for an available update
+            assert_eq!((ui.set_hit(l.upd_dl.cx(), l.upd_dl.cy()), ui.set_hit(l.upd_page.cx(), l.upd_page.cy())), (Hit::Panel, Hit::Panel));
+            ui.update = UpdateState::Available { version: "9.9.9".into(), url: "https://github.com/x".into(), asset: None, error: None };
+            assert_eq!((ui.set_hit(l.upd_dl.cx(), l.upd_dl.cy()), ui.set_hit(l.upd_page.cx(), l.upd_page.cy())), (Hit::UpdInstall, Hit::UpdPage));
+            ui.update = UpdateState::Downloading(5);
             assert_eq!(ui.set_hit(l.upd_dl.cx(), l.upd_dl.cy()), Hit::Panel);
-            ui.update = UpdateState::Available { version: "9.9.9".into(), url: "https://github.com/x".into() };
-            assert_eq!(ui.set_hit(l.upd_dl.cx(), l.upd_dl.cy()), Hit::UpdDownload);
             assert_eq!(ui.set_hit(p.x - 1.0, p.cy()), Hit::None);
             assert_eq!(ui.set_hit(1.0, 1.0), Hit::None);
             // reading order for the headless --hover
-            assert!(matches!(ui.nth_control(0), Hit::Look(0, _)) && ui.nth_control(l.rows.len() + 12) == Hit::Done && ui.nth_control(99) == Hit::None);
+            assert!(matches!(ui.nth_control(0), Hit::Look(0, _)) && ui.nth_control(l.rows.len() + 13) == Hit::Done && ui.nth_control(99) == Hit::None);
         }
     }
 
@@ -1982,7 +2015,7 @@ pub struct DumpArgs {
     pub appearance: Option<crate::motion::AppearancePref>,
     /// `--look '{"blur":9,...}'`: a `widgetsLook` object for the render (default: the user's config.json; a sample for `--state settings`)
     pub look: Option<String>,
-    /// `--update-state idle|checking|latest|available|failed`: the update line of the settings panel (sample)
+    /// `--update-state idle|checking|latest|available|update-failed|downloading|verifying|failed`: the update line of the settings panel (sample)
     pub update_state: Option<String>,
     /// `--monitors count,selected`: the "Monitor" control of the settings panel (sample: two monitors, the first one)
     pub monitors: Option<(usize, usize)>,
@@ -2062,7 +2095,10 @@ pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
     ui.update = match a.update_state.as_deref() {
         Some("checking") => UpdateState::Checking,
         Some("latest") => UpdateState::Latest,
-        Some("available") => UpdateState::Available { version: "0.3.0".into(), url: "https://github.com/".into() },
+        Some("available") => UpdateState::Available { version: "0.3.0".into(), url: "https://github.com/".into(), asset: None, error: None },
+        Some("update-failed") => UpdateState::Available { version: "0.3.0".into(), url: "https://github.com/".into(), asset: None, error: Some("checksum mismatch".into()) },
+        Some("downloading") => UpdateState::Downloading(42),
+        Some("verifying") => UpdateState::Verifying,
         Some("failed") => UpdateState::Failed,
         _ => UpdateState::Idle,
     };
