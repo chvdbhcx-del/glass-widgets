@@ -8,10 +8,13 @@ pub mod calendar;
 pub mod clipboard;
 pub mod clock;
 pub mod controls;
+pub mod countdown;
+pub mod crypto;
 pub mod dev;
 pub mod disks;
 pub mod music;
 pub mod network;
+pub mod nextevent;
 pub mod notes;
 pub mod photos;
 pub mod processes;
@@ -44,6 +47,9 @@ pub fn register_all(r: &mut Registry) {
     photos::register(r);
     rates::register(r);
     quote::register(r);
+    nextevent::register(r);
+    countdown::register(r);
+    crypto::register(r);
     controls::register(r);
     dev::register(r); // hidden developer tool (id starts with '_')
 }

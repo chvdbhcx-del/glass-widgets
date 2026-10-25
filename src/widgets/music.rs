@@ -310,9 +310,9 @@ fn lay(size: Size) -> Lay {
         Size::S => Lay {
             cover: Rect::new(0.0, 0.0, 170.0, 170.0),
             pill: Some(Rect::new(8.0, 118.0, 154.0, 44.0)),
-            title: Rect::new(22.0, 122.0, 96.0, 18.0),
+            title: Rect::new(20.0, 122.0, 100.0, 18.0),
             tsz: 13.0,
-            artist: Rect::new(22.0, 140.0, 96.0, 15.0),
+            artist: Rect::new(20.0, 140.0, 100.0, 15.0),
             eq: None,
             prog: None,
             times: None,
@@ -368,8 +368,10 @@ struct Music {
     cover: Option<Bitmap>,
     accent: Color,
     hue: f32,
-    /// natural width of the title (for the marquee decision)
+    /// natural width of the title at `tsz` (for the marquee decision)
     title_w: f32,
+    /// title font size: the layout's, stepped down by up to 2 px so a longish title fits without scrolling
+    tsz: f32,
     /// hovered control: 0 none, 1 prev, 2 play-pause, 3 next
     hov: u8,
     /// equalizer bars: (angular speed rad/s, phase, amplitude)
@@ -407,6 +409,7 @@ impl Music {
             accent: PINK,
             hue: 330.0,
             title_w: 0.0,
+            tsz: 13.0,
             hov: 0,
             bars,
         }
@@ -425,14 +428,21 @@ impl Music {
         }
     }
 
-    fn title_style(l: &Lay) -> Style {
-        Style::new(l.tsz, 600)
+    fn title_style(&self) -> Style {
+        Style::new(self.tsz, 600)
     }
 
     fn set_title(&mut self, cx: &Cx, title: &str) {
         self.title = title.to_string();
         self.hue = hash_hue(&format!("{}{}", self.title, self.artist));
-        self.title_w = cx.measure(&self.title, Self::title_style(&lay(cx.size)), 0.0).0;
+        let l = lay(cx.size);
+        let (tsz, w) = [l.tsz, l.tsz - 1.0, l.tsz - 2.0]
+            .iter()
+            .map(|&z| (z, cx.measure(&self.title, Style::new(z, 600), 0.0).0))
+            .find(|&(_, w)| w <= l.title.w)
+            .unwrap_or_else(|| (l.tsz - 2.0, cx.measure(&self.title, Style::new(l.tsz - 2.0, 600), 0.0).0));
+        self.tsz = tsz;
+        self.title_w = w;
     }
 
     /// Pull the worker's latest snapshot into the UI state; bump the version when something visible changed.
@@ -567,7 +577,7 @@ impl Music {
     }
 
     fn title_text(&self, cx: &Cx, l: &Lay, off: f32) {
-        let st = Self::title_style(l);
+        let st = self.title_style();
         if off == 0.0 {
             cx.text(l.title, &self.title, st.ellipsis(), TEXT);
         } else {

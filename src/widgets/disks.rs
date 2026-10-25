@@ -230,9 +230,16 @@ fn drive_row(cx: &Cx, r: Rect, d: &Drive, tall: bool) {
         cx.bar(Rect::new(x, r.y + 27.0, w, 6.0), d.used_pct() / 100.0, d.color());
         cx.text(Rect::new(x, r.y + 34.0, w, 14.0), &free, Style::CAPTION.ellipsis(), SUBTLE);
     } else {
-        // the name keeps the left, the free / total text the right (SUBTLE: readable on bright glass); a clear gap above the bar
-        cx.text(Rect::new(x, r.y, w * 0.5, 18.0), &d.name(lang), Style::BODY.ellipsis(), TEXT);
-        cx.text(Rect::new(x + w * 0.5, r.y + 1.0, w * 0.5, 18.0), &free, Style::new(11.0, 500).right().ellipsis(), SUBTLE);
+        // the name keeps the left, the free / total text the right (SUBTLE: readable on bright glass); a clear gap above the bar.
+        // Both are measured: the long "свободно" wording gives way to a short one before the name has to be cut.
+        let name = d.name(lang);
+        let st = Style::new(11.0, 500);
+        let nw = cx.measure(&name, Style::BODY, 0.0).0;
+        let short = format!("{} {} {}", fmt_size(d.free, lang), cx.t("из", "of"), fmt_size(d.total, lang));
+        let txt = if nw + cx.measure(&free, st, 0.0).0 + 12.0 <= w { &free } else { &short };
+        let fw = (cx.measure(txt, st, 0.0).0 + 2.0).min(w * 0.6);
+        cx.text(Rect::new(x, r.y, w - fw - 10.0, 18.0), &name, Style::BODY.ellipsis(), TEXT);
+        cx.text(Rect::new(r.right() - fw, r.y + 1.0, fw, 18.0), txt, st.right().ellipsis(), SUBTLE);
         cx.bar(Rect::new(x, r.y + 25.0, w, 6.0), d.used_pct() / 100.0, d.color());
     }
 }

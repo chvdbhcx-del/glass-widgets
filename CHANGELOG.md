@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Next event widget (S / M / L): the upcoming events of a local `.ics` file (`ics` setting; click to set the path). UTC, local and all-day times, simple DAILY / WEEKLY / MONTHLY / YEARLY repeats.
+- Crypto widget (S / M / L): prices and the 24 h change of a few coins from the public CoinGecko API (coins / currency in the settings). Network only while the card is on the desktop; previews use sample data.
+- Countdown widget (S / M / L): days left to a date you set, with a progress ring.
+
+### Fixed
+- Text that was cut with an ellipsis although it could fit: the weather condition (shorter wording), the music title in S (wider, steps down in size), long reminder titles in M (smaller font or two lines), disk rows (shorter "free of" wording), big prices in rates.
+
 ## [0.2.1] - 2026-10-25
 
 ### Changed
