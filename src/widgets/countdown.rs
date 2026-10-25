@@ -191,7 +191,7 @@ impl Widget for Countdown {
         let title = self.title_text(cx);
         match cx.size {
             Size::S => {
-                cx.text(Rect::new(c.x, c.y, c.w, 18.0), title, Style::TITLE.ellipsis(), DIM);
+                cx.text(Rect::new(c.x, c.y, c.w, 18.0), title, Style::TITLE.center().ellipsis(), DIM);
                 self.ring(cx, (c.cx(), c.y + 22.0 + 55.0), 51.0, 7.0, 36.0, left, frac);
             }
             Size::M => {
@@ -199,13 +199,15 @@ impl Widget for Countdown {
                 let x = c.x + 130.0;
                 let w = c.w - 130.0;
                 let st = [16.0, 14.0, 13.0].iter().map(|&z| Style::new(z, 600)).find(|&s| cx.measure(title, s, 0.0).0 <= w).unwrap_or(Style::new(13.0, 600));
-                cx.text(Rect::new(x, c.y + 6.0, w, 22.0), title, st.ellipsis(), TEXT);
+                // the text block (title, weeks, date, progress) is centred on the ring's centre line, like the ring itself
+                let top = c.cy() - 40.0;
+                cx.text(Rect::new(x, top, w, 22.0), title, st.ellipsis(), TEXT);
                 let weeks = if left > 0 { weeks_text(left, ru) } else { String::new() };
-                cx.text(Rect::new(x, c.y + 32.0, w, 20.0), &weeks, Style::new(14.0, 500).ellipsis(), TEXT);
-                cx.text(Rect::new(x, c.bottom() - 52.0, w, 16.0), &date_text(target, cx.lang), Style::CAPTION.ellipsis(), DIM);
+                cx.text(Rect::new(x, top + 26.0, w, 20.0), &weeks, Style::new(14.0, 500).ellipsis(), TEXT);
+                cx.text(Rect::new(x, top + 54.0, w, 16.0), &date_text(target, cx.lang), Style::CAPTION.ellipsis(), DIM);
                 let pct = (frac * 100.0).round() as i32;
-                cx.bar(Rect::new(x, c.bottom() - 26.0, w - 40.0, 5.0), frac, ring_color(left));
-                cx.text(Rect::new(c.right() - 36.0, c.bottom() - 32.0, 36.0, 16.0), &format!("{pct}%"), Style::CAPTION.mono().right(), DIM);
+                cx.bar(Rect::new(x, top + 77.0, w - 40.0, 5.0), frac, ring_color(left));
+                cx.text(Rect::new(c.right() - 36.0, top + 71.0, 36.0, 16.0), &format!("{pct}%"), Style::CAPTION.mono().right(), DIM);
             }
             Size::L => {
                 cx.text(Rect::new(c.x, c.y, c.w, 20.0), title, Style::new(15.0, 600).center().ellipsis(), TEXT);
