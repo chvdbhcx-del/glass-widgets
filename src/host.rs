@@ -2512,13 +2512,16 @@ impl App {
         self.set_window(r);
         self.ui.sync_panels(&mut self.scene, &self.gfx);
         self.sync_regions();
+        let all = self.all_mask();
+        // same order as at start: one frame while the GPU is quiet, THEN the capture thread (a new backdrop does nothing until started)
+        self.redraw(all | BIT_GALLERY | BIT_TOOLBAR, true);
+        self.bd().start();
         if self.use_dupl {
             let t = Instant::now();
-            while self.bd().take_dirty() == 0 && t.elapsed() < Duration::from_millis(400) {
+            while self.bd().take_dirty() == 0 && t.elapsed() < Duration::from_millis(600) {
                 std::thread::sleep(Duration::from_millis(15));
             }
         }
-        let all = self.all_mask();
         self.redraw(all | BIT_GALLERY | BIT_TOOLBAR, true);
         let d = RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h };
         self.frame(d);
