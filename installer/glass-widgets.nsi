@@ -99,6 +99,7 @@ Section "$(SEC_MAIN)" SecMain
   File "..\LICENSE"
   File "..\README.md"
   File "..\assets\fonts\OFL.txt"
+  File "..ssetsontsInter-LICENSE.txt"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateDirectory "$SMPROGRAMS\${NAME}"
   CreateShortcut "$SMPROGRAMS\${NAME}\${NAME}.lnk" "$INSTDIR\${EXE}"
