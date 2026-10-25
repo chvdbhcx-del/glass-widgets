@@ -25,7 +25,6 @@ pub fn register(r: &mut Registry) {
     });
 }
 
-const DOWN: Color = BLUE;
 const UP: Color = GREEN;
 const IF_LOOPBACK: u32 = 24;
 const IF_TUNNEL: u32 = 131;
@@ -168,14 +167,14 @@ impl Widget for Network {
         let c = cx.content();
         match cx.size {
             Size::S => {
-                cx.icon(Glyph::NetDown, Rect::new(c.x, c.y + 1.0, 14.0, 14.0), DOWN);
+                cx.icon(Glyph::NetDown, Rect::new(c.x, c.y + 1.0, 14.0, 14.0), accent());
                 cx.text(Rect::new(c.x + 19.0, c.y, c.w - 19.0, 16.0), &cx.t("ЗАГРУЗКА", "DOWNLOAD"), Style::LABEL.size(11.0), DIM);
                 cx.icon(Glyph::NetUp, Rect::new(c.x, c.y + 73.0, 14.0, 14.0), UP);
             }
             Size::M => {
                 for i in 0..2 {
                     let lane = m_lane(i);
-                    let (glyph, color, label) = if i == 0 { (Glyph::NetDown, DOWN, cx.t("ЗАГРУЗКА", "DOWNLOAD")) } else { (Glyph::NetUp, UP, cx.t("ОТДАЧА", "UPLOAD")) };
+                    let (glyph, color, label) = if i == 0 { (Glyph::NetDown, accent(), cx.t("ЗАГРУЗКА", "DOWNLOAD")) } else { (Glyph::NetUp, UP, cx.t("ОТДАЧА", "UPLOAD")) };
                     cx.icon(glyph, Rect::new(lane.x, lane.y + 1.0, 13.0, 13.0), color);
                     cx.text(Rect::new(lane.x + 18.0, lane.y, 96.0, 15.0), label, Style::LABEL.size(10.5), DIM);
                     cx.rrect(Rect::new(lane.x + 124.0, lane.y, lane.w - 124.0, lane.h), 9.0, PANEL);
@@ -203,13 +202,13 @@ impl Widget for Network {
                 }
                 let r = Rect::new(c.x, c.y + 96.0, c.w, 42.0);
                 let hi = scale_of(&self.down, Some(&self.up));
-                self.down.draw(cx, r, 0.0, hi, DOWN);
+                self.down.draw(cx, r, 0.0, hi, accent());
                 self.up.draw(cx, r, 0.0, hi, UP);
             }
             Size::M => {
                 for i in 0..2 {
                     let lane = m_lane(i);
-                    let (h, v, color) = if i == 0 { (&self.down, d, DOWN) } else { (&self.up, u, UP) };
+                    let (h, v, color) = if i == 0 { (&self.down, d, accent()) } else { (&self.up, u, UP) };
                     if self.online {
                         value_unit(cx, lane.x, lane.y + 14.0, lane.h - 14.0, v, 28.0, 50.0);
                     } else {

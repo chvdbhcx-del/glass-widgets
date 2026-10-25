@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0] - 2026-10-25
+
+### Changed
+- The wallpaper accent is now taken from the captured desktop (what is really on the screen, also a dynamic or slideshow wallpaper), not from the wallpaper file.
+- Rings and bars of Disks / System / Network follow the accent below the warning levels (orange and red stay); the calendar dims weekends and past days like Apple's.
 
 ### Added
 - One-click self-update: when the update check finds a newer version, "Update now" downloads `GlassWidgets_<version>_x64-setup.exe` (HTTPS, github.com and its release CDN only, at most 20 MB, progress in the status line), verifies its SHA-256 against the `digest` GitHub publishes for the asset and, only if it matches, runs it with `/S /UPDATE`; the installer replaces the app and starts it again. A missing / malformed digest or a mismatch deletes the file and shows an error. "Release page" keeps the old behaviour (opens the release in the browser). Opt-in by the click, never automatic.

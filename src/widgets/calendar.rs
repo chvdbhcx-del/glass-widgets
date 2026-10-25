@@ -78,7 +78,9 @@ fn month_block(cx: &Cx, x: f32, y: f32, w: f32, m: &Metrics, view: (i32, u32), t
             cx.text(cell, &num, st.weight(700), INK);
         } else {
             let past = (vy, vm, day) < (now.y, now.mo, now.d);
-            cx.text(cell, &num, st, if past { DIM } else { TEXT });
+            // like Apple's calendar: past days and the weekend columns are dimmer
+            let weekend = if sun_first { c == 0 || c == 6 } else { c >= 5 };
+            cx.text(cell, &num, st, if past || weekend { DIM } else { TEXT });
         }
     }
 }

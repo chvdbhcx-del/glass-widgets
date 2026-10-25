@@ -34,17 +34,18 @@ pub fn register(r: &mut Registry) {
 /// Faint panel behind graphs.
 pub(crate) const PANEL: Color = Color::rgba(1.0, 1.0, 1.0, 0.07);
 
-/// Green below `amber`, amber from `amber`, red from `red` (all in the same unit as `v`).
+/// The accent below `amber` (the system's accent colour, like Apple's rings and progress bars), amber from `amber`, red from `red`
+/// (all in the same unit as `v`). Warnings keep their own colours.
 pub(crate) fn level_color(v: f32, amber: f32, red: f32) -> Color {
     if v >= red {
         RED
     } else if v >= amber {
         ORANGE
     } else {
-        GREEN
+        accent()
     }
 }
-/// Load percentage ramp: green, amber > 70 %, red > 90 %.
+/// Load percentage ramp: accent, amber > 70 %, red > 90 %.
 pub(crate) fn load_color(pct: f32) -> Color {
     level_color(pct, 70.0, 90.0)
 }
@@ -701,11 +702,11 @@ mod tests {
 
     #[test]
     fn colour_ramp() {
-        assert_eq!(load_color(10.0), GREEN);
+        assert_eq!(load_color(10.0), accent());
         assert_eq!(load_color(70.0), ORANGE);
         assert_eq!(load_color(89.9), ORANGE);
         assert_eq!(load_color(90.0), RED);
-        assert_eq!(level_color(74.0, 75.0, 85.0), GREEN);
+        assert_eq!(level_color(74.0, 75.0, 85.0), accent());
         assert_eq!(level_color(80.0, 75.0, 85.0), ORANGE);
         assert_eq!(level_color(85.0, 75.0, 85.0), RED);
     }
