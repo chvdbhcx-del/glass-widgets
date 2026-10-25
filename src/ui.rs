@@ -663,6 +663,8 @@ impl Ui {
         let n = 1 + LOOK.len();
         let top = p.y + SET_TOP;
         let rh = ((p.bottom() - SET_FOOT - 12.0 - top) / n as f32).clamp(22.0, SET_ROW);
+        // the right column squeezes its rows on a short screen (the panel is capped at the screen height) so the buttons stay above the footer
+        let orow = ((p.bottom() - SET_FOOT - 14.0 - top - 40.0) / (Opt::ALL.len() + 2) as f32).clamp(28.0, OPT_ROW);
         let lx = p.x + 22.0;
         let lw = (p.w * 0.5).round();
         let rx = p.x + lw + 60.0;
@@ -677,13 +679,13 @@ impl Ui {
             .iter()
             .enumerate()
             .map(|(k, o)| {
-                let y = top + k as f32 * OPT_ROW;
+                let y = top + k as f32 * orow;
                 OptRow { which: *o, label: Rect::new(rx, y, 112.0, 28.0), seg: Rect::new(rx + 112.0, y + 2.0, rw - 112.0, 24.0) }
             })
             .collect();
-        let ay = top + Opt::ALL.len() as f32 * OPT_ROW;
-        let cy = top + (Opt::ALL.len() + 1) as f32 * OPT_ROW;
-        let by = top + (Opt::ALL.len() + 2) as f32 * OPT_ROW + 10.0;
+        let ay = top + Opt::ALL.len() as f32 * orow;
+        let cy = top + (Opt::ALL.len() + 1) as f32 * orow;
+        let by = top + (Opt::ALL.len() + 2) as f32 * orow + 10.0;
         let bw = ((rw - 8.0) * 0.6).round();
         let fy = p.bottom() - SET_FOOT + 13.0;
         let done = Rect::new(p.right() - 16.0 - 82.0, fy, 82.0, 30.0);
