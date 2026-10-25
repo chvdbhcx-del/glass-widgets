@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.9] - 2026-10-25
+
+### Changed
+- Weather L: the glyph, the condition and high / low sit next to the temperature instead of at the far right edge; "Today" in the daily list no longer truncates to "Сегод…".
+
 ## [0.5.8] - 2026-10-25
 
 ### Changed

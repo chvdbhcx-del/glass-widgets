@@ -493,11 +493,11 @@ impl Weather {
         for (i, d) in shown.iter().enumerate() {
             let y = 180.0 + i as f32 * 32.0;
             let name = if i == 0 { cx.t("Сегодня", "Today") } else { dow_short(cx.lang, d.dow) };
-            cx.text(Rect::new(16.0, y, 62.0, 32.0), name, Style::new(14.0, 500).ellipsis(), TEXT);
+            cx.text(Rect::new(16.0, y, 70.0, 32.0), name, Style::new(14.0, 500).ellipsis(), TEXT);
             let (k, _, _) = wmo(d.code, true);
-            draw_kind(cx, k, true, Rect::new(82.0, y + 6.0, 20.0, 20.0), TEXT);
-            cx.text(Rect::new(106.0, y, 36.0, 32.0), &fmt_t(d.lo, f), Style::new(14.0, 400).mono().right(), DIM);
-            let bar = Rect::new(150.0, y + 14.0, 148.0, 4.0);
+            draw_kind(cx, k, true, Rect::new(88.0, y + 6.0, 20.0, 20.0), TEXT);
+            cx.text(Rect::new(112.0, y, 34.0, 32.0), &fmt_t(d.lo, f), Style::new(14.0, 400).mono().right(), DIM);
+            let bar = Rect::new(152.0, y + 14.0, 146.0, 4.0);
             cx.pill(bar, FILL);
             let x0 = bar.x + bar.w * (d.lo - gmin) / span;
             let x1 = bar.x + bar.w * (d.hi - gmin) / span;
@@ -572,11 +572,12 @@ impl Widget for Weather {
                 self.city_row(cx, Rect::new(16.0, 16.0, 324.0, 18.0));
                 cx.text(Rect::new(15.0, 32.0, 170.0, 62.0), &fmt_t(wx.temp, f), Style::BIG.size(54.0).track(-1.2), TEXT);
                 let (kind, ru, en) = wmo(wx.code, wx.day);
-                draw_kind(cx, kind, wx.day, Rect::new(340.0 - 26.0, 36.0, 26.0, 26.0), TEXT);
+                // glyph, condition and high / low sit next to the temperature, not at the far edge
+                draw_kind(cx, kind, wx.day, Rect::new(140.0, 38.0, 26.0, 26.0), TEXT);
                 let cond = cx.t(ru, en);
-                cx.text(Rect::new(190.0, 64.0, 150.0, 16.0), cond, fit_cond(cx, cond, 150.0).right().ellipsis(), TEXT);
+                cx.text(Rect::new(140.0, 66.0, 200.0, 16.0), cond, fit_cond(cx, cond, 200.0).ellipsis(), TEXT);
                 if let Some(d) = days.first() {
-                    cx.text(Rect::new(190.0, 80.0, 150.0, 16.0), &hl_text(cx, d, f), Style::new(13.0, 500).right().ellipsis(), TEXT);
+                    cx.text(Rect::new(140.0, 82.0, 200.0, 16.0), &hl_text(cx, d, f), Style::new(13.0, 500).ellipsis(), TEXT);
                 }
                 cx.rect(Rect::new(16.0, 101.0, 324.0, 0.6), FILL);
                 self.hours_row(cx, wx, hours, Rect::new(16.0, 104.0, 324.0, 66.0), 7, f, (106.0, 136.0, 150.0), 22.0);
