@@ -11,6 +11,7 @@
 #![allow(clippy::too_many_arguments)]
 // the widget API (widget.rs, sys.rs, tz.rs, icons.rs) is a public surface for widget files that do not exist yet: unused items are expected
 #![allow(dead_code, unused_imports)]
+mod accent;
 mod autostart;
 mod backdrop;
 mod calib;
@@ -85,6 +86,9 @@ struct Args {
     anim_strip: Option<String>,
     times: Option<Vec<f32>>,
     anim_out: bool,
+    /// `--accent RRGGBB`: render the headless output with this accent colour; `--accent-of image`: print the accent picked from an image and exit
+    accent: Option<[u8; 3]>,
+    accent_of: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -146,6 +150,15 @@ fn parse_args() -> Args {
             "--calib-dump" => a.calib_dump = Some(val()),
             "--selftest-dupl" => a.selftest = true,
             "--prompt-demo" => a.prompt_demo = Some(val()),
+            "--accent" => {
+                let v = val();
+                let h = v.trim_start_matches('#');
+                a.accent = u32::from_str_radix(h, 16).ok().filter(|_| h.len() == 6).map(|c| [(c >> 16) as u8, (c >> 8) as u8, c as u8]);
+                if a.accent.is_none() {
+                    eprintln!("mswidgets: --accent expects RRGGBB, got '{v}'");
+                }
+            }
+            "--accent-of" => a.accent_of = Some(val()),
             other => eprintln!("mswidgets: unknown argument {other}"),
         }
     }
@@ -181,6 +194,14 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
+    if let Some(path) = &a.accent_of {
+        match accent::from_file(path) {
+            Some(c) => println!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]),
+            None => println!("none (grey / unreadable: the default blue is used)"),
+        }
+        std::process::exit(0);
+    }
+    widget::set_accent(a.accent);
     if let Some(mode) = &a.calib {
         let r = calib::run(&calib::CalibArgs { mode: mode.clone(), dir: a.calib_dir.clone().unwrap_or_else(|| "calib/ref".into()), out: a.calib_out.clone(), params: a.glass_params.clone(), rounds: a.calib_rounds.unwrap_or(6), dump: a.calib_dump.clone() });
         std::process::exit(report(r));

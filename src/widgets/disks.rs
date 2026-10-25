@@ -141,7 +141,7 @@ impl Widget for Disks {
         if self.drives.is_empty() {
             let (head, rest) = c.cut_top(18.0);
             if cx.size == Size::L {
-                cx.text(head, &cx.t("ДИСКИ", "DISKS"), Style::LABEL, ACCENT);
+                cx.text(head, &cx.t("ДИСКИ", "DISKS"), Style::LABEL, accent());
             } else {
                 cx.text(head, cx.t("Диски", "Disks"), Style::TITLE, DIM);
             }
@@ -171,7 +171,7 @@ impl Widget for Disks {
                 }
             }
             Size::L => {
-                cx.text(Rect::new(c.x, c.y, c.w, 18.0), &cx.t("ДИСКИ", "DISKS"), Style::LABEL, ACCENT);
+                cx.text(Rect::new(c.x, c.y, c.w, 18.0), &cx.t("ДИСКИ", "DISKS"), Style::LABEL, accent());
                 let top = c.y + 28.0;
                 for (i, d) in self.drives.iter().take(6).enumerate() {
                     let r = Rect::new(c.x, top + i as f32 * 49.0, c.w, 49.0);

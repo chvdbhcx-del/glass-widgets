@@ -6,7 +6,7 @@ use crate::cards::*;
 use crate::gfx::*;
 use crate::glass::{self, GlassParams, GlassStyle, LOOK};
 use crate::grid;
-use crate::layout::Dim;
+use crate::layout::{AccentMode, Dim};
 use crate::motion::AppearancePref;
 use crate::registry::{self, WidgetDef};
 use crate::update::UpdateState;
@@ -132,11 +132,13 @@ pub enum Opt {
     Dim,
     /// live / plain (`widgetsGlassMode`)
     Source,
+    /// blue / from the wallpaper (`accentMode`)
+    Accent,
 }
 impl Opt {
-    pub const ALL: [Opt; 3] = [Opt::Appearance, Opt::Dim, Opt::Source];
+    pub const ALL: [Opt; 4] = [Opt::Appearance, Opt::Dim, Opt::Source, Opt::Accent];
     pub fn count(self) -> usize {
-        if self == Opt::Source {
+        if matches!(self, Opt::Source | Opt::Accent) {
             2
         } else {
             3
@@ -145,6 +147,10 @@ impl Opt {
     /// Option `k` as the appearance preference (Dark, Light, Auto).
     pub fn appearance(k: usize) -> AppearancePref {
         [AppearancePref::Dark, AppearancePref::Light, AppearancePref::Auto][k.min(2)]
+    }
+    /// Option `k` as the accent source (Blue, Wallpaper).
+    pub fn accent(k: usize) -> AccentMode {
+        [AccentMode::Blue, AccentMode::Wallpaper][k.min(1)]
     }
     /// Option `k` as the dimming mode (Auto, Never, Always).
     pub fn dim(k: usize) -> Dim {
@@ -243,6 +249,7 @@ pub struct Ui {
     pub base: GlassParams,
     pub appearance: AppearancePref,
     pub dim_mode: Dim,
+    pub accent_mode: AccentMode,
     pub autostart: bool,
     /// settings panel: `checkUpdates` and the state of the update check
     pub check_start: bool,
@@ -445,6 +452,7 @@ impl Ui {
             base: glass::global_params(),
             appearance: AppearancePref::default(),
             dim_mode: Dim::Auto,
+            accent_mode: AccentMode::Blue,
             autostart: false,
             check_start: false,
             update: UpdateState::Idle,
@@ -653,9 +661,9 @@ impl Ui {
                 OptRow { which: *o, label: Rect::new(rx, y, 112.0, 28.0), seg: Rect::new(rx + 112.0, y + 2.0, rw - 112.0, 24.0) }
             })
             .collect();
-        let ay = top + 3.0 * OPT_ROW;
-        let cy = top + 4.0 * OPT_ROW;
-        let by = top + 5.0 * OPT_ROW + 10.0;
+        let ay = top + Opt::ALL.len() as f32 * OPT_ROW;
+        let cy = top + (Opt::ALL.len() + 1) as f32 * OPT_ROW;
+        let by = top + (Opt::ALL.len() + 2) as f32 * OPT_ROW + 10.0;
         let bw = ((rw - 8.0) * 0.6).round();
         let fy = p.bottom() - SET_FOOT + 13.0;
         let done = Rect::new(p.right() - 16.0 - 82.0, fy, 82.0, 30.0);
@@ -777,7 +785,7 @@ impl Ui {
         if k < n {
             return Hit::Look(k, self.set_pos(k));
         }
-        [Hit::ResetLook, Hit::Opt(Opt::Appearance, 1), Hit::Opt(Opt::Dim, 0), Hit::Opt(Opt::Source, 1), Hit::Autostart, Hit::CheckStart, Hit::EditBtn, Hit::QuitBtn, Hit::UpdBtn, Hit::UpdDownload, Hit::Done].get(k - n).copied().unwrap_or(Hit::None)
+        [Hit::ResetLook, Hit::Opt(Opt::Appearance, 1), Hit::Opt(Opt::Dim, 0), Hit::Opt(Opt::Source, 1), Hit::Opt(Opt::Accent, 1), Hit::Autostart, Hit::CheckStart, Hit::EditBtn, Hit::QuitBtn, Hit::UpdBtn, Hit::UpdDownload, Hit::Done].get(k - n).copied().unwrap_or(Hit::None)
     }
 
     // ------------------------------------------------ keyboard / wheel on the sliders
@@ -831,6 +839,7 @@ impl Ui {
             Opt::Appearance => [AppearancePref::Dark, AppearancePref::Light, AppearancePref::Auto].iter().position(|a| *a == self.appearance).unwrap_or(0),
             Opt::Dim => [Dim::Auto, Dim::Never, Dim::Always].iter().position(|d| *d == self.dim_mode).unwrap_or(0),
             Opt::Source => usize::from(!self.live),
+            Opt::Accent => usize::from(self.accent_mode == AccentMode::Wallpaper),
         }
     }
 
@@ -1377,10 +1386,11 @@ impl Ui {
             self.set_button(cx, l.reset, self.t("Сбросить вид", "Reset look"), hot, pr == Hit::ResetLook, TEXT);
 
             // behaviour: segmented controls
-            let labels: [(Opt, (&str, &str), [(&str, &str); 3]); 3] = [
+            let labels: [(Opt, (&str, &str), [(&str, &str); 3]); 4] = [
                 (Opt::Appearance, ("Оформление", "Appearance"), [("Тёмное", "Dark"), ("Светлое", "Light"), ("Авто", "Auto")]),
                 (Opt::Dim, ("Приглушение", "Dimming"), [("Авто", "Auto"), ("Никогда", "Never"), ("Всегда", "Always")]),
                 (Opt::Source, ("Источник стекла", "Glass source"), [("Живой", "Live"), ("Простой", "Plain"), ("", "")]),
+                (Opt::Accent, ("Акцент", "Accent"), [("Синий", "Blue"), ("Из обоев", "Wallpaper"), ("", "")]),
             ];
             for o in &l.opts {
                 let Some((_, (ru, en), opts)) = labels.iter().find(|x| x.0 == o.which) else { continue };
@@ -1792,7 +1802,7 @@ mod tests {
             assert_eq!(ui.set_hit(p.x - 1.0, p.cy()), Hit::None);
             assert_eq!(ui.set_hit(1.0, 1.0), Hit::None);
             // reading order for the headless --hover
-            assert!(matches!(ui.nth_control(0), Hit::Look(0, _)) && ui.nth_control(l.rows.len() + 10) == Hit::Done && ui.nth_control(99) == Hit::None);
+            assert!(matches!(ui.nth_control(0), Hit::Look(0, _)) && ui.nth_control(l.rows.len() + 11) == Hit::Done && ui.nth_control(99) == Hit::None);
         }
     }
 
@@ -1813,8 +1823,9 @@ mod tests {
         ui.appearance = AppearancePref::Light;
         ui.dim_mode = Dim::Always;
         ui.live = false;
-        assert_eq!((ui.opt_sel(Opt::Appearance), ui.opt_sel(Opt::Dim), ui.opt_sel(Opt::Source)), (1, 2, 1));
-        assert_eq!((Opt::appearance(2), Opt::dim(1), Opt::count(Opt::Source)), (AppearancePref::Auto, Dim::Never, 2));
+        ui.accent_mode = AccentMode::Wallpaper;
+        assert_eq!((ui.opt_sel(Opt::Appearance), ui.opt_sel(Opt::Dim), ui.opt_sel(Opt::Source), ui.opt_sel(Opt::Accent)), (1, 2, 1, 1));
+        assert_eq!((Opt::appearance(2), Opt::dim(1), Opt::count(Opt::Source), Opt::accent(0), Opt::count(Opt::Accent)), (AppearancePref::Auto, Dim::Never, 2, AccentMode::Blue, 2));
         // panel geometry: the settings panel replaces the gallery rect only while it is up
         assert_eq!(ui.panel_rect(), ui.gallery_rect());
         ui.settings = true;
@@ -1992,6 +2003,7 @@ pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
     ui.base = base;
     ui.appearance = a.appearance.unwrap_or(settings.appearance);
     ui.dim_mode = settings.dim;
+    ui.accent_mode = settings.accent;
     ui.autostart = true; // sample state: the registry is never read by a headless render
     ui.check_start = settings.check_updates;
     ui.update = match a.update_state.as_deref() {

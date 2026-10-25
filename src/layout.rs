@@ -41,24 +41,27 @@ pub fn load(use_config: bool) -> Vec<Item> {
 pub fn load_path(path: Option<&std::path::Path>) -> Vec<Item> {
     let read = || -> Option<Vec<Item>> {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(path?).ok()?).ok()?;
-        let reg = registry::global();
-        let items: Vec<Item> = v
-            .get("widgetsLayout")?
-            .as_array()?
-            .iter()
-            .enumerate()
-            .filter_map(|(i, it)| {
-                let t = it.get("type")?.as_str()?;
-                let def = reg.get(t)?;
-                let size = it.get("size").and_then(|s| s.as_str()).and_then(Size::parse).filter(|s| def.sizes.contains(s)).unwrap_or(def.default_size);
-                let id = it.get("id").and_then(|s| s.as_str()).map(str::to_string).unwrap_or_else(|| new_id(t, i));
-                let cfg = it.get("cfg").filter(|c| c.is_object()).cloned().unwrap_or_else(|| json!({}));
-                Some(Item { id, type_id: t.to_string(), size, col: it.get("col")?.as_u64()? as u32, row: it.get("row")?.as_u64()? as u32, cfg })
-            })
-            .collect();
+        let items = items_from_value(&v);
         (!items.is_empty()).then_some(items)
     };
     read().unwrap_or_else(default_layout)
+}
+
+/// The cards of a parsed config.json (`widgetsLayout`; unknown types skipped, an unsupported size falls back to the default). May be empty.
+pub fn items_from_value(v: &Value) -> Vec<Item> {
+    let reg = registry::global();
+    let Some(arr) = v.get("widgetsLayout").and_then(|a| a.as_array()) else { return Vec::new() };
+    arr.iter()
+        .enumerate()
+        .filter_map(|(i, it)| {
+            let t = it.get("type")?.as_str()?;
+            let def = reg.get(t)?;
+            let size = it.get("size").and_then(|s| s.as_str()).and_then(Size::parse).filter(|s| def.sizes.contains(s)).unwrap_or(def.default_size);
+            let id = it.get("id").and_then(|s| s.as_str()).map(str::to_string).unwrap_or_else(|| new_id(t, i));
+            let cfg = it.get("cfg").filter(|c| c.is_object()).cloned().unwrap_or_else(|| json!({}));
+            Some(Item { id, type_id: t.to_string(), size, col: it.get("col")?.as_u64()? as u32, row: it.get("row")?.as_u64()? as u32, cfg })
+        })
+        .collect()
 }
 
 /// Tidy default: clock S + calendar S in row 0, then up to two more finished (non-stub) widgets as default-size cards below.
@@ -220,8 +223,26 @@ pub fn appearance_key(p: crate::motion::AppearancePref) -> &'static str {
     }
 }
 
+/// `accentMode`: where the accent colour of card titles and links comes from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AccentMode {
+    /// the fixed blue (default)
+    Blue,
+    /// the dominant hue of the desktop wallpaper (`accent.rs`)
+    Wallpaper,
+}
+impl AccentMode {
+    /// The `accentMode` value.
+    pub fn key(self) -> &'static str {
+        match self {
+            AccentMode::Blue => "blue",
+            AccentMode::Wallpaper => "wallpaper",
+        }
+    }
+}
+
 /// The host settings of config.json: `widgetsGlass` 0..1, `widgetsDim`, `widgetsGlassMode` ("plain" = no desktop capture, anything else = live glass),
-/// `widgetsAppearance` ("auto" | "dark" | "light"), `checkUpdates` (bool).
+/// `widgetsAppearance` ("auto" | "dark" | "light"), `checkUpdates` (bool), `accentMode` ("blue" | "wallpaper").
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Settings {
     pub glass: f32,
@@ -231,10 +252,11 @@ pub struct Settings {
     pub appearance: crate::motion::AppearancePref,
     /// `checkUpdates`: one silent update check at start (off unless the user turned it on)
     pub check_updates: bool,
+    pub accent: AccentMode,
 }
 impl Default for Settings {
     fn default() -> Self {
-        Settings { glass: 0.5, dim: Dim::Auto, live: true, appearance: crate::motion::AppearancePref::Dark, check_updates: false }
+        Settings { glass: 0.5, dim: Dim::Auto, live: true, appearance: crate::motion::AppearancePref::Dark, check_updates: false, accent: AccentMode::Blue }
     }
 }
 impl Settings {
@@ -250,6 +272,7 @@ impl Settings {
             live: v.get("widgetsGlassMode").and_then(|g| g.as_str()) != Some("plain"),
             appearance: v.get("widgetsAppearance").and_then(|g| g.as_str()).and_then(crate::motion::AppearancePref::parse).unwrap_or_default(),
             check_updates: v.get("checkUpdates").and_then(|g| g.as_bool()).unwrap_or(d.check_updates),
+            accent: if v.get("accentMode").and_then(|g| g.as_str()) == Some("wallpaper") { AccentMode::Wallpaper } else { AccentMode::Blue },
         }
     }
 }
@@ -377,6 +400,112 @@ pub fn write_panels_to(p: &std::path::Path, gallery: (f32, f32), settings: (f32,
         obj.insert("widgetsPanels".into(), Value::Object(m));
     }
     write_root(p, &root)
+}
+
+// ---------------------------------------------------------------- layout profiles
+//
+// config.json: `profiles` = { name: { "items": [<widgetsLayout entries>], "look": {<widgetsLook>} } } and `activeProfile` = name. The live layout stays in
+// `widgetsLayout` / `widgetsLook` as always (the host and the Tauri app read those); a profile is a named snapshot of both. Everything below works on the
+// parsed JSON only (unit-tested without a file); `profile_op` is the one place that touches config.json.
+
+/// The saved profile names (sorted: the JSON object is a sorted map).
+pub fn profile_names(root: &Value) -> Vec<String> {
+    root.get("profiles").and_then(|p| p.as_object()).map(|p| p.keys().cloned().collect()).unwrap_or_default()
+}
+
+/// `activeProfile` when a profile of that name still exists.
+pub fn active_profile(root: &Value) -> Option<String> {
+    let a = root.get("activeProfile")?.as_str()?;
+    root.get("profiles")?.get(a).is_some().then(|| a.to_string())
+}
+
+/// The current layout + look as one profile entry.
+fn snapshot(root: &Value) -> Value {
+    json!({ "items": root.get("widgetsLayout").filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([])), "look": look_from_value(root) })
+}
+
+fn put_profile(root: &mut Value, name: &str, entry: Value) -> Result<(), String> {
+    let obj = root.as_object_mut().ok_or("config root is not an object")?;
+    match obj.entry("profiles").or_insert_with(|| json!({})) {
+        Value::Object(m) => m.insert(name.to_string(), entry),
+        _ => return Err("`profiles` in config.json is not an object".into()),
+    };
+    Ok(())
+}
+
+/// "Save current layout as...": the desk (`widgetsLayout` + `widgetsLook`) becomes profile `name` (replacing a profile of that name) and the active one.
+pub fn profile_save(root: &mut Value, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("empty profile name".into());
+    }
+    let snap = snapshot(root);
+    put_profile(root, name, snap)?;
+    root["activeProfile"] = json!(name);
+    Ok(())
+}
+
+/// Switch to profile `name`: the current desk is first written back into the profile that was active (nothing is lost; with no active profile it is
+/// kept as a new profile called `stash_name`), then the profile's items and look become `widgetsLayout` / `widgetsLook`. Other keys are untouched.
+pub fn profile_switch(root: &mut Value, name: &str, stash_name: &str) -> Result<(), String> {
+    let entry = root.get("profiles").and_then(|p| p.get(name)).cloned().ok_or_else(|| format!("no profile '{name}'"))?;
+    let active = active_profile(root);
+    if active.as_deref() == Some(name) {
+        return Ok(());
+    }
+    let snap = snapshot(root);
+    match active {
+        Some(a) => put_profile(root, &a, snap)?,
+        None => {
+            // an unnamed desk with something on it is kept, not overwritten
+            if snap["items"].as_array().is_some_and(|a| !a.is_empty()) {
+                let mut n = stash_name.to_string();
+                let mut i = 1;
+                while root["profiles"].get(&n).is_some() {
+                    i += 1;
+                    n = format!("{stash_name} {i}");
+                }
+                put_profile(root, &n, snap)?;
+            }
+        }
+    }
+    let obj = root.as_object_mut().ok_or("config root is not an object")?;
+    obj.insert("widgetsLayout".into(), entry.get("items").filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([])));
+    match entry.get("look").filter(|l| l.as_object().is_some_and(|m| !m.is_empty())) {
+        Some(l) => obj.insert("widgetsLook".into(), l.clone()),
+        None => obj.remove("widgetsLook"),
+    };
+    obj.insert("activeProfile".into(), json!(name));
+    Ok(())
+}
+
+/// "Delete current layout": the active profile is forgotten; the desk keeps what it shows. Returns the deleted name.
+pub fn profile_delete_active(root: &mut Value) -> Result<String, String> {
+    let a = active_profile(root).ok_or("no active profile")?;
+    let obj = root.as_object_mut().ok_or("config root is not an object")?;
+    if let Some(Value::Object(m)) = obj.get_mut("profiles") {
+        m.remove(&a);
+        if m.is_empty() {
+            obj.remove("profiles");
+        }
+    }
+    obj.remove("activeProfile");
+    Ok(a)
+}
+
+/// Read config.json, apply `f`, write it back (temp file + rename). An unparsable file is refused and never touched; nothing is written when `f` fails.
+pub fn profile_op(f: impl FnOnce(&mut Value) -> Result<(), String>) -> Result<(), String> {
+    profile_op_at(&config_path().ok_or("no APPDATA")?, f)
+}
+pub fn profile_op_at(p: &std::path::Path, f: impl FnOnce(&mut Value) -> Result<(), String>) -> Result<(), String> {
+    let mut root = read_root(p)?;
+    f(&mut root)?;
+    write_root(p, &root)
+}
+
+/// config.json as parsed JSON for read-only use (`{}` when missing / unparsable).
+pub fn read_config() -> Value {
+    config_path().and_then(|p| read_root(&p).ok()).unwrap_or_else(|| json!({}))
 }
 
 /// Persist the whole layout after the user moved / resized / added / removed a card. Per-item keys the host does not know are kept,
@@ -615,11 +744,162 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn two_profile_config() -> Value {
+        json!({
+            "mode": "widgets",
+            "widgetsLayout": [{"id": "clock-1", "type": "clock", "size": "s", "col": 0, "row": 0, "cfg": {}}],
+            "widgetsLook": {"blur": 9.0},
+            "other": {"keep": [1, 2]}
+        })
+    }
+
+    /// save -> the first profile is created from the desk and becomes active; the live keys are untouched.
+    #[test]
+    fn profile_save_creates_and_activates() {
+        let mut v = two_profile_config();
+        assert_eq!((profile_names(&v), active_profile(&v)), (vec![], None));
+        profile_save(&mut v, "  Work ").unwrap();
+        assert_eq!(profile_names(&v), ["Work"]);
+        assert_eq!(active_profile(&v).as_deref(), Some("Work"));
+        assert_eq!(v["profiles"]["Work"]["items"][0]["id"], "clock-1");
+        assert_eq!(v["profiles"]["Work"]["look"], json!({"blur": 9.0}));
+        assert_eq!(v["widgetsLayout"].as_array().unwrap().len(), 1);
+        assert_eq!(v["widgetsLook"], json!({"blur": 9.0}));
+        assert_eq!(v["other"], json!({"keep": [1, 2]}));
+        // an empty name is refused and changes nothing
+        let before = v.clone();
+        assert!(profile_save(&mut v, "   ").is_err());
+        assert_eq!(v, before);
+        // a desk without any layout / look saves empty containers
+        let mut e = json!({});
+        profile_save(&mut e, "Empty").unwrap();
+        assert_eq!(e["profiles"]["Empty"], json!({"items": [], "look": {}}));
+        // a broken `profiles` is not overwritten
+        let mut bad = json!({"profiles": 5});
+        assert!(profile_save(&mut bad, "x").is_err());
+    }
+
+    /// switch: the desk is written back into the active profile first, then the chosen one is loaded (look removed when empty).
+    #[test]
+    fn profile_switch_saves_back_then_loads() {
+        let mut v = two_profile_config();
+        profile_save(&mut v, "Work").unwrap();
+        // a second profile: one card more, no look; then back to the desk of "Work" with an edit
+        v["widgetsLayout"].as_array_mut().unwrap().push(json!({"id": "notes-2", "type": "notes", "size": "m", "col": 1, "row": 0, "cfg": {}}));
+        v.as_object_mut().unwrap().remove("widgetsLook");
+        profile_save(&mut v, "Home").unwrap();
+        assert_eq!((active_profile(&v).as_deref(), profile_names(&v)), (Some("Home"), vec!["Home".to_string(), "Work".to_string()]));
+        // edit the desk while "Home" is active, then switch: the edit lands in "Home", "Work" is loaded
+        v["widgetsLayout"][0]["col"] = json!(1);
+        profile_switch(&mut v, "Work", "Unsaved").unwrap();
+        assert_eq!(v["profiles"]["Home"]["items"][0]["col"], 1);
+        assert_eq!(v["profiles"]["Home"]["items"].as_array().unwrap().len(), 2);
+        assert!(v["profiles"]["Home"]["look"].as_object().unwrap().is_empty());
+        assert_eq!(v["widgetsLayout"].as_array().unwrap().len(), 1);
+        assert_eq!(v["widgetsLook"], json!({"blur": 9.0}));
+        assert_eq!(active_profile(&v).as_deref(), Some("Work"));
+        // and back: "Home" has no look, so the key goes away
+        profile_switch(&mut v, "Home", "Unsaved").unwrap();
+        assert!(v.get("widgetsLook").is_none());
+        assert_eq!(v["widgetsLayout"].as_array().unwrap().len(), 2);
+        assert_eq!(v["profiles"]["Work"]["look"], json!({"blur": 9.0}));
+        // foreign keys survive all of it; switching to the active or to an unknown profile changes nothing
+        assert_eq!(v["other"], json!({"keep": [1, 2]}));
+        let before = v.clone();
+        profile_switch(&mut v, "Home", "Unsaved").unwrap();
+        assert!(profile_switch(&mut v, "Nope", "Unsaved").is_err());
+        assert_eq!(v, before);
+    }
+
+    /// With no active profile (just deleted) a switch keeps the desk as a stash profile instead of overwriting it; an empty desk is not stashed.
+    #[test]
+    fn profile_switch_without_active_keeps_the_desk() {
+        let mut v = two_profile_config();
+        profile_save(&mut v, "Work").unwrap();
+        v["widgetsLayout"][0]["row"] = json!(3);
+        profile_save(&mut v, "Home").unwrap();
+        assert_eq!(profile_delete_active(&mut v).unwrap(), "Home");
+        assert_eq!(profile_names(&v), ["Work"]);
+        assert!(v.get("activeProfile").is_none());
+        assert_eq!(v["widgetsLayout"][0]["row"], 3); // the desk keeps what it showed
+        profile_switch(&mut v, "Work", "Unsaved").unwrap();
+        assert_eq!(v["profiles"]["Unsaved"]["items"][0]["row"], 3);
+        assert_eq!(v["widgetsLayout"][0]["row"], 0);
+        // again with an existing stash name: numbered
+        profile_delete_active(&mut v).unwrap();
+        v["widgetsLayout"][0]["row"] = json!(5);
+        profile_save(&mut v, "Zed").unwrap();
+        profile_delete_active(&mut v).unwrap();
+        profile_switch(&mut v, "Unsaved", "Unsaved").unwrap();
+        assert_eq!(v["profiles"]["Unsaved 2"]["items"][0]["row"], 5);
+        // an empty desk is not stashed
+        let mut e = json!({"profiles": {"A": {"items": [], "look": {}}}, "widgetsLayout": []});
+        profile_switch(&mut e, "A", "Unsaved").unwrap();
+        assert_eq!(profile_names(&e), ["A"]);
+    }
+
+    /// delete: only the active profile goes, the desk and the other profiles stay; the last one takes `profiles` with it.
+    #[test]
+    fn profile_delete_active_only() {
+        let mut v = two_profile_config();
+        assert!(profile_delete_active(&mut v).is_err());
+        profile_save(&mut v, "A").unwrap();
+        profile_save(&mut v, "B").unwrap();
+        assert_eq!(profile_delete_active(&mut v).unwrap(), "B");
+        assert_eq!(profile_names(&v), ["A"]);
+        assert!(active_profile(&v).is_none());
+        assert_eq!(v["widgetsLayout"].as_array().unwrap().len(), 1);
+        // a dangling activeProfile (the profile was removed by hand) counts as none
+        v["activeProfile"] = json!("A");
+        assert_eq!(profile_delete_active(&mut v).unwrap(), "A");
+        assert!(v.get("profiles").is_none() && v.get("activeProfile").is_none());
+        assert_eq!(v["widgetsLook"], json!({"blur": 9.0}));
+        v["activeProfile"] = json!("ghost");
+        assert!(profile_delete_active(&mut v).is_err());
+    }
+
+    /// The file round trip: a failed transformation writes nothing, an unparsable file is refused, a profile switch yields a layout `items_from_value` reads.
+    #[test]
+    fn profile_op_on_a_file() {
+        let dir = std::env::temp_dir().join(format!("mswidgets-prof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config.json");
+        std::fs::write(&f, r#"{"mode":"widgets","widgetsLayout":[{"id":"clock-1","type":"clock","size":"s","col":0,"row":0,"cfg":{}}]}"#).unwrap();
+        profile_op_at(&f, |r| profile_save(r, "One")).unwrap();
+        let before = std::fs::read_to_string(&f).unwrap();
+        assert!(profile_op_at(&f, |r| profile_switch(r, "Nope", "U")).is_err());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), before);
+        profile_op_at(&f, |r| {
+            r["widgetsLayout"] = json!([{"id": "calendar-9", "type": "calendar", "size": "s", "col": 1, "row": 1, "cfg": {}}]);
+            profile_save(r, "Two")
+        })
+        .unwrap();
+        profile_op_at(&f, |r| profile_switch(r, "One", "U")).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        let items = items_from_value(&v);
+        assert_eq!(items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["clock-1"]);
+        assert_eq!(v["mode"], "widgets");
+        assert!(!f.with_extension("json.tmp").exists());
+        std::fs::write(&f, "{ nope").unwrap();
+        assert!(profile_op_at(&f, |r| profile_save(r, "x")).is_err());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "{ nope");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn check_updates_is_opt_in() {
         assert!(!Settings::from_value(&json!({})).check_updates);
         assert!(!Settings::from_value(&json!({"checkUpdates": "yes"})).check_updates);
         assert!(Settings::from_value(&json!({"checkUpdates": true})).check_updates);
+    }
+
+    #[test]
+    fn accent_mode_setting() {
+        assert_eq!(Settings::from_value(&json!({})).accent, AccentMode::Blue);
+        assert_eq!(Settings::from_value(&json!({"accentMode": "wallpaper"})).accent, AccentMode::Wallpaper);
+        assert_eq!(Settings::from_value(&json!({"accentMode": "nonsense"})).accent, AccentMode::Blue);
+        assert_eq!(AccentMode::Wallpaper.key(), "wallpaper");
     }
 
     #[test]

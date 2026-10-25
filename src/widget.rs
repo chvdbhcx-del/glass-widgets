@@ -383,8 +383,22 @@ pub const YELLOW: Color = Color::rgb8(255, 214, 10);
 pub const PINK: Color = Color::rgb8(255, 55, 95);
 pub const TEAL: Color = Color::rgb8(64, 200, 224);
 pub const PURPLE: Color = Color::rgb8(191, 90, 242);
-/// accent colour of headers (calendar month, reminders title)
+/// The DEFAULT accent (`accentMode` "blue"). Widgets must call `accent()` instead: it follows the wallpaper in `accentMode` "wallpaper".
 pub const ACCENT: Color = Color::rgb8(100, 190, 255); // lighter than BLUE: stays readable on grey, orange and pink glass
+const ACCENT_RGB: [u8; 3] = [100, 190, 255];
+static ACCENT_NOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(pack_rgb(ACCENT_RGB));
+const fn pack_rgb(c: [u8; 3]) -> u32 {
+    (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32
+}
+/// The accent colour of headers, links and highlights (calendar month, reminders title): `ACCENT`, or the colour taken from the wallpaper.
+pub fn accent() -> Color {
+    let v = ACCENT_NOW.load(Ordering::Relaxed);
+    Color::rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+/// Set the accent (`None` = the default blue); true when it changed (the cached card content has to be recorded again then).
+pub fn set_accent(rgb: Option<[u8; 3]>) -> bool {
+    ACCENT_NOW.swap(pack_rgb(rgb.unwrap_or(ACCENT_RGB)), Ordering::Relaxed) != pack_rgb(rgb.unwrap_or(ACCENT_RGB))
+}
 /// dark text on a light/cream fill (today circle, buttons)
 pub const INK: Color = Color::rgba(20.0 / 255.0, 20.0 / 255.0, 24.0 / 255.0, 0.92);
 pub const BLACK: Color = Color::rgba(0.0, 0.0, 0.0, 1.0);

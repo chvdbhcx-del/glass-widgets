@@ -979,6 +979,12 @@ impl Scene {
             self.fx_wake = true;
         }
     }
+    /// Record every card's static content again on its next `render_card` (the accent colour changed).
+    pub fn invalidate_all(&mut self) {
+        for c in &self.cards {
+            c.flags.invalidate.set(true);
+        }
+    }
     /// Headless: jump every card to its target appearance (no cross-fade).
     pub fn snap_looks(&mut self) {
         for i in 0..self.cards.len() {

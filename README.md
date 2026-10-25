@@ -50,13 +50,15 @@ recorders: the glass reads the wallpaper window itself (Windows Graphics Capture
 ## Tray icon and settings panel
 
 Glass Widgets lives in the notification area (Windows 11 may keep it under the `^` chevron: drag it out to pin it). Left click opens
-the settings panel; right click shows a menu: **Settings**, **Edit Widgets**, **Hide / Show Widgets**, **Start with Windows**, **Quit**.
+the settings panel; right click shows a menu: **Settings**, **Edit Widgets**, **Hide / Show Widgets**, **Layouts**, **Start with Windows**, **Quit**.
+
+**Layouts** keeps named desks (cards and glass look): pick one to switch (the desk you leave is saved back into the layout that was active, so nothing is lost), *Save current layout as...* names the current desk, *Delete current layout* forgets the active name (the desk stays).
 
 ![Settings panel](docs/images/settings.png)
 
 The panel has sliders that change the look of the widgets live: glass amount, blur, refraction, chromatic fringe, saturation, brightness,
-frosting, highlights, glow, corner roundness and card size. It also switches dark / light / auto glass, dimming, live or plain glass
-and autostart. "Reset look" brings everything back to the defaults. Drag the panel (or the gallery) by an empty spot: it remembers
+frosting, highlights, glow, corner roundness and card size. It also switches dark / light / auto glass, dimming, live or plain glass,
+autostart and the accent colour of card titles (blue, or taken from the wallpaper). "Reset look" brings everything back to the defaults. Drag the panel (or the gallery) by an empty spot: it remembers
 where you left it. The sliders also work from the keyboard (`Up` / `Down` / `Tab` pick one, `Left` / `Right` change it by 1 %, with
 `Shift` by 10 %, `Home` / `End` jump, `Backspace` resets it) and with the mouse wheel.
 
@@ -78,6 +80,8 @@ Everything lives in `%APPDATA%\macshell\config.json` (written by the edit mode; 
 | `widgetsLook` | the other sliders of the settings panel (only the changed ones) |
 | `widgetsPanels` | where the gallery / settings panel were dragged: `{"gallery":[dx,dy],"settings":[dx,dy]}` (only non-zero ones) |
 | `checkUpdates` | `true` = one silent update check at start (default `false`) |
+| `accentMode` | `blue` (default) or `wallpaper` (the dominant hue of the desktop wallpaper, re-read when the wallpaper changes) |
+| `profiles`, `activeProfile` | saved layouts: `{ name: { items: [...], look: {...} } }` and the checked one (the Layouts submenu of the tray) |
 
 Network is used only by the widgets that need it (weather, rates, quote, site icons of shortcut tiles) and by the update check, which runs only
 when you press "Check for updates" or turn on `checkUpdates`; nothing else phones home.

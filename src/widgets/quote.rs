@@ -230,10 +230,10 @@ impl Widget for Quote {
         const SIZES: [f32; 8] = [30.0, 27.0, 24.0, 22.0, 20.0, 18.0, 16.0, 14.0];
         match cx.size {
             Size::L => {
-                cx.text(Rect::new(16.0, 16.0, 200.0, 16.0), &cx.t("ЦИТАТА ДНЯ", "QUOTE OF THE DAY"), Style::LABEL, ACCENT);
+                cx.text(Rect::new(16.0, 16.0, 200.0, 16.0), &cx.t("ЦИТАТА ДНЯ", "QUOTE OF THE DAY"), Style::LABEL, accent());
                 let date = format!("{} {}", cx.now.d, month_genitive(cx.lang, cx.now.mo));
                 cx.text(Rect::new(200.0, 16.0, 140.0, 16.0), &date, Style::new(12.0, 500).right(), DIM);
-                cx.text(Rect::new(12.0, 28.0, 80.0, 64.0), "❝", Style::new(64.0, 400), ACCENT);
+                cx.text(Rect::new(12.0, 28.0, 80.0, 64.0), "❝", Style::new(64.0, 400), accent());
                 let area = Rect::new(16.0, 92.0, 324.0, 136.0);
                 let size = fit(cx, text, area.w, area.h, &SIZES);
                 cx.text(area, text, Style::new(size, 300).wrap(), TEXT);
@@ -247,7 +247,7 @@ impl Widget for Quote {
                 author_line(cx, Rect::new(16.0, 328.0, 324.0, 14.0), nw, FAINT);
             }
             _ => {
-                cx.text(Rect::new(12.0, -2.0, 60.0, 56.0), "❝", Style::new(46.0, 400), ACCENT);
+                cx.text(Rect::new(12.0, -2.0, 60.0, 56.0), "❝", Style::new(46.0, 400), accent());
                 let area = Rect::new(16.0, 42.0, 324.0, 80.0);
                 let size = fit(cx, text, area.w, area.h, &SIZES[2..]);
                 cx.text(area, text, Style::new(size, 300).wrap(), TEXT);

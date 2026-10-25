@@ -349,7 +349,7 @@ impl Widget for Batteries {
 impl Batteries {
     /// L: "БАТАРЕИ" header, then rows of 44 px: glyph, name over a bar, percent on the right.
     fn draw_list(&self, cx: &Cx, items: &[Item]) -> Result<()> {
-        cx.text(Rect::new(16.0, 16.0, 324.0, 16.0), &cx.t("БАТАРЕИ", "BATTERIES"), Style::LABEL, ACCENT);
+        cx.text(Rect::new(16.0, 16.0, 324.0, 16.0), &cx.t("БАТАРЕИ", "BATTERIES"), Style::LABEL, accent());
         for (i, it) in items.iter().enumerate() {
             let row = Rect::new(16.0, 44.0 + 44.0 * i as f32, 324.0, 44.0);
             if i > 0 {

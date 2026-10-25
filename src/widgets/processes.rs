@@ -247,7 +247,7 @@ impl Widget for Processes {
     fn draw(&mut self, cx: &mut Cx) -> Result<()> {
         self.start(cx);
         let (title, cpu, ram, _) = Self::header(cx);
-        cx.text(title, &cx.t("ПРОЦЕССЫ", "PROCESSES"), Style::LABEL, ACCENT);
+        cx.text(title, &cx.t("ПРОЦЕССЫ", "PROCESSES"), Style::LABEL, accent());
         let seg = Rect::new(cpu.x, cpu.y, cpu.w + ram.w + 2.0, cpu.h);
         cx.rrect(seg, 10.0, Color::rgba(1.0, 1.0, 1.0, 0.10));
         cx.rrect(if self.by_ram { ram } else { cpu }.inset_xy(0.0, 1.5), 8.5, Color::rgba(1.0, 1.0, 1.0, 0.22));
@@ -272,7 +272,7 @@ impl Widget for Processes {
             return Ok(());
         }
         let peak = self.view.iter().map(|e| if self.by_ram { e.ram as f64 } else { e.cpu as f64 }).fold(0.0, f64::max).max(if self.by_ram { 1.0 } else { 5.0 });
-        let color = if self.by_ram { TEAL } else { ACCENT };
+        let color = if self.by_ram { TEAL } else { accent() };
         for (i, e) in self.view.iter().enumerate() {
             let r = Self::row(cx, i);
             let name = if e.count > 1 { format!("{} ×{}", e.name, e.count) } else { e.name.clone() };

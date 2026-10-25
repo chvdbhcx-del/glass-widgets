@@ -588,11 +588,11 @@ impl Widget for Reminders {
         let (lay, c) = (Lay::of(cx.size), cx.content());
         let (nm, off) = (now_ms(cx), cx.utc_offset_min());
         let open = self.items.iter().filter(|r| !r.done).count().saturating_sub(self.comps.len());
-        cx.text(Rect::new(c.x, c.y, c.w - 44.0, 22.0), cx.t("Напоминания", "Reminders"), Style::TITLE.ellipsis(), ACCENT);
+        cx.text(Rect::new(c.x, c.y, c.w - 44.0, 22.0), cx.t("Напоминания", "Reminders"), Style::TITLE.ellipsis(), accent());
         let big = if cx.size == Size::L { 34.0 } else { 30.0 };
         cx.text(Lay::count_rect(c), &open.to_string(), Style::new(big, 300).mono().right(), TEXT);
         if cx.size == Size::M {
-            cx.icon(Glyph::Plus, Rect::new(c.right() - 44.0 - 24.0, c.y - 1.0, 22.0, 22.0), ACCENT);
+            cx.icon(Glyph::Plus, Rect::new(c.right() - 44.0 - 24.0, c.y - 1.0, 22.0, 22.0), accent());
         }
         let list = lay.list(c);
         let vis = self.visible(lay.rows);
@@ -620,8 +620,8 @@ impl Widget for Reminders {
         if cx.size == Size::L {
             let a = Lay::add_hit(Size::L, c);
             cx.rect(Rect::new(a.x, a.y, a.w, 0.6), FILL);
-            cx.icon(Glyph::Plus, Rect::new(a.x - 3.0, a.cy() - 9.0, 18.0, 18.0), ACCENT);
-            cx.text(Rect::new(a.x + 22.0, a.y, a.w - 22.0, a.h), cx.t("Новое напоминание", "New reminder"), Style::BODY, ACCENT);
+            cx.icon(Glyph::Plus, Rect::new(a.x - 3.0, a.cy() - 9.0, 18.0, 18.0), accent());
+            cx.text(Rect::new(a.x + 22.0, a.y, a.w - 22.0, a.h), cx.t("Новое напоминание", "New reminder"), Style::BODY, accent());
         }
         Ok(())
     }
@@ -635,7 +635,7 @@ impl Widget for Reminders {
             let g = &k.geo;
             cx.circle_stroke(g.c, CIRCLE_R, 1.5, CIRCLE.fade(fade * (1.0 - fill)));
             if fill > 0.0 {
-                cx.circle(g.c, CIRCLE_R * fill, ACCENT.fade(fade));
+                cx.circle(g.c, CIRCLE_R * fill, accent().fade(fade));
                 cx.icon(Glyph::Check, Rect::new(g.c.0 - 6.5, g.c.1 - 6.5, 13.0, 13.0), WHITE.fade(fade * fill));
             }
             for (s, r, w) in &g.lines {

@@ -33,7 +33,7 @@ impl Widget for Dev {
         }
         // text styles
         let mut y = 14.0;
-        for (st, s, c) in [(Style::TITLE, "TITLE 13 semibold Привет", TEXT), (Style::BODY, "BODY 13 regular Привет", TEXT), (Style::CAPTION, "CAPTION 11 regular Привет", DIM), (Style::LABEL, "LABEL 12 BOLD ПЯТНИЦА", ACCENT)] {
+        for (st, s, c) in [(Style::TITLE, "TITLE 13 semibold Привет", TEXT), (Style::BODY, "BODY 13 regular Привет", TEXT), (Style::CAPTION, "CAPTION 11 regular Привет", DIM), (Style::LABEL, "LABEL 12 BOLD ПЯТНИЦА", accent())] {
             cx.text(Rect::new(16.0, y, 324.0, 18.0), s, st, c);
             y += 18.0;
         }

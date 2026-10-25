@@ -457,7 +457,7 @@ impl Rates {
     fn draw_small(&self, cx: &Cx) {
         let Some(row) = self.rows.get(self.sel) else { return self.draw_empty(cx) };
         let c = cx.content();
-        cx.text(Rect::new(c.x, c.y, 90.0, 18.0), &row.label.replace('/', " / "), Style::LABEL.ellipsis(), ACCENT);
+        cx.text(Rect::new(c.x, c.y, 90.0, 18.0), &row.label.replace('/', " / "), Style::LABEL.ellipsis(), accent());
         let n = self.rows.len();
         if n > 1 {
             for i in 0..n {
@@ -488,7 +488,7 @@ impl Rates {
         for (i, row) in self.rows.iter().take(4).enumerate() {
             let (col, rw) = ((i % 2) as f32, (i / 2) as f32);
             let cell = Rect::new(area.x + col * (cw + gap_x), area.y + rw * (ch + gap_y), cw, ch);
-            cx.text(Rect::new(cell.x, cell.y, 74.0, 16.0), &row.label, Style::new(11.0, 700).track(0.4).ellipsis(), ACCENT);
+            cx.text(Rect::new(cell.x, cell.y, 74.0, 16.0), &row.label, Style::new(11.0, 700).track(0.4).ellipsis(), accent());
             self.draw_change(cx, Rect::new(cell.x + 60.0, cell.y, cell.w - 60.0, 16.0), row.change, 10.5, true);
             let vt = self.value_text(cx, row.value);
             let vw = cell.w - 62.0;
@@ -535,7 +535,7 @@ impl Widget for Rates {
                 self.draw_empty(cx);
             } else {
                 let c = cx.content();
-                cx.text(Rect::new(c.x, c.y, c.w, 18.0), cx.t("КУРСЫ", "RATES"), Style::LABEL, ACCENT);
+                cx.text(Rect::new(c.x, c.y, c.w, 18.0), cx.t("КУРСЫ", "RATES"), Style::LABEL, accent());
                 self.draw_empty(cx);
             }
             return Ok(());

@@ -456,11 +456,11 @@ impl Widget for Clip {
         let size = cx.size;
         let (n, _, _) = layout(size);
         let l = size == Size::L;
-        cx.icon(Glyph::Clipboard, Rect::new(16.0, 17.0, 15.0, 15.0), ACCENT);
-        cx.text(Rect::new(37.0, 14.0, 200.0, 22.0), cx.t("Буфер обмена", "Clipboard"), Style::TITLE.ellipsis(), ACCENT);
+        cx.icon(Glyph::Clipboard, Rect::new(16.0, 17.0, 15.0, 15.0), accent());
+        cx.text(Rect::new(37.0, 14.0, 200.0, 22.0), cx.t("Буфер обмена", "Clipboard"), Style::TITLE.ellipsis(), accent());
         if l {
             if !self.rows.is_empty() {
-                cx.text(clear_rect(), cx.t("Очистить", "Clear"), Style::BODY.right(), ACCENT);
+                cx.text(clear_rect(), cx.t("Очистить", "Clear"), Style::BODY.right(), accent());
             }
         }
         if self.rows.is_empty() {
@@ -487,7 +487,7 @@ impl Widget for Clip {
             }
             if row.current {
                 let c = if l { Rect::new(r.right() - 16.0, r.cy() - 8.0, 16.0, 16.0) } else { Rect::new(r.right() - 52.0 - 20.0, r.cy() - 7.0, 14.0, 14.0) };
-                cx.icon(Glyph::Check, c, ACCENT);
+                cx.icon(Glyph::Check, c, accent());
             }
         }
         Ok(())
