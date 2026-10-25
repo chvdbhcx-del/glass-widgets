@@ -666,7 +666,11 @@ impl Ui {
                     "blur" => format!("{:.1} px", self.look.blur),
                     "radius_k" => format!("{:.0} px", Size::S.radius() * self.look.radius_k),
                     "card_k" => format!("{:.0}%", self.look.card_k * 100.0),
-                    _ => format!("{:.0}%", d.ratio(&self.look, &self.base) * 100.0),
+                    _ => {
+                        // a wide slider can reach many times the base look: "x10" reads better than "1000%"
+                        let r = d.ratio(&self.look, &self.base);
+                        if r >= 9.95 { format!("x{:.0}", r) } else { format!("{:.0}%", r * 100.0) }
+                    }
                 }
             }
         }
@@ -1595,7 +1599,7 @@ mod tests {
         assert_eq!(ui.set_value_text(1), format!("{:.1} px", base.blur));
         assert_eq!(ui.set_value_text(LOOK.len()), "100%"); // card size
         glass::LOOK[2].set_pos(&mut ui.look, &base, 1.0); // fringe, index 3 in the panel
-        assert_eq!(ui.set_value_text(3), "300%");
+        assert_eq!(ui.set_value_text(3), "x10");
         assert!((ui.set_pos(3) - 1.0).abs() < 1e-6 && ui.set_default_pos(3) < 0.5);
         ui.glass = 0.25;
         assert_eq!((ui.set_pos(0), ui.set_default_pos(0)), (0.25, 0.5));

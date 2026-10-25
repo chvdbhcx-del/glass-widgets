@@ -52,16 +52,16 @@ macro_rules! glass_params {
 
 glass_params! {
     /// lens gaussian sigma
-    blur: 4.19, 1.0, 14.0;
+    blur: 4.19, 1.0, 30.0;
     /// refraction strength multiplier (x the size dependent shift)
-    refr: 1.0, 0.0, 1.6;
+    refr: 1.0, 0.0, 4.0;
     /// refraction band width multiplier
-    refr_edge: 1.0, 0.5, 1.8;
+    refr_edge: 1.0, 0.5, 3.0;
     /// refraction profile exponent: displacement ~ (1 - t)^pow
     refr_pow: 2.3, 1.2, 4.0;
     /// chromatic split: the red pass is displaced by (1 - chroma_r), the blue one by (1 + chroma_b) of the green pass
-    chroma_r: 0.04, 0.0, 0.15;
-    chroma_b: 0.06, 0.0, 0.2;
+    chroma_r: 0.04, 0.0, 0.7;
+    chroma_b: 0.06, 0.0, 1.0;
     /// lens colour matrix: saturation and brightness
     sat: 1.92, 0.8, 2.8;
     bright: 0.81, 0.5, 1.4;
@@ -71,10 +71,10 @@ glass_params! {
     tint1: 0.016, 0.0, 0.2;
     tint1_g: 0.05, 0.0, 0.2;
     /// diagonal sheen: peak alpha at the lit corner and alpha at 26 % of the diagonal
-    sheen: 0.22, 0.12, 0.5;
-    sheen_mid: 0.05, 0.02, 0.2;
+    sheen: 0.22, 0.0, 1.0;
+    sheen_mid: 0.05, 0.0, 0.5;
     /// inner glow (white, gaussian sigma)
-    glow: 0.06, 0.0, 0.3;
+    glow: 0.06, 0.0, 0.8;
     glow_sigma: 11.5, 4.0, 24.0;
     /// adaptive dark veil over bright backdrops: gain, luminance threshold, ceiling
     veil_gain: 0.79, 0.0, 2.5;
@@ -82,7 +82,7 @@ glass_params! {
     veil_max: 0.138, 0.0, 0.7;
     /// thin uniform base rim: stroke width and alpha
     rim_w: 0.6, 0.6, 2.5;
-    rim_base: 0.14, 0.10, 0.5;
+    rim_base: 0.14, 0.0, 0.7;
     /// thin dark edge line under the rim (the references show a dark 1 px outline on the sides)
     edge_dark: 0.134, 0.0, 0.7;
     /// specular rim: peak alpha, stroke width, extent along the light axis (0..1), strength of the opposite (counter) highlight
@@ -194,14 +194,14 @@ pub struct LookDef {
 
 /// The sliders of the settings panel, in panel order (after "Glass", which is `widgetsGlass`).
 pub const LOOK: [LookDef; 10] = [
-    LookDef { primary: "blur", lo: 1.0, hi: 12.0, follow: &[] },
-    LookDef { primary: "refr", lo: 0.0, hi: 1.6, follow: &[] },
-    LookDef { primary: "chroma_r", lo: 0.0, hi: 0.12, follow: &["chroma_b"] },
+    LookDef { primary: "blur", lo: 1.0, hi: 24.0, follow: &[] },
+    LookDef { primary: "refr", lo: 0.0, hi: 4.0, follow: &["refr_edge"] },
+    LookDef { primary: "chroma_r", lo: 0.0, hi: 0.4, follow: &["chroma_b"] },
     LookDef { primary: "sat", lo: 0.8, hi: 2.6, follow: &[] },
     LookDef { primary: "bright", lo: 0.6, hi: 1.2, follow: &[] },
     LookDef { primary: "tint0_g", lo: 0.0, hi: 0.26, follow: &["tint1_g"] },
-    LookDef { primary: "spec", lo: 0.0, hi: 1.0, follow: &["sheen", "sheen_mid"] },
-    LookDef { primary: "glow", lo: 0.0, hi: 0.25, follow: &[] },
+    LookDef { primary: "sheen", lo: 0.0, hi: 0.9, follow: &["spec", "sheen_mid", "rim_base"] },
+    LookDef { primary: "glow", lo: 0.0, hi: 0.5, follow: &[] },
     LookDef { primary: "radius_k", lo: 0.15, hi: 1.7, follow: &[] },
     LookDef { primary: "card_k", lo: 0.7, hi: 1.5, follow: &[] },
 ];
@@ -226,7 +226,8 @@ impl LookDef {
         if b.abs() > 1e-6 {
             for f in self.follow {
                 if let Some(bf) = base.get(f) {
-                    p.set(f, bf * v / b);
+                    let (lo, hi) = GlassParams::range(f).unwrap_or((f32::MIN, f32::MAX));
+                    p.set(f, (bf * v / b).clamp(lo, hi));
                 }
             }
         }
@@ -924,7 +925,7 @@ mod tests {
         let chroma = &LOOK[2];
         let mut p = base;
         chroma.set_pos(&mut p, &base, 1.0);
-        assert!((p.chroma_r - 0.12).abs() < 1e-5 && (p.chroma_b - base.chroma_b * 3.0).abs() < 1e-4, "{p:?}");
+        assert!((p.chroma_r - 0.4).abs() < 1e-5 && (p.chroma_b - base.chroma_b * 0.4 / base.chroma_r).abs() < 1e-3, "{p:?}");
         chroma.set_pos(&mut p, &base, 0.0);
         assert_eq!((p.chroma_r, p.chroma_b), (0.0, 0.0));
         // near the base value the knob snaps to it exactly (so "back at default" leaves no key behind)
@@ -939,12 +940,12 @@ mod tests {
         assert!((blur.pos(&p) - 0.5).abs() < 1e-5);
         // widgetsLook: only differences, applying them gives the same look back
         let mut q = base;
-        LOOK[6].set_pos(&mut q, &base, 1.0); // highlights: spec + sheen + sheen_mid
+        LOOK[6].set_pos(&mut q, &base, 1.0); // highlights: sheen + spec + sheen_mid + rim_base
         LOOK[8].set_pos(&mut q, &base, 0.9);
         let diff = look_diff(&base, &q);
         let keys: Vec<&str> = diff.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-        assert_eq!(keys.len(), 4, "{keys:?}");
-        for k in ["spec", "sheen", "sheen_mid", "radius_k"] {
+        assert_eq!(keys.len(), 5, "{keys:?}");
+        for k in ["spec", "sheen", "sheen_mid", "rim_base", "radius_k"] {
             assert!(keys.contains(&k), "{k}");
         }
         let back = apply_look(&base, &diff);
@@ -957,7 +958,7 @@ mod tests {
         gj.blur = 6.0;
         assert_eq!(look_diff(&gj, &gj), json!({}));
         let wild = apply_look(&gj, &json!({"blur": 900, "sat": -3, "nonsense": 1, "light_angle": 10, "refr": "x"}));
-        assert_eq!((wild.blur, wild.sat), (14.0, 0.8));
+        assert_eq!((wild.blur, wild.sat), (30.0, 0.8));
         assert_eq!((wild.light_angle, wild.refr), (gj.light_angle, gj.refr)); // not a look key / not a number
     }
 
