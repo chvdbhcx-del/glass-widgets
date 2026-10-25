@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.2] - 2026-10-25
+
+### Changed
+- Calendar S: the circle of today is a little smaller (radius 9.5).
+
 ## [0.5.1] - 2026-10-25
 
 ### Changed
