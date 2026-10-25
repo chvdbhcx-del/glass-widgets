@@ -566,7 +566,7 @@ impl Widget for Weather {
             Size::S => self.left_block(cx, wx, days.first(), 16.0, 138.0, f),
             Size::M => {
                 self.left_block(cx, wx, days.first(), 16.0, 140.0, f);
-                self.hours_row(cx, wx, hours, Rect::new(168.0, 16.0, 172.0, 138.0), 5, f, (52.0, 82.0, 98.0), 22.0); // one tight block (as in L), centred on the card
+                self.hours_row(cx, wx, hours, Rect::new(168.0, 16.0, 172.0, 138.0), 5, f, (49.0, 81.0, 101.0), 22.0); // one tight block (as in L), centred on the card
             }
             Size::L => {
                 self.city_row(cx, Rect::new(16.0, 16.0, 324.0, 18.0));

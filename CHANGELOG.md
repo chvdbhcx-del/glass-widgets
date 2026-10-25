@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.8] - 2026-10-25
+
+### Changed
+- Weather M: a little more air between the hour, the glyph and the temperature.
+
 ## [0.5.7] - 2026-10-25
 
 ### Changed
