@@ -14,6 +14,7 @@ use crate::cards::*;
 use crate::gfx::*;
 use crate::grid;
 use crate::layout;
+use crate::monitors;
 use crate::motion::{self, MatState};
 use crate::layout::AccentMode;
 use crate::tray::{self, TrayCmd};
@@ -31,7 +32,7 @@ use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, Ope
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcess, GetCurrentThreadId, GetProcessTimes};
-use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForSystem, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -186,6 +187,10 @@ struct App {
     mem_dc: HDC,
     dib: HBITMAP,
     bits: *mut u8,
+    /// LUID of the GPU the UI device lives on (None = unknown): a monitor on another GPU gets the GDI capture
+    gfx_luid: Option<i64>,
+    /// whose layout `items` is: None = the primary monitor, else a device name (`monitorLayouts`); mirrors `layout::slot()`
+    slot: Option<String>,
     mon: RECT,  // monitor, desktop px
     work: RECT, // work area, desktop px
     s: f32,
@@ -290,17 +295,47 @@ struct Monitor {
     out: Option<OutputInfo>,
     rect: RECT,
     work: RECT,
+    /// DPI scale of this monitor
+    scale: f32,
+    /// whose layout the desk shows: None = the primary monitor (`widgetsLayout`), else the device name (`monitorLayouts`)
+    slot: Option<String>,
+    /// how many monitors are connected, and the display position (0 = primary) of this one
+    count: usize,
+    pos: usize,
 }
 
+/// The monitor the desk lives on (`widgetsMonitor`, see monitors.rs): rect, work area, DPI and capture output all come from it.
 unsafe fn monitor() -> Monitor {
-    let out = find_primary_output();
-    let rect = match &out {
-        Some(x) => x.rect,
-        None => RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) },
+    let list = monitors::enumerate();
+    let sel = monitors::pick(&list);
+    let mi = sel.and_then(|i| list.get(i));
+    let out = find_output(mi.filter(|m| !m.primary).map(|m| m.name.as_str()));
+    let rect = match (&out, mi) {
+        (Some(x), _) => x.rect,
+        (None, Some(m)) => m.rect,
+        (None, None) => RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) },
     };
-    let mut work = rect;
-    let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut work as *mut RECT as *mut std::ffi::c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
-    Monitor { out, rect, work }
+    let work = match mi {
+        Some(m) => m.work,
+        None => {
+            let mut w = rect;
+            let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut w as *mut RECT as *mut std::ffi::c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+            w
+        }
+    };
+    let dpi = mi.filter(|m| m.hmon != 0).and_then(|m| {
+        let (mut x, mut y) = (0u32, 0u32);
+        GetDpiForMonitor(HMONITOR(m.hmon as *mut _), MDT_EFFECTIVE_DPI, &mut x, &mut y).ok().map(|_| x)
+    });
+    Monitor {
+        out,
+        rect,
+        work,
+        scale: dpi.filter(|d| *d > 0).unwrap_or_else(|| GetDpiForSystem()) as f32 / 96.0,
+        slot: sel.and_then(|i| monitors::slot_of(&list, i)),
+        count: list.len().max(1),
+        pos: sel.map_or(0, |i| monitors::position(&list, i)),
+    }
 }
 
 fn grid_dims(mon: &RECT, work: &RECT, s: f32) -> grid::Dims {
@@ -325,24 +360,36 @@ fn place_items(items: &mut [layout::Item], dims: &grid::Dims, s: f32) -> Vec<Car
     out
 }
 
-unsafe fn make_backdrop(gfx: &Gfx, mon: &Monitor, w: i32, h: i32, live: bool, fps: u32, rects: &[RECT], margin: i32) -> Box<dyn Backdrop> {
+/// A capture output can share textures with the UI device when the device's GPU is unknown (`owner` None: default adapter / WARP, the old
+/// behaviour) or is the output's own.
+fn same_gpu(owner: Option<i64>, output_luid: i64) -> bool {
+    owner.is_none_or(|l| l == output_luid)
+}
+
+/// `owner`: LUID of the GPU the UI device lives on. The WGC / duplication textures are shared with that device, which only works on the same GPU;
+/// a monitor on another adapter gets the GDI capture (CPU copy, any monitor) instead.
+unsafe fn make_backdrop(gfx: &Gfx, mon: &Monitor, w: i32, h: i32, live: bool, fps: u32, rects: &[RECT], margin: i32, owner: Option<i64>) -> Box<dyn Backdrop> {
     if live {
         // Graphics Capture of the desktop window is the default (the layer does not see itself, so it can stay visible to screenshots);
         // `MSW_CAPTURE=gdi` selects GDI region capture of the screen (the layer is then excluded from captures), `dxgi` Desktop Duplication
         let pick = std::env::var("MSW_CAPTURE").unwrap_or_default().to_ascii_lowercase();
-        if let (true, Some(x), false) = (pick.is_empty() || pick == "wgc", &mon.out, gfx.warp) {
+        let out = mon.out.as_ref().filter(|x| same_gpu(owner, x.luid));
+        if mon.out.is_some() && out.is_none() {
+            eprintln!("mswidgets: the monitor is on another GPU than the UI device, using GDI capture");
+        }
+        if let (true, Some(x), false) = (pick.is_empty() || pick == "wgc", out, gfx.warp) {
             match WgcBackdrop::new(gfx, x, rects, margin, fps) {
                 Ok(d) => return Box::new(d),
                 Err(e) => eprintln!("mswidgets: graphics capture unavailable ({e}), trying GDI"),
             }
         }
-        if pick != "dxgi" && !gfx.warp {
+        if (pick != "dxgi" || (mon.out.is_some() && out.is_none())) && !gfx.warp {
             match GdiBackdrop::new(gfx, mon.rect, rects, margin, fps) {
                 Ok(d) => return Box::new(d),
                 Err(e) => eprintln!("mswidgets: GDI capture unavailable ({e}), trying duplication"),
             }
         }
-        if let (Some(x), false) = (&mon.out, gfx.warp) {
+        if let (Some(x), false) = (out, gfx.warp) {
             match DuplBackdrop::new(gfx, x, RECT { left: 0, top: 0, right: w, bottom: h }, rects, margin, fps) {
                 Ok(d) => return Box::new(d),
                 Err(e) => eprintln!("mswidgets: desktop duplication unavailable ({e}), plain base"),
@@ -361,16 +408,19 @@ unsafe fn make_backdrop(gfx: &Gfx, mon: &Monitor, w: i32, h: i32, live: bool, fp
 }
 
 unsafe fn setup(o: &Opts) -> Result<()> {
+    // `widgetsMonitor`: which monitor the desk lives on (a headless / --no-config run always uses the primary one)
+    monitors::set_choice(if o.no_config { monitors::Choice::Primary } else { monitors::Choice::from_value(&layout::read_config()) });
     let mon = monitor();
+    layout::set_slot(mon.slot.clone());
     let (mw, mh) = (mon.rect.right - mon.rect.left, mon.rect.bottom - mon.rect.top);
-    let gfx = match Gfx::new(mon.out.as_ref().map(|x| &x.adapter)) {
-        Ok(g) => g,
+    let (gfx, gfx_luid) = match Gfx::new(mon.out.as_ref().map(|x| &x.adapter)) {
+        Ok(g) => (g, mon.out.as_ref().map(|x| x.luid)),
         Err(e) => {
             eprintln!("mswidgets: device on the output adapter failed ({e}), default adapter");
-            Gfx::new(None)?
+            (Gfx::new(None)?, None)
         }
     };
-    let s = o.scale.unwrap_or(GetDpiForSystem() as f32 / 96.0);
+    let s = o.scale.unwrap_or(mon.scale);
     let settings = layout::read_settings();
     // the accent colour is needed before the first card is recorded
     let (accent_rgb, accent_key) = resolve_accent(if o.no_config { AccentMode::Blue } else { settings.accent });
@@ -382,7 +432,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     let cs = s * look.card_k;
     let dims = grid_dims(&mon.rect, &mon.work, cs);
 
-    let mut items = layout::load(!o.no_config);
+    let mut items = layout::load_path(if o.no_config { None } else { layout::config_path() }.as_deref(), mon.slot.as_deref());
     let specs = place_items(&mut items, &dims, cs);
     let m = (MARGIN * cs).round() as i32;
     let card_rects: Vec<RECT> = specs.iter().map(|c| c.rect()).collect();
@@ -408,7 +458,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     )?;
     // backdrop: graphics capture of the wallpaper window, else screen capture, else a plain dark translucent base
     let regions = region_list(&card_rects, None, None);
-    let backdrop = make_backdrop(&gfx, &mon, mw, mh, settings.live, o.fps, &regions, m);
+    let backdrop = make_backdrop(&gfx, &mon, mw, mh, settings.live, o.fps, &regions, m, gfx_luid);
     // a backdrop that reads the SCREEN would see the layer itself: keep the window out of every capture then (screenshots miss it);
     // `MSW_NO_EXCLUDE=1` (diagnostics only) skips that
     if backdrop.name() != "desktop-wgc" && std::env::var_os("MSW_NO_EXCLUDE").is_none() && SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_err() {
@@ -436,6 +486,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         scene.tick_card(&gfx, i, &t0); // first tick: widgets start their jobs / report their schedule
     }
     let mut ui = Ui::new(env.lang, s, mw as f32 / s, mh as f32 / s);
+    (ui.mon_count, ui.mon_sel) = (mon.count, mon.pos);
     ui.glass = settings.glass;
     ui.live = settings.live;
     ui.look = look;
@@ -464,6 +515,8 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         mem_dc,
         dib,
         bits,
+        gfx_luid,
+        slot: mon.slot.clone(),
         mon: mon.rect,
         work: mon.work,
         s,
@@ -2231,7 +2284,10 @@ impl App {
         let root = layout::read_config();
         let profiles = layout::profile_names(&root);
         let active = layout::active_profile(&root).and_then(|a| profiles.iter().position(|p| *p == a));
-        tray::MenuState { lang: self.ui.lang, editing: self.editing, hidden: self.user_hidden, autostart: crate::autostart::enabled(), profiles, active }
+        let list = monitors::enumerate();
+        let monitor = monitors::pick(&list).map_or(0, |i| monitors::position(&list, i));
+        let monitors = (0..list.len()).map(|p| monitors::label(&list, p, self.ui.lang)).collect();
+        tray::MenuState { lang: self.ui.lang, editing: self.editing, hidden: self.user_hidden, autostart: crate::autostart::enabled(), profiles, active, monitors, monitor }
     }
 
     /// A tray click / menu choice.
@@ -2262,6 +2318,7 @@ impl App {
             TrayCmd::Profile(i) => self.switch_profile(i),
             TrayCmd::SaveProfile => self.ask_profile_name(),
             TrayCmd::DeleteProfile => self.delete_profile(),
+            TrayCmd::Monitor(i) => self.set_monitor(i),
             TrayCmd::Quit => {
                 let _ = DestroyWindow(self.hwnd);
             }
@@ -2655,6 +2712,7 @@ impl App {
                 self.write_setting("accentMode", serde_json::json!(m.key()));
                 self.refresh_accent(true);
             }
+            ui::Opt::Monitor => return self.set_monitor(k), // redraws the panel itself
         }
         if let Some(d) = self.hover_dirty(Hit::Panel) {
             self.frame(d);
@@ -2725,7 +2783,16 @@ impl App {
     unsafe fn rebuild(&mut self, keep_layout: bool) {
         let mon = monitor();
         let (mw, mh) = (mon.rect.right - mon.rect.left, mon.rect.bottom - mon.rect.top);
-        let s = if keep_layout { self.s } else { GetDpiForWindow(self.hwnd) as f32 / 96.0 };
+        let s = if keep_layout && same_rect(&mon.rect, &self.mon) { self.s } else { mon.scale };
+        // another monitor's desk (its own layout; the primary one when the chosen monitor is unplugged): every card is replaced
+        let new_desk = mon.slot != self.slot;
+        if new_desk {
+            self.slot = mon.slot.clone();
+            layout::set_slot(mon.slot.clone());
+            self.items = layout::items_for(&layout::read_config(), mon.slot.as_deref());
+            self.clear_desk();
+        }
+        (self.ui.mon_count, self.ui.mon_sel) = (mon.count, mon.pos);
         self.backdrop = None; // stops the capture thread before a new duplication is requested
         self.mon = mon.rect;
         self.work = mon.work;
@@ -2752,7 +2819,7 @@ impl App {
             }
         }
         let card_rects: Vec<RECT> = rects.iter().map(|&(x, y, w, h)| RECT { left: x, top: y, right: x + w, bottom: y + h }).collect();
-        let bd = make_backdrop(&self.gfx, &mon, mw, mh, self.settings.live, self.fps, &region_list(&card_rects, None, None), m);
+        let bd = make_backdrop(&self.gfx, &mon, mw, mh, self.settings.live, self.fps, &region_list(&card_rects, None, None), m, self.gfx_luid);
         bd.set_hwnd(self.hwnd);
         self.use_dupl = bd.name().starts_with("desktop");
         if let Err(e) = self.scene.reconfigure(&self.gfx, mw, mh, cs, bd.bitmap(), &rects) {
@@ -2788,14 +2855,23 @@ impl App {
         let d = RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h };
         self.frame(d);
         self.update_tick_timer();
+        if new_desk {
+            self.pop_all_in();
+        }
     }
 
+    /// Display / DPI / work-area change, a monitor (un)plugged or a new `widgetsMonitor`: when the monitor the desk belongs on (see monitors.rs) is not
+    /// the one we sit on, or its geometry / DPI changed, everything is re-placed. An unplugged monitor falls back to the primary one, and the desk
+    /// returns when it comes back.
     unsafe fn replace_monitor(&mut self) {
         let cur = monitor();
-        let same = cur.rect.left == self.mon.left && cur.rect.top == self.mon.top && cur.rect.right == self.mon.right && cur.rect.bottom == self.mon.bottom;
-        let s = GetDpiForWindow(self.hwnd) as f32 / 96.0;
         let wa = cur.work.bottom == self.work.bottom && cur.work.top == self.work.top;
-        if same && (s - self.s).abs() < 0.01 && wa {
+        let (count, pos) = (self.ui.mon_count, self.ui.mon_sel);
+        (self.ui.mon_count, self.ui.mon_sel) = (cur.count, cur.pos);
+        if same_rect(&cur.rect, &self.mon) && (cur.scale - self.s).abs() < 0.01 && wa && cur.slot == self.slot {
+            if (count, pos) != (cur.count, cur.pos) && self.ui.settings {
+                self.redraw_ui(); // a monitor came or went: the "Monitor" control has another number of segments
+            }
             return;
         }
         if self.drag.is_some() {
@@ -2803,6 +2879,63 @@ impl App {
         }
         eprintln!("mswidgets: monitor / DPI / work area changed, re-placing the widgets");
         self.rebuild(false);
+    }
+
+    /// Every card leaves the scene (the stored layout stays): a new desk is about to be built from `items`.
+    unsafe fn clear_desk(&mut self) {
+        let now = self.now();
+        self.leave(&now);
+        self.hot = None;
+        self.pressed = None;
+        self.press = Press::None;
+        self.ui.hover = Hit::None;
+        self.ui.press = Hit::None;
+        while self.scene.len() > 0 {
+            self.scene.remove_card(0);
+        }
+        self.pops.clear();
+        self.springs.clear();
+    }
+
+    /// The freshly built desk condenses card by card (a plain appearance with reduced motion).
+    unsafe fn pop_all_in(&mut self) {
+        if !self.reduced {
+            let t = Instant::now();
+            for i in 0..self.scene.len() {
+                let uid = self.scene.cards[i].uid;
+                self.pops.insert(uid, Pop { t0: t + Duration::from_millis(60 * i as u64), out: false });
+                self.scene.set_xf(i, mat_xf(&motion::materialize(0.0, false, false), 0.0, 0.0));
+            }
+            self.last_anim = t;
+            self.arm_anim();
+        }
+        if !self.ui.edit && !self.want_full() {
+            SetTimer(self.hwnd, T_SHRINK, 400, None);
+        }
+    }
+
+    /// Move the desk to the monitor at display position `pos` (settings panel / tray menu): this monitor's layout is written back to its own slot,
+    /// the choice is stored in `widgetsMonitor` (the primary monitor as "primary", the others by device name) and the desk is rebuilt there with
+    /// that monitor's layout (an empty desk the first time). Nothing changes when config.json cannot be written.
+    unsafe fn set_monitor(&mut self, pos: usize) {
+        let list = monitors::enumerate();
+        let Some(choice) = monitors::choice_for_position(&list, pos) else { return };
+        if monitors::choice() == choice {
+            return;
+        }
+        if self.drag.is_some() {
+            self.end_drag();
+        }
+        if let Err(e) = layout::save_layout(&self.items).and_then(|_| layout::write_setting("widgetsMonitor", serde_json::json!(choice.key()))) {
+            self.note_own_write();
+            return self.notify(format!("{}: {e}", self.ui.lang.pick("Монитор не изменён", "Monitor not changed")));
+        }
+        self.note_own_write();
+        monitors::set_choice(choice);
+        self.replace_monitor();
+        if self.ui.settings {
+            self.redraw_ui();
+        }
     }
 
     /// config.json changed behind our back (the settings of the Tauri app / a manual edit): glass, backdrop mode, dim.
@@ -2839,6 +2972,14 @@ impl App {
         if new.live != old.live {
             self.ui.live = new.live;
             self.rebuild(true);
+        }
+        // `widgetsMonitor` edited behind our back: the desk moves (our own writes set the choice first, so they are not seen as a change)
+        if let Some(root) = layout::try_read_config() {
+            let choice = monitors::Choice::from_value(&root);
+            if choice != monitors::choice() {
+                monitors::set_choice(choice);
+                self.replace_monitor();
+            }
         }
         // `widgetsLook` edited behind our back (the sliders of the Tauri app / by hand)
         let look = layout::read_look();
@@ -2935,7 +3076,7 @@ impl App {
             self.app_front = front;
             self.update_dim();
         }
-        let fs = self.user_hidden || foreground_is_fullscreen(self.hwnd);
+        let fs = self.user_hidden || foreground_is_fullscreen(self.hwnd, &self.mon);
         if fs && self.visible {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
             self.visible = false;
@@ -3065,36 +3206,13 @@ impl App {
         self.note_own_write();
         // the new desk: items + look from the file, every card replaced (a card of the same id may have another size / cfg in the new layout)
         let root = layout::read_config();
-        self.items = layout::items_from_value(&root);
+        self.items = layout::items_for(&root, self.slot.as_deref()); // the active monitor's layout
         self.look_cfg = layout::look_from_value(&root);
         self.ui.look = crate::glass::apply_look(&self.look_base, &self.look_cfg);
-        let now = self.now();
-        self.leave(&now);
-        self.hot = None;
-        self.pressed = None;
-        self.press = Press::None;
-        self.ui.hover = Hit::None;
-        self.ui.press = Hit::None;
-        while self.scene.len() > 0 {
-            self.scene.remove_card(0);
-        }
-        self.pops.clear();
-        self.springs.clear();
+        self.clear_desk();
         self.apply_look_now(); // the glass parameters first: the new cards are built with them
         self.rebuild(true); // also the card scale of the new look: a new grid, the cards come back from `items`
-        if !self.reduced {
-            let t = Instant::now();
-            for i in 0..self.scene.len() {
-                let uid = self.scene.cards[i].uid;
-                self.pops.insert(uid, Pop { t0: t + Duration::from_millis(60 * i as u64), out: false });
-                self.scene.set_xf(i, mat_xf(&motion::materialize(0.0, false, false), 0.0, 0.0));
-            }
-            self.last_anim = t;
-            self.arm_anim();
-        }
-        if !self.ui.edit && !self.want_full() {
-            SetTimer(self.hwnd, T_SHRINK, 400, None);
-        }
+        self.pop_all_in();
     }
 
     /// Tray "Save current layout as...": the prompt runs on its own thread (it has a message loop); the name comes back as `WM_PROFILE_NAME`.
@@ -3141,6 +3259,10 @@ impl App {
             Err(e) => self.notify(format!("{}: {e}", self.ui.lang.pick("Макет не удалён", "Layout not deleted"))),
         }
     }
+}
+
+fn same_rect(a: &RECT, b: &RECT) -> bool {
+    (a.left, a.top, a.right, a.bottom) == (b.left, b.top, b.right, b.bottom)
 }
 
 fn step_toward(v: f32, target: f32, d: f32) -> f32 {
@@ -3199,8 +3321,9 @@ unsafe fn app_in_front(me: HWND) -> bool {
     )
 }
 
-/// Same logic as `foreground_is_fullscreen` in src-tauri/src/main.rs (the own window does not count).
-unsafe fn foreground_is_fullscreen(me: HWND) -> bool {
+/// Same logic as `foreground_is_fullscreen` in src-tauri/src/main.rs (the own window does not count). Only a fullscreen window on `ours`, the
+/// monitor the desk lives on, counts: a game on the other monitor leaves the widgets alone.
+unsafe fn foreground_is_fullscreen(me: HWND, ours: &RECT) -> bool {
     let hwnd = GetForegroundWindow();
     if hwnd.0.is_null() || hwnd == me {
         return false;
@@ -3221,6 +3344,9 @@ unsafe fn foreground_is_fullscreen(me: HWND) -> bool {
         return false;
     }
     let m = mi.rcMonitor;
+    if !same_rect(&m, ours) {
+        return false;
+    }
     r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
 }
 
@@ -3258,6 +3384,16 @@ mod tests {
         let x = mat_xf(&s0, 0.0, 0.0);
         assert!(!x.is_id() && x.blur > 0.99 && x.sweep < 0.0);
         assert!(mat_xf(&s1, 0.0, 0.0).is_id());
+    }
+
+    /// Capture outputs are only used on the GPU the UI device lives on (shared textures); an unknown device GPU keeps the old behaviour.
+    #[test]
+    fn capture_output_must_share_the_gpu() {
+        assert!(same_gpu(None, 7));
+        assert!(same_gpu(Some(7), 7));
+        assert!(!same_gpu(Some(7), (1 << 32) | 7));
+        assert!(same_rect(&RECT { left: -1920, top: 0, right: 0, bottom: 1080 }, &RECT { left: -1920, top: 0, right: 0, bottom: 1080 }));
+        assert!(!same_rect(&RECT { left: 0, top: 0, right: 1, bottom: 1 }, &RECT { left: 0, top: 0, right: 1, bottom: 2 }));
     }
 
     #[test]

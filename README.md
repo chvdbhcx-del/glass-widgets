@@ -86,6 +86,8 @@ Everything lives in `%APPDATA%\macshell\config.json` (written by the edit mode; 
 | Key | Values |
 | --- | --- |
 | `widgetsLayout` | list of cards: `type`, `size` (`s` `m` `l`), `col`, `row`, `cfg` (per-widget settings) |
+| `widgetsMonitor` | the monitor the desk lives on: `primary` (default), `cursor` (the one under the mouse at start), a number (1 = primary, then left to right) or a device name such as `\.\DISPLAY2` (what the settings panel / tray menu store). A monitor that is gone falls back to the primary one and the desk returns when it is plugged in again |
+| `monitorLayouts` | the cards of every non-primary monitor: `{ "\.\DISPLAY2": [ ...like widgetsLayout... ] }` (`widgetsLayout` stays the primary monitor's layout; `monitorProfiles` holds the checked profile per monitor; look, panels and the rest are shared) |
 | `widgetsGlassMode` | anything but `plain` = live wallpaper behind the glass; `plain` = no capture, cheapest |
 | `widgetsAppearance` | `dark` (default), `light` or `auto` (follows the brightness under each card) |
 | `widgetsDim` | `auto` (default), `never`, `always` |

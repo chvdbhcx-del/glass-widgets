@@ -134,14 +134,19 @@ pub enum Opt {
     Source,
     /// blue / from the wallpaper (`accentMode`)
     Accent,
+    /// which monitor the desk lives on (`widgetsMonitor`): one segment per connected monitor, `Ui::opt_n` of them
+    Monitor,
 }
+/// At most this many monitors get a segment (the tray menu lists all of them).
+pub const MON_SEGS: usize = 5;
 impl Opt {
-    pub const ALL: [Opt; 4] = [Opt::Appearance, Opt::Dim, Opt::Source, Opt::Accent];
+    pub const ALL: [Opt; 5] = [Opt::Appearance, Opt::Dim, Opt::Source, Opt::Accent, Opt::Monitor];
+    /// Number of options of a fixed control (`Monitor` depends on the connected monitors: `Ui::opt_n`).
     pub fn count(self) -> usize {
-        if matches!(self, Opt::Source | Opt::Accent) {
-            2
-        } else {
-            3
+        match self {
+            Opt::Source | Opt::Accent => 2,
+            Opt::Monitor => 1,
+            _ => 3,
         }
     }
     /// Option `k` as the appearance preference (Dark, Light, Auto).
@@ -250,6 +255,9 @@ pub struct Ui {
     pub appearance: AppearancePref,
     pub dim_mode: Dim,
     pub accent_mode: AccentMode,
+    /// number of connected monitors and the display position (0 = primary) of the one the desk is on
+    pub mon_count: usize,
+    pub mon_sel: usize,
     pub autostart: bool,
     /// settings panel: `checkUpdates` and the state of the update check
     pub check_start: bool,
@@ -453,6 +461,8 @@ impl Ui {
             appearance: AppearancePref::default(),
             dim_mode: Dim::Auto,
             accent_mode: AccentMode::Blue,
+            mon_count: 1,
+            mon_sel: 0,
             autostart: false,
             check_start: false,
             update: UpdateState::Idle,
@@ -585,7 +595,7 @@ impl Ui {
     /// The settings panel opens at the right edge, vertically centred: the cards (top left of the desk) stay visible to judge the look.
     fn settings_home(&self) -> Rect {
         let w = SET_W.min(self.mw - 16.0);
-        let h = (SET_TOP + (1 + LOOK.len()) as f32 * SET_ROW + 14.0 + SET_FOOT).min(self.mh - 24.0);
+        let h = (SET_TOP + (1 + LOOK.len()) as f32 * SET_ROW + 14.0 + SET_FOOT + OPT_ROW).min(self.mh - 24.0);
         Rect::new((self.mw - w - (self.mw * 0.04).max(8.0)).max(8.0), ((self.mh - h) / 2.0).max(8.0), w, h)
     }
 
@@ -717,8 +727,9 @@ impl Ui {
         }
         for o in &l.opts {
             if o.seg.contains(lx, ly) {
-                let k = (((lx - o.seg.x) / o.seg.w) * o.which.count() as f32) as usize;
-                return Hit::Opt(o.which, k.min(o.which.count() - 1));
+                let n = self.opt_n(o.which);
+                let k = (((lx - o.seg.x) / o.seg.w) * n as f32) as usize;
+                return Hit::Opt(o.which, k.min(n - 1));
             }
         }
         if l.auto_row.contains(lx, ly) {
@@ -785,7 +796,7 @@ impl Ui {
         if k < n {
             return Hit::Look(k, self.set_pos(k));
         }
-        [Hit::ResetLook, Hit::Opt(Opt::Appearance, 1), Hit::Opt(Opt::Dim, 0), Hit::Opt(Opt::Source, 1), Hit::Opt(Opt::Accent, 1), Hit::Autostart, Hit::CheckStart, Hit::EditBtn, Hit::QuitBtn, Hit::UpdBtn, Hit::UpdDownload, Hit::Done].get(k - n).copied().unwrap_or(Hit::None)
+        [Hit::ResetLook, Hit::Opt(Opt::Appearance, 1), Hit::Opt(Opt::Dim, 0), Hit::Opt(Opt::Source, 1), Hit::Opt(Opt::Accent, 1), Hit::Opt(Opt::Monitor, 0), Hit::Autostart, Hit::CheckStart, Hit::EditBtn, Hit::QuitBtn, Hit::UpdBtn, Hit::UpdDownload, Hit::Done].get(k - n).copied().unwrap_or(Hit::None)
     }
 
     // ------------------------------------------------ keyboard / wheel on the sliders
@@ -840,6 +851,15 @@ impl Ui {
             Opt::Dim => [Dim::Auto, Dim::Never, Dim::Always].iter().position(|d| *d == self.dim_mode).unwrap_or(0),
             Opt::Source => usize::from(!self.live),
             Opt::Accent => usize::from(self.accent_mode == AccentMode::Wallpaper),
+            Opt::Monitor => self.mon_sel.min(self.opt_n(o) - 1),
+        }
+    }
+
+    /// Number of segments of a control: fixed, except `Monitor` (one per connected monitor, 1..=MON_SEGS).
+    pub fn opt_n(&self, o: Opt) -> usize {
+        match o {
+            Opt::Monitor => self.mon_count.clamp(1, MON_SEGS),
+            _ => o.count(),
         }
     }
 
@@ -1386,17 +1406,23 @@ impl Ui {
             self.set_button(cx, l.reset, self.t("Сбросить вид", "Reset look"), hot, pr == Hit::ResetLook, TEXT);
 
             // behaviour: segmented controls
-            let labels: [(Opt, (&str, &str), [(&str, &str); 3]); 4] = [
+            let labels: [(Opt, (&str, &str), [(&str, &str); 3]); 5] = [
                 (Opt::Appearance, ("Оформление", "Appearance"), [("Тёмное", "Dark"), ("Светлое", "Light"), ("Авто", "Auto")]),
                 (Opt::Dim, ("Приглушение", "Dimming"), [("Авто", "Auto"), ("Никогда", "Never"), ("Всегда", "Always")]),
                 (Opt::Source, ("Источник стекла", "Glass source"), [("Живой", "Live"), ("Простой", "Plain"), ("", "")]),
                 (Opt::Accent, ("Акцент", "Accent"), [("Синий", "Blue"), ("Из обоев", "Wallpaper"), ("", "")]),
+                (Opt::Monitor, ("Монитор", "Monitor"), [("", ""), ("", ""), ("", "")]),
             ];
+            let nums: Vec<String> = (1..=self.opt_n(Opt::Monitor)).map(|n| n.to_string()).collect();
             for o in &l.opts {
                 let Some((_, (ru, en), opts)) = labels.iter().find(|x| x.0 == o.which) else { continue };
                 cx.text(o.label, self.t(ru, en), Style::new(12.5, 500).ellipsis(), TEXT);
                 let sel = self.opt_sel(o.which);
-                let items: Vec<(&str, bool)> = opts.iter().take(o.which.count()).enumerate().map(|(k, (r, e))| (self.t(r, e), k == sel)).collect();
+                let items: Vec<(&str, bool)> = if o.which == Opt::Monitor {
+                    nums.iter().enumerate().map(|(k, n)| (n.as_str(), k == sel)).collect()
+                } else {
+                    opts.iter().take(o.which.count()).enumerate().map(|(k, (r, e))| (self.t(r, e), k == sel)).collect()
+                };
                 let hot = if let Hit::Opt(w, k) = hv { (w == o.which).then_some(k) } else { None };
                 self.seg(cx, o.seg, &items, 2.0, hot);
             }
@@ -1781,8 +1807,8 @@ mod tests {
             assert!((ui.set_value_at(3, (t.x + t.w * 0.25) as i32) - 0.25).abs() < 0.01);
             // segmented controls pick the option under the pointer
             for o in &l.opts {
-                for k in 0..o.which.count() {
-                    let x = o.seg.x + o.seg.w * (k as f32 + 0.5) / o.which.count() as f32;
+                for k in 0..ui.opt_n(o.which) {
+                    let x = o.seg.x + o.seg.w * (k as f32 + 0.5) / ui.opt_n(o.which) as f32;
                     assert_eq!(ui.set_hit(x, o.seg.cy()), Hit::Opt(o.which, k));
                 }
             }
@@ -1802,8 +1828,32 @@ mod tests {
             assert_eq!(ui.set_hit(p.x - 1.0, p.cy()), Hit::None);
             assert_eq!(ui.set_hit(1.0, 1.0), Hit::None);
             // reading order for the headless --hover
-            assert!(matches!(ui.nth_control(0), Hit::Look(0, _)) && ui.nth_control(l.rows.len() + 11) == Hit::Done && ui.nth_control(99) == Hit::None);
+            assert!(matches!(ui.nth_control(0), Hit::Look(0, _)) && ui.nth_control(l.rows.len() + 12) == Hit::Done && ui.nth_control(99) == Hit::None);
         }
+    }
+
+    /// The "Monitor" control has one segment per connected monitor (1..=MON_SEGS), the selected one follows `mon_sel`, a click picks the segment.
+    #[test]
+    fn monitor_control_follows_the_monitor_count() {
+        let mut ui = Ui::new(Lang::En, 1.0, 1600.0, 900.0);
+        ui.edit = true;
+        ui.settings = true;
+        assert_eq!((ui.opt_n(Opt::Monitor), ui.opt_sel(Opt::Monitor), ui.opt_n(Opt::Dim)), (1, 0, 3));
+        (ui.mon_count, ui.mon_sel) = (3, 2);
+        assert_eq!((ui.opt_n(Opt::Monitor), ui.opt_sel(Opt::Monitor)), (3, 2));
+        (ui.mon_count, ui.mon_sel) = (9, 8);
+        assert_eq!((ui.opt_n(Opt::Monitor), ui.opt_sel(Opt::Monitor)), (MON_SEGS, MON_SEGS - 1));
+        (ui.mon_count, ui.mon_sel) = (0, 5);
+        assert_eq!((ui.opt_n(Opt::Monitor), ui.opt_sel(Opt::Monitor)), (1, 0));
+        ui.mon_count = 3;
+        let l = ui.set_lay();
+        let o = l.opts.iter().find(|o| o.which == Opt::Monitor).expect("monitor row");
+        for k in 0..3 {
+            assert_eq!(ui.set_hit(o.seg.x + o.seg.w * (k as f32 + 0.5) / 3.0, o.seg.cy()), Hit::Opt(Opt::Monitor, k));
+        }
+        // the row sits inside the panel above the switches, and the panel grew to hold it
+        assert!(l.panel.contains(o.seg.cx(), o.seg.cy()) && o.seg.bottom() <= l.auto_row.y + 0.5);
+        assert!(l.edit_btn.bottom() < l.panel.bottom());
     }
 
     /// The shown values follow the look: positions, texts, the selected options, the base tick.
@@ -1934,6 +1984,8 @@ pub struct DumpArgs {
     pub look: Option<String>,
     /// `--update-state idle|checking|latest|available|failed`: the update line of the settings panel (sample)
     pub update_state: Option<String>,
+    /// `--monitors count,selected`: the "Monitor" control of the settings panel (sample: two monitors, the first one)
+    pub monitors: Option<(usize, usize)>,
 }
 
 /// `--dump-ui`: compose the host UI of a state (live | edit | gallery | menu) headless into a PNG with the SAME scene / UI code as the live host:
@@ -2004,6 +2056,7 @@ pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
     ui.appearance = a.appearance.unwrap_or(settings.appearance);
     ui.dim_mode = settings.dim;
     ui.accent_mode = settings.accent;
+    (ui.mon_count, ui.mon_sel) = a.monitors.unwrap_or(if ui.settings { (2, 0) } else { (1, 0) });
     ui.autostart = true; // sample state: the registry is never read by a headless render
     ui.check_start = settings.check_updates;
     ui.update = match a.update_state.as_deref() {

@@ -93,7 +93,7 @@ impl WgcBackdrop {
                 ctx: cap_ctx,
                 tex,
                 pool,
-                org: (mon.left - pr.left, mon.top - pr.top),
+                org: origin_in_window(&mon, &pr),
                 size: (w as i32, h as i32),
                 // the glass is blurred: a wallpaper video under it needs no more than ~15 fps
                 interval: Duration::from_micros(1_000_000 / fps.clamp(1, 15) as u64),
@@ -151,6 +151,65 @@ impl Backdrop for WgcBackdrop {
     }
 }
 
+/// Which part of a captured frame lands in the monitor's backdrop texture. `org` = the monitor's top-left inside the captured window
+/// (monitor origin minus the window origin, desktop px; negative or positive: the desktop window spans ALL monitors, so a monitor left of
+/// or above the primary one has a smaller origin), `size` = the monitor size, `content` = the size of the frame. Returns the source box
+/// `[left, top, right, bottom]` in the frame and the destination offset in the texture, None when none of the monitor is in the frame.
+fn crop(org: (i32, i32), size: (i32, i32), content: (i32, i32)) -> Option<([i32; 4], (i32, i32))> {
+    let (l, t) = (org.0.max(0), org.1.max(0));
+    let (r, b) = ((org.0 + size.0).min(content.0), (org.1 + size.1).min(content.1));
+    (r > l && b > t).then_some(([l, t, r, b], (l - org.0, t - org.1)))
+}
+
+/// The monitor origin inside the captured desktop window.
+fn origin_in_window(mon: &RECT, window: &RECT) -> (i32, i32) {
+    (mon.left - window.left, mon.top - window.top)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rc(l: i32, t: i32, w: i32, h: i32) -> RECT {
+        RECT { left: l, top: t, right: l + w, bottom: t + h }
+    }
+
+    /// Progman spans the virtual desktop: primary 1920x1080 at 0,0, a second monitor LEFT of it (negative x, shifted down), a third
+    /// to the right and above. Every monitor's crop is its own rectangle of the frame, whatever the coordinates.
+    #[test]
+    fn each_monitor_crops_its_own_part_of_the_virtual_desktop() {
+        let prim = rc(0, 0, 1920, 1080);
+        let left = rc(-1280, 100, 1280, 1024);
+        let right = rc(1920, -200, 2560, 1440);
+        let desk = rc(-1280, -200, 1280 + 1920 + 2560, 1440); // union: x -1280..4480, y -200..1240
+        let frame = (desk.right - desk.left, desk.bottom - desk.top);
+        assert_eq!(frame, (5760, 1440));
+        let c = |m: &RECT| crop(origin_in_window(m, &desk), (m.right - m.left, m.bottom - m.top), frame);
+        assert_eq!(c(&prim), Some(([1280, 200, 3200, 1280], (0, 0))));
+        assert_eq!(c(&left), Some(([0, 300, 1280, 1324], (0, 0))));
+        assert_eq!(c(&right), Some(([3200, 0, 5760, 1440], (0, 0))));
+        // the crop is as big as the monitor in every case
+        for m in [&prim, &left, &right] {
+            let ([l, t, r, b], _) = c(m).unwrap();
+            assert_eq!((r - l, b - t), (m.right - m.left, m.bottom - m.top));
+        }
+    }
+
+    /// A window that covers only part of the monitor (the desktop window smaller than the monitor, a frame not yet resized): the
+    /// visible part is copied to the matching place of the texture, nothing outside the frame is read.
+    #[test]
+    fn partial_overlap_keeps_the_destination_offset() {
+        // monitor starts 100 px left of / 50 px above the window: the texture's first 100 columns and 50 rows stay empty
+        assert_eq!(crop((-100, -50), (1920, 1080), (4000, 3000)), Some(([0, 0, 1820, 1030], (100, 50))));
+        // the frame is smaller than the monitor
+        assert_eq!(crop((10, 20), (1920, 1080), (1000, 500)), Some(([10, 20, 1000, 500], (0, 0))));
+        // the monitor is entirely outside the frame, or the frame is empty
+        assert_eq!(crop((5000, 0), (1920, 1080), (4000, 3000)), None);
+        assert_eq!(crop((-2000, 0), (1920, 1080), (4000, 3000)), None);
+        assert_eq!(crop((0, 0), (1920, 1080), (0, 0)), None);
+    }
+}
+
 unsafe fn wgc_loop(c: WgcCap) {
     let sh = &c.shared;
     let mut regions: Vec<RECT> = Vec::new();
@@ -183,11 +242,9 @@ unsafe fn wgc_loop(c: WgcCap) {
             let src = f.Surface().ok().and_then(|s| s.cast::<IDirect3DDxgiInterfaceAccess>().ok()).and_then(|a| a.GetInterface::<ID3D11Texture2D>().ok());
             if let (Some(src), Ok(cs)) = (src, f.ContentSize()) {
                 // the visible part of the monitor inside the captured window
-                let (l, t) = (c.org.0.max(0), c.org.1.max(0));
-                let (r, b) = ((c.org.0 + c.size.0).min(cs.Width), (c.org.1 + c.size.1).min(cs.Height));
-                if r > l && b > t {
+                if let Some(([l, t, r, b], (dx, dy))) = crop(c.org, c.size, (cs.Width, cs.Height)) {
                     let bx = D3D11_BOX { left: l as u32, top: t as u32, front: 0, right: r as u32, bottom: b as u32, back: 1 };
-                    c.ctx.CopySubresourceRegion(&c.tex, 0, (l - c.org.0) as u32, (t - c.org.1) as u32, 0, &src, 0, Some(&bx));
+                    c.ctx.CopySubresourceRegion(&c.tex, 0, dx as u32, dy as u32, 0, &src, 0, Some(&bx));
                     c.ctx.Flush();
                     sh.copied.fetch_add(1, Relaxed);
                     let mask = regions.iter().take(64).enumerate().filter(|(_, r)| r.right > r.left && r.bottom > r.top).fold(0u64, |m, (i, _)| m | 1 << i);

@@ -1,7 +1,7 @@
 //! mswidgets - native (no WebView) Direct2D renderer for the macshell desktop widgets. See native/NATIVE.md.
 //!   mswidgets --dump out.png --backdrop bd.png --cards "clock:s@0,0;calendar:m@1,0" [--scale 1] [--w W --h H] [--time "2026-10-24 10:08:35"]
 //!   mswidgets --sheet out.png --backdrop bd.png [--only clock,calendar] [--scale 1] [--time "..."]    contact sheet: every widget x every size
-//!   mswidgets --dump-ui out.png [--backdrop bd.png] --state live|edit|gallery|settings|menu [--look '{"blur":9}'] [--update-state idle|checking|latest|available|failed] [--size WxH] [--search txt] [--group id] [--psize s|m|l] [--hover n] [--dim] [--scale S] [--cards ...]
+//!   mswidgets --dump-ui out.png [--backdrop bd.png] --state live|edit|gallery|settings|menu [--look '{"blur":9}'] [--update-state idle|checking|latest|available|failed] [--size WxH] [--search txt] [--group id] [--psize s|m|l] [--hover n] [--monitors count,selected] [--dim] [--scale S] [--cards ...]
 //!                                                                     the host UI (edit mode, gallery with live previews) rendered headless
 //!   mswidgets [--backdrop-fps 30] [--scale S] [--no-config] [--no-hotkeys]   live mode (Ctrl+Alt+Q quits, Ctrl+Alt+W edits; a second instance exits silently)
 //!   mswidgets --bench SECONDS [--backdrop-fps N]                    live mode that prints stats and exits
@@ -25,6 +25,7 @@ mod icons;
 mod input;
 mod layout;
 mod liquid;
+mod monitors;
 mod motion;
 mod net;
 mod registry;
@@ -78,6 +79,7 @@ struct Args {
     glass_params: Option<String>,
     look: Option<String>,
     update_state: Option<String>,
+    monitors: Option<(usize, usize)>,
     calib: Option<String>,
     calib_dir: Option<String>,
     calib_out: Option<String>,
@@ -130,6 +132,7 @@ fn parse_args() -> Args {
             "--group" => a.group = Some(val()),
             "--psize" => a.psize = Size::parse(&val()),
             "--hover" => a.hover = val().parse().ok(),
+            "--monitors" => a.monitors = val().split_once(',').and_then(|(n, s)| Some((n.trim().parse().ok()?, s.trim().parse().ok()?))),
             "--appearance" => {
                 let v = val();
                 a.appearance = motion::AppearancePref::parse(&v);
@@ -243,6 +246,7 @@ fn main() {
             appearance: a.appearance,
             look: a.look.clone(),
             update_state: a.update_state.clone(),
+            monitors: a.monitors,
         }))
     } else {
         // one live instance per session (a bench run may coexist with a live one)
