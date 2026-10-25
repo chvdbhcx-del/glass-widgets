@@ -1035,11 +1035,14 @@ impl<'a> Cx<'a> {
                     let _ = l1.SetCharacterSpacing(0.0, track, 0.0, range);
                 }
             }
-            if st.mono {
-                if let Ok(t) = self.gfx.dw.CreateTypography() {
+            // Inter's stylistic set 3 = round commas (the default comma hangs far below the baseline: ugly in a big "9,0"); tabular figures for numbers that
+            // change in place, but not at display sizes: a tabular "9,0" at 40 px has wide holes around the comma, and nothing jitters at that size anyway
+            if let Ok(t) = self.gfx.dw.CreateTypography() {
+                let _ = t.AddFontFeature(DWRITE_FONT_FEATURE { nameTag: DWRITE_FONT_FEATURE_TAG_STYLISTIC_SET_3, parameter: 1 });
+                if st.mono && st.size < 36.0 {
                     let _ = t.AddFontFeature(DWRITE_FONT_FEATURE { nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, parameter: 1 });
-                    let _ = lay.SetTypography(&t, range);
                 }
+                let _ = lay.SetTypography(&t, range);
             }
             Ok(lay)
         }

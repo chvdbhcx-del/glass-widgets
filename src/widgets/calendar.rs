@@ -39,8 +39,8 @@ struct Metrics {
     num_cy: f32,
     title_size: f32,
 }
-const MS: Metrics = Metrics { head: 22.0, dow_h: 15.0, dow_size: 10.0, row: 17.0, num_size: 11.5, circ: 8.5, num_cy: 8.5, title_size: 12.0 };
-const ML: Metrics = Metrics { head: 30.0, dow_h: 20.0, dow_size: 12.0, row: 28.0, num_size: 15.0, circ: 12.0, num_cy: 12.5, title_size: 13.0 };
+const MS: Metrics = Metrics { head: 22.0, dow_h: 15.0, dow_size: 10.0, row: 17.0, num_size: 11.0, circ: 10.5, num_cy: 8.5, title_size: 12.0 };
+const ML: Metrics = Metrics { head: 30.0, dow_h: 20.0, dow_size: 12.0, row: 28.0, num_size: 15.0, circ: 14.0, num_cy: 12.5, title_size: 13.0 };
 
 fn view_month(now: &Now, offset: i32) -> (i32, u32) {
     let m = now.y * 12 + now.mo as i32 - 1 + offset;

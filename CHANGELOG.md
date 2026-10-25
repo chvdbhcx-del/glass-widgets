@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.1] - 2026-10-25
+
+### Changed
+- Big numbers: round commas (Inter's stylistic set 3, the default comma hung far below the baseline) and proportional figures from 36 px up (a tabular "9,0" had wide holes around the comma); small numbers that change in place stay tabular.
+- Calendar: the circle of today is larger, the digits no longer touch its edge.
+
 ## [0.5.0] - 2026-10-25
 
 ### Added
