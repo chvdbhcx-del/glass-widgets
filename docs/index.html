@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glass Widgets: Liquid-Glass desktop widgets for Windows</title>
+<meta name="description" content="Native desktop widgets for Windows 10/11 with a Liquid-Glass look. Translucent cards that refract your wallpaper, live wallpapers included. No WebView, no Electron, no telemetry.">
+<link rel="canonical" href="https://chvdbhcx-del.github.io/glass-widgets/">
+<meta name="theme-color" content="#0b0d1a">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Glass Widgets">
+<meta property="og:title" content="Glass Widgets: Liquid-Glass desktop widgets for Windows">
+<meta property="og:description" content="Translucent cards that refract your wallpaper. Native Direct2D, about 1 MB installer, no telemetry.">
+<meta property="og:url" content="https://chvdbhcx-del.github.io/glass-widgets/">
+<meta property="og:image" content="https://chvdbhcx-del.github.io/glass-widgets/images/hero.png">
+<meta property="og:image:alt" content="Glass Widgets on a wallpaper: weather, clock, calendar, music, reminders and more">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+@font-face{font-family:Inter;font-weight:400;font-display:swap;src:url(fonts/Inter-Regular.ttf) format("truetype")}
+@font-face{font-family:Inter;font-weight:600;font-display:swap;src:url(fonts/Inter-SemiBold.ttf) format("truetype")}
+@font-face{font-family:Inter;font-weight:700;font-display:swap;src:url(fonts/Inter-Bold.ttf) format("truetype")}
+:root{
+  --bg:#0b0d1a;--bg1:rgba(59,130,246,.34);--bg2:rgba(168,85,247,.30);--bg3:rgba(236,120,90,.16);
+  --text:#eef0fb;--muted:#a3a8c3;--card:rgba(255,255,255,.07);--line:rgba(255,255,255,.15);--shadow:0 20px 60px rgba(0,0,0,.45);
+  --accent:#3b82f6;--accent2:#7c5cff;--btn-text:#fff;--code:rgba(255,255,255,.1)
+}
+@media (prefers-color-scheme:light){:root:not([data-theme=dark]){
+  --bg:#eef0fb;--bg1:rgba(59,130,246,.30);--bg2:rgba(192,132,252,.34);--bg3:rgba(251,146,100,.22);
+  --text:#161830;--muted:#565b7a;--card:rgba(255,255,255,.62);--line:rgba(255,255,255,.9);--shadow:0 20px 50px rgba(60,70,140,.2);
+  --code:rgba(22,24,48,.08)}}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;font:400 16px/1.6 Inter,system-ui,"Segoe UI",sans-serif;color:var(--text);background:var(--bg);min-height:100vh;
+  background-image:radial-gradient(60rem 36rem at 10% -5%,var(--bg1),transparent 60%),radial-gradient(50rem 34rem at 95% 8%,var(--bg2),transparent 60%),radial-gradient(60rem 30rem at 50% 105%,var(--bg3),transparent 60%);
+  background-attachment:fixed;-webkit-font-smoothing:antialiased}
+a{color:inherit}
+.wrap{max-width:1040px;margin:0 auto;padding:0 16px}
+html[data-lang=en] [lang=ru],html[data-lang=ru] [lang=en]{display:none!important}
+header.top{display:flex;align-items:center;justify-content:space-between;padding:18px 0;gap:12px}
+.brand{font-weight:700;letter-spacing:-.01em;text-decoration:none}
+.top nav{display:flex;gap:10px;align-items:center}
+.top nav a{color:var(--muted);text-decoration:none;font-size:14px;padding:4px 6px}
+.top nav a:hover{color:var(--text)}
+#lang{font:600 13px Inter,sans-serif;color:var(--text);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:5px 12px;cursor:pointer;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+.glass{background:var(--card);border:1px solid var(--line);border-radius:22px;box-shadow:var(--shadow);backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px) saturate(140%)}
+.hero{text-align:center;padding:36px 0 18px}
+.hero h1{font-size:clamp(40px,8vw,76px);line-height:1.04;letter-spacing:-.035em;margin:0 0 14px;font-weight:700}
+.hero h1 span{background:linear-gradient(100deg,var(--accent),var(--accent2) 60%,#e879a8);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p.lead{font-size:clamp(17px,2.6vw,21px);color:var(--muted);max-width:640px;margin:0 auto 26px}
+.btn{display:inline-block;font-weight:700;font-size:19px;text-decoration:none;color:var(--btn-text);padding:15px 34px;border-radius:999px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 10px 30px rgba(80,90,255,.4),inset 0 1px 0 rgba(255,255,255,.35);transition:transform .15s,box-shadow .15s}
+.btn:hover{transform:translateY(-2px);box-shadow:0 14px 36px rgba(80,90,255,.5),inset 0 1px 0 rgba(255,255,255,.35)}
+.btn:focus-visible,#lang:focus-visible,a:focus-visible{outline:3px solid var(--accent);outline-offset:3px}
+.sub{color:var(--muted);font-size:14px;margin:12px 0 0}
+.shot{margin:34px auto 0;padding:8px}
+.shot img,.cap img{display:block;width:100%;height:auto;border-radius:16px}
+h2{font-size:clamp(26px,4.5vw,36px);letter-spacing:-.025em;margin:68px 0 22px;text-align:center}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px}
+.card{padding:20px 22px}
+.card h3{margin:0 0 6px;font-size:18px;letter-spacing:-.01em}
+.card p{margin:0;color:var(--muted);font-size:15px}
+.shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+.cap{margin:0;padding:8px}
+.cap figcaption{color:var(--muted);font-size:14px;padding:10px 8px 6px;text-align:center}
+.list{padding:24px 26px}
+.list ul{margin:0;padding-left:20px}.list li{margin:7px 0}
+.list p{margin:0 0 10px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin:0;padding:0;list-style:none}
+.chips li{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:5px 14px;font-size:14px;color:var(--muted)}
+kbd,code{font:600 .88em ui-monospace,Consolas,monospace;background:var(--code);border-radius:7px;padding:2px 7px}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+footer{margin:70px 0 0;padding:26px 0 44px;border-top:1px solid var(--line);color:var(--muted);font-size:14px;text-align:center}
+footer a{margin:0 8px}
+@media (max-width:520px){.btn{display:block}.top nav a{display:none}.card,.list{padding:18px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="#">Glass Widgets</a>
+    <nav>
+      <a href="#features"><span lang="en">Features</span><span lang="ru">Возможности</span></a>
+      <a href="#install"><span lang="en">Install</span><span lang="ru">Установка</span></a>
+      <a href="https://github.com/chvdbhcx-del/glass-widgets">GitHub</a>
+      <button id="lang" type="button" aria-label="Language / Язык">RU</button>
+    </nav>
+  </header>
+
+  <section class="hero">
+    <h1><span>Glass</span> Widgets</h1>
+    <p class="lead">
+      <span lang="en">Native desktop widgets for Windows 10/11 with a Liquid-Glass look: translucent cards that refract your wallpaper, live ones too.</span>
+      <span lang="ru">Нативные виджеты рабочего стола для Windows 10/11 в стиле «жидкого стекла»: полупрозрачные карточки с преломлением поверх обоев, в том числе живых.</span>
+    </p>
+    <a class="btn" href="https://github.com/chvdbhcx-del/glass-widgets/releases/latest"><span lang="en">Download for Windows</span><span lang="ru">Скачать для Windows</span></a>
+    <p class="sub"><span lang="en">Windows 10/11 · x64 · installer of about 1 MB · free, MIT</span><span lang="ru">Windows 10/11 · x64 · установщик около 1 МБ · бесплатно, MIT</span></p>
+    <div class="shot glass"><img src="images/hero.png" width="1360" height="630" alt="Glass Widgets on a wallpaper: weather, clock, calendar, system monitor, music, reminders, world clock, shortcuts, notes, timer and disks" data-ru="Glass Widgets поверх обоев: погода, часы, календарь, монитор системы, музыка, напоминания, мировое время, ярлыки, заметки, таймер и диски"></div>
+  </section>
+
+  <section id="features">
+    <h2><span lang="en">Why it feels different</span><span lang="ru">Чем это отличается</span></h2>
+    <div class="grid">
+      <div class="card glass"><h3><span lang="en">Real glass</span><span lang="ru">Настоящее стекло</span></h3>
+        <p><span lang="en">Each card refracts and blurs the wallpaper behind it, with a chromatic fringe, a specular highlight that follows the light and a soft materialise animation. Cards that touch merge into one blob.</span>
+        <span lang="ru">Каждая карточка преломляет и размывает обои за собой: хроматическая кайма, блик, следующий за светом, мягкое появление. Касающиеся карточки сливаются в одну каплю.</span></p></div>
+      <div class="card glass"><h3><span lang="en">Dark or light</span><span lang="ru">Тёмное или светлое</span></h3>
+        <p><span lang="en">Dark glass by default, light or auto on demand, with crisp, smooth Inter typography (bundled, SIL OFL).</span>
+        <span lang="ru">По умолчанию тёмное стекло, светлое или авто по желанию; чёткий гладкий шрифт Inter (в комплекте, SIL OFL).</span></p></div>
+      <div class="card glass"><h3><span lang="en">Live wallpapers work</span><span lang="ru">Живые обои работают</span></h3>
+        <p><span lang="en">The glass reads the wallpaper window itself, so it follows videos and animated wallpapers.</span>
+        <span lang="ru">Стекло читает само окно обоев, поэтому следует за видео и анимированными обоями.</span></p></div>
+      <div class="card glass"><h3><span lang="en">Visible to screenshots</span><span lang="ru">Видно на скриншотах</span></h3>
+        <p><span lang="en">Screenshots and screen recorders see the widgets: the layer never captures itself.</span>
+        <span lang="ru">Скриншоты и запись экрана видят виджеты: слой никогда не захватывает сам себя.</span></p></div>
+      <div class="card glass"><h3><span lang="en">Light on resources</span><span lang="ru">Лёгкий</span></h3>
+        <p><span lang="en">One transparent layered window drawn with Direct2D on the GPU. No WebView, no Electron: about 100 MB of RAM and under 10 % of one core with an animated wallpaper.</span>
+        <span lang="ru">Одно прозрачное окно, рисуется Direct2D на GPU. Без WebView и Electron: около 100 МБ ОЗУ и меньше 10 % одного ядра при анимированных обоях.</span></p></div>
+      <div class="card glass"><h3><span lang="en">Private</span><span lang="ru">Приватный</span></h3>
+        <p><span lang="en">The network is used only by the widgets that need it (weather, rates, quote, site icons). No telemetry.</span>
+        <span lang="ru">Сеть используют только виджеты, которым она нужна (погода, курсы, цитата, значки сайтов). Телеметрии нет.</span></p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2><span lang="en">Screenshots</span><span lang="ru">Скриншоты</span></h2>
+    <div class="shots">
+      <figure class="cap glass"><img loading="lazy" src="images/gallery.png" width="1600" height="900" alt="Edit mode with the widget gallery" data-ru="Режим правки и галерея виджетов"><figcaption><span lang="en">Edit mode and the widget gallery (<kbd>Ctrl+Alt+W</kbd>)</span><span lang="ru">Режим правки и галерея виджетов (<kbd>Ctrl+Alt+W</kbd>)</span></figcaption></figure>
+      <figure class="cap glass"><img loading="lazy" src="images/light.png" width="780" height="420" alt="Light glass appearance" data-ru="Светлое стекло"><figcaption><span lang="en">Light glass</span><span lang="ru">Светлое стекло</span></figcaption></figure>
+      <figure class="cap glass"><img loading="lazy" src="images/settings.png" width="1600" height="900" alt="Settings panel with sliders for the glass look" data-ru="Панель настроек с ползунками вида стекла"><figcaption><span lang="en">Settings panel with live look sliders (<kbd>Ctrl+Alt+G</kbd>)</span><span lang="ru">Настройки с ползунками вида стекла (<kbd>Ctrl+Alt+G</kbd>)</span></figcaption></figure>
+    </div>
+
+    <h2><span lang="en">Widgets</span><span lang="ru">Виджеты</span></h2>
+    <ul class="chips">
+      <li><span lang="en">Clock</span><span lang="ru">Часы</span></li><li><span lang="en">Calendar</span><span lang="ru">Календарь</span></li><li><span lang="en">Reminders</span><span lang="ru">Напоминания</span></li>
+      <li><span lang="en">Music</span><span lang="ru">Музыка</span></li><li><span lang="en">Batteries</span><span lang="ru">Батареи</span></li><li><span lang="en">Weather</span><span lang="ru">Погода</span></li>
+      <li><span lang="en">World clock</span><span lang="ru">Мировое время</span></li><li><span lang="en">System monitor</span><span lang="ru">Монитор системы</span></li><li><span lang="en">Disks</span><span lang="ru">Диски</span></li>
+      <li><span lang="en">Network</span><span lang="ru">Сеть</span></li><li><span lang="en">Processes</span><span lang="ru">Процессы</span></li><li><span lang="en">Notes</span><span lang="ru">Заметки</span></li>
+      <li><span lang="en">Timer</span><span lang="ru">Таймер</span></li><li><span lang="en">Shortcuts</span><span lang="ru">Ярлыки</span></li><li><span lang="en">Clipboard history</span><span lang="ru">История буфера</span></li>
+      <li><span lang="en">Photos</span><span lang="ru">Фото</span></li><li><span lang="en">Currency rates</span><span lang="ru">Курсы валют</span></li><li><span lang="en">Quote of the day</span><span lang="ru">Цитата дня</span></li><li><span lang="en">Quick controls</span><span lang="ru">Быстрые настройки</span></li>
+    </ul>
+    <p class="sub" style="text-align:center"><span lang="en">Cards come in S / M / L sizes, snap to a grid, can be dragged and merge into one blob when they touch.</span><span lang="ru">Карточки бывают S / M / L, привязываются к сетке, перетаскиваются и сливаются в одну каплю при касании.</span></p>
+  </section>
+
+  <section id="install">
+    <h2><span lang="en">Install</span><span lang="ru">Установка</span></h2>
+    <div class="two">
+      <div class="list glass">
+        <ul>
+          <li><span lang="en">Download <code>GlassWidgets_&lt;version&gt;_x64-setup.exe</code> from the <a href="https://github.com/chvdbhcx-del/glass-widgets/releases/latest">latest release</a> and run it.</span><span lang="ru">Скачайте <code>GlassWidgets_&lt;версия&gt;_x64-setup.exe</code> из <a href="https://github.com/chvdbhcx-del/glass-widgets/releases/latest">последнего релиза</a> и запустите.</span></li>
+          <li><span lang="en">It installs per user, no administrator rights needed, and can start Glass Widgets with Windows.</span><span lang="ru">Ставится для текущего пользователя, права администратора не нужны, может запускаться вместе с Windows.</span></li>
+          <li><span lang="en"><strong>SmartScreen:</strong> the installer is not code-signed, so Windows may ask you to confirm (More info, then Run anyway).</span><span lang="ru"><strong>SmartScreen:</strong> установщик не подписан сертификатом, поэтому Windows может попросить подтвердить запуск («Подробнее», затем «Выполнить в любом случае»).</span></li>
+          <li><span lang="en">Glass Widgets lives in the notification area; Windows 11 may keep it under the <code>^</code> chevron.</span><span lang="ru">Программа живёт в области уведомлений; Windows 11 может спрятать значок под стрелкой <code>^</code>.</span></li>
+        </ul>
+      </div>
+      <div class="list glass">
+        <p><strong><span lang="en">Keys</span><span lang="ru">Клавиши</span></strong></p>
+        <ul>
+          <li><kbd>Ctrl+Alt+G</kbd> <span lang="en">settings panel</span><span lang="ru">панель настроек</span></li>
+          <li><kbd>Ctrl+Alt+W</kbd> <span lang="en">edit mode: gallery, resize, remove</span><span lang="ru">режим правки: галерея, размер, удаление</span></li>
+          <li><kbd>Ctrl+Alt+Q</kbd> <span lang="en">quit</span><span lang="ru">выход</span></li>
+        </ul>
+        <p class="sub"><span lang="en">winget: not available yet, a package is being prepared (see the README).</span><span lang="ru">winget: пока недоступен, пакет готовится (см. README).</span></p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>
+      <a href="https://github.com/chvdbhcx-del/glass-widgets">GitHub</a>
+      <a href="https://github.com/chvdbhcx-del/glass-widgets/blob/main/CHANGELOG.md"><span lang="en">Changelog</span><span lang="ru">Список изменений</span></a>
+      <a href="https://github.com/chvdbhcx-del/glass-widgets/blob/main/LICENSE"><span lang="en">License (MIT)</span><span lang="ru">Лицензия (MIT)</span></a>
+      <a href="https://github.com/chvdbhcx-del/glass-widgets/issues"><span lang="en">Issues</span><span lang="ru">Обратная связь</span></a>
+    </p>
+    <p><span lang="en">An independent clean-room implementation, not affiliated with or endorsed by Apple. Typeface: Inter, SIL OFL.</span><span lang="ru">Независимая реализация «с чистого листа», не связана с Apple и не одобрена ею. Шрифт Inter, SIL OFL.</span></p>
+  </footer>
+</div>
+<script>
+(function () {
+  var root = document.documentElement, btn = document.getElementById("lang"), KEY = "gw-lang";
+  function apply(l) {
+    root.dataset.lang = l; root.lang = l; btn.textContent = l === "ru" ? "EN" : "RU";
+    document.querySelectorAll("img[data-ru]").forEach(function (i) {
+      if (!i.dataset.en) i.dataset.en = i.alt;
+      i.alt = l === "ru" ? i.dataset.ru : i.dataset.en;
+    });
+  }
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  apply(saved || (/^ru\b/i.test(navigator.language || "") ? "ru" : "en"));
+  btn.addEventListener("click", function () {
+    var l = root.dataset.lang === "ru" ? "en" : "ru"; apply(l);
+    try { localStorage.setItem(KEY, l); } catch (e) {}
+  });
+})();
+</script>
+</body>
+</html>
