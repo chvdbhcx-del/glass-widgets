@@ -312,6 +312,24 @@ pub enum AccentMode {
     /// the dominant hue of the desktop wallpaper (`accent.rs`)
     Wallpaper,
 }
+/// `accentScope`: how far the accent colour reaches.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AccentScope {
+    /// titles, links, rings and bars only (default)
+    Main,
+    /// "Tinted" like Apple's icon and widget style: all text, icons and graphics of a card in the accent colour
+    All,
+}
+impl AccentScope {
+    /// The `accentScope` value.
+    pub fn key(self) -> &'static str {
+        match self {
+            AccentScope::Main => "main",
+            AccentScope::All => "all",
+        }
+    }
+}
+
 impl AccentMode {
     /// The `accentMode` value.
     pub fn key(self) -> &'static str {
@@ -334,12 +352,13 @@ pub struct Settings {
     /// `checkUpdates`: one silent update check at start (off unless the user turned it on)
     pub check_updates: bool,
     pub accent: AccentMode,
+    pub accent_scope: AccentScope,
     /// `captureFps`: None = auto (15 fps backing off to 2 while the wallpaper is still), Some(n) = a fixed capture rate
     pub capture_fps: Option<u32>,
 }
 impl Default for Settings {
     fn default() -> Self {
-        Settings { glass: 0.5, dim: Dim::Auto, live: true, appearance: crate::motion::AppearancePref::Dark, check_updates: false, accent: AccentMode::Blue, capture_fps: None }
+        Settings { glass: 0.5, dim: Dim::Auto, live: true, appearance: crate::motion::AppearancePref::Dark, check_updates: false, accent: AccentMode::Blue, accent_scope: AccentScope::Main, capture_fps: None }
     }
 }
 impl Settings {
@@ -356,6 +375,7 @@ impl Settings {
             appearance: v.get("widgetsAppearance").and_then(|g| g.as_str()).and_then(crate::motion::AppearancePref::parse).unwrap_or_default(),
             check_updates: v.get("checkUpdates").and_then(|g| g.as_bool()).unwrap_or(d.check_updates),
             accent: if v.get("accentMode").and_then(|g| g.as_str()) == Some("wallpaper") { AccentMode::Wallpaper } else { AccentMode::Blue },
+            accent_scope: if v.get("accentScope").and_then(|g| g.as_str()) == Some("all") { AccentScope::All } else { AccentScope::Main },
             capture_fps: crate::backdrop::parse_capture_fps(v.get("captureFps")),
         }
     }
@@ -1115,6 +1135,10 @@ mod tests {
         assert_eq!(Settings::from_value(&json!({"accentMode": "wallpaper"})).accent, AccentMode::Wallpaper);
         assert_eq!(Settings::from_value(&json!({"accentMode": "nonsense"})).accent, AccentMode::Blue);
         assert_eq!(AccentMode::Wallpaper.key(), "wallpaper");
+        assert_eq!(Settings::from_value(&json!({})).accent_scope, AccentScope::Main);
+        assert_eq!(Settings::from_value(&json!({"accentScope": "all"})).accent_scope, AccentScope::All);
+        assert_eq!(Settings::from_value(&json!({"accentScope": "x"})).accent_scope, AccentScope::Main);
+        assert_eq!(AccentScope::All.key(), "all");
     }
 
     #[test]

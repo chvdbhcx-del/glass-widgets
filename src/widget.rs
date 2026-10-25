@@ -553,6 +553,38 @@ fn weight_for(size: f32, weight: u16, nunito: bool) -> i32 {
     }
 }
 
+/// `accentScope` "all" (Apple's Tinted icon and widget style): every colour a card draws becomes the accent, as bright as the colour was (white text =
+/// the accent lightened a little, a green ring = a half-bright accent); alpha is kept, the red / orange warning colours keep their meaning.
+static TINT: AtomicBool = AtomicBool::new(false);
+
+/// Turn the tint on / off; true when that changed it (the caller re-renders every card).
+pub fn set_tint(on: bool) -> bool {
+    TINT.swap(on, Ordering::Relaxed) != on
+}
+
+fn tinted(c: Color, light: bool) -> Color {
+    let near = |a: Color, b: Color| (a.r - b.r).abs() + (a.g - b.g).abs() + (a.b - b.b).abs() < 0.06;
+    if near(c, RED) || near(c, ORANGE) {
+        return c;
+    }
+    let acc = accent();
+    // brightness = the strongest channel: white text and the accent itself (titles) get the full tint, a green ring a bit less, grey text its grey
+    let v = c.r.max(c.g).max(c.b).clamp(0.0, 1.0);
+    if light {
+        // dark ink on light glass: a darkened accent, the darker the ink the fuller; white stays white (text on a filled accent); coloured items full
+        if v > 0.9 && c.r.min(c.g).min(c.b) > 0.8 {
+            return c;
+        }
+        let chroma = c.r.max(c.g).max(c.b) - c.r.min(c.g).min(c.b);
+        let k = if chroma > 0.2 { 1.0 } else { (1.1 - v).clamp(0.25, 1.0) } * 0.62;
+        Color::rgba(acc.r * k, acc.g * k, acc.b * k, c.a)
+    } else {
+        let t = 0.28; // toward white: the accent itself is often a mid pastel and thin text needs the contrast
+        let (r, g, b) = (acc.r + (1.0 - acc.r) * t, acc.g + (1.0 - acc.g) * t, acc.b + (1.0 - acc.b) * t);
+        Color::rgba(r * v, g * v, b * v, c.a)
+    }
+}
+
 /// Size-dependent tracking in px (SF-like): small text opens up a little, large text tightens.
 fn auto_track(size: f32) -> f32 {
     match size {
@@ -933,6 +965,14 @@ impl<'a> Cx<'a> {
     /// Light appearance palette: white (any alpha) -> dark ink with the same alpha, the dark `INK` -> white, saturated accents a little
     /// deeper. Identity in the dark appearance.
     fn ink(&self, c: Color) -> Color {
+        let c = self.ink_plain(c);
+        if TINT.load(Ordering::Relaxed) {
+            tinted(c, self.light)
+        } else {
+            c
+        }
+    }
+    fn ink_plain(&self, c: Color) -> Color {
         if !self.light {
             return c;
         }

@@ -6,7 +6,7 @@ use crate::cards::*;
 use crate::gfx::*;
 use crate::glass::{self, GlassParams, GlassStyle, LOOK};
 use crate::grid;
-use crate::layout::{AccentMode, Dim};
+use crate::layout::{AccentMode, AccentScope, Dim};
 use crate::motion::AppearancePref;
 use crate::registry::{self, WidgetDef};
 use crate::update::UpdateState;
@@ -134,17 +134,19 @@ pub enum Opt {
     Source,
     /// blue / from the wallpaper (`accentMode`)
     Accent,
+    /// accent on the main things / everywhere, Apple's "Tinted" (`accentScope`)
+    Scope,
     /// which monitor the desk lives on (`widgetsMonitor`): one segment per connected monitor, `Ui::opt_n` of them
     Monitor,
 }
 /// At most this many monitors get a segment (the tray menu lists all of them).
 pub const MON_SEGS: usize = 5;
 impl Opt {
-    pub const ALL: [Opt; 5] = [Opt::Appearance, Opt::Dim, Opt::Source, Opt::Accent, Opt::Monitor];
+    pub const ALL: [Opt; 6] = [Opt::Appearance, Opt::Dim, Opt::Source, Opt::Accent, Opt::Scope, Opt::Monitor];
     /// Number of options of a fixed control (`Monitor` depends on the connected monitors: `Ui::opt_n`).
     pub fn count(self) -> usize {
         match self {
-            Opt::Source | Opt::Accent => 2,
+            Opt::Source | Opt::Accent | Opt::Scope => 2,
             Opt::Monitor => 1,
             _ => 3,
         }
@@ -156,6 +158,10 @@ impl Opt {
     /// Option `k` as the accent source (Blue, Wallpaper).
     pub fn accent(k: usize) -> AccentMode {
         [AccentMode::Blue, AccentMode::Wallpaper][k.min(1)]
+    }
+    /// Option `k` as the accent scope (Main, All).
+    pub fn scope(k: usize) -> AccentScope {
+        [AccentScope::Main, AccentScope::All][k.min(1)]
     }
     /// Option `k` as the dimming mode (Auto, Never, Always).
     pub fn dim(k: usize) -> Dim {
@@ -256,6 +262,7 @@ pub struct Ui {
     pub appearance: AppearancePref,
     pub dim_mode: Dim,
     pub accent_mode: AccentMode,
+    pub accent_scope: AccentScope,
     /// number of connected monitors and the display position (0 = primary) of the one the desk is on
     pub mon_count: usize,
     pub mon_sel: usize,
@@ -463,6 +470,7 @@ impl Ui {
             appearance: AppearancePref::default(),
             dim_mode: Dim::Auto,
             accent_mode: AccentMode::Blue,
+            accent_scope: AccentScope::Main,
             mon_count: 1,
             mon_sel: 0,
             autostart: false,
@@ -805,7 +813,7 @@ impl Ui {
         if k < n {
             return Hit::Look(k, self.set_pos(k));
         }
-        [Hit::ResetLook, Hit::Opt(Opt::Appearance, 1), Hit::Opt(Opt::Dim, 0), Hit::Opt(Opt::Source, 1), Hit::Opt(Opt::Accent, 1), Hit::Opt(Opt::Monitor, 0), Hit::Autostart, Hit::CheckStart, Hit::EditBtn, Hit::QuitBtn, Hit::UpdBtn, Hit::UpdInstall, Hit::UpdPage, Hit::Done].get(k - n).copied().unwrap_or(Hit::None)
+        [Hit::ResetLook, Hit::Opt(Opt::Appearance, 1), Hit::Opt(Opt::Dim, 0), Hit::Opt(Opt::Source, 1), Hit::Opt(Opt::Accent, 1), Hit::Opt(Opt::Scope, 1), Hit::Opt(Opt::Monitor, 0), Hit::Autostart, Hit::CheckStart, Hit::EditBtn, Hit::QuitBtn, Hit::UpdBtn, Hit::UpdInstall, Hit::UpdPage, Hit::Done].get(k - n).copied().unwrap_or(Hit::None)
     }
 
     // ------------------------------------------------ keyboard / wheel on the sliders
@@ -860,6 +868,7 @@ impl Ui {
             Opt::Dim => [Dim::Auto, Dim::Never, Dim::Always].iter().position(|d| *d == self.dim_mode).unwrap_or(0),
             Opt::Source => usize::from(!self.live),
             Opt::Accent => usize::from(self.accent_mode == AccentMode::Wallpaper),
+            Opt::Scope => usize::from(self.accent_scope == AccentScope::All),
             Opt::Monitor => self.mon_sel.min(self.opt_n(o) - 1),
         }
     }
@@ -1415,11 +1424,12 @@ impl Ui {
             self.set_button(cx, l.reset, self.t("Сбросить вид", "Reset look"), hot, pr == Hit::ResetLook, TEXT);
 
             // behaviour: segmented controls
-            let labels: [(Opt, (&str, &str), [(&str, &str); 3]); 5] = [
+            let labels: [(Opt, (&str, &str), [(&str, &str); 3]); 6] = [
                 (Opt::Appearance, ("Оформление", "Appearance"), [("Тёмное", "Dark"), ("Светлое", "Light"), ("Авто", "Auto")]),
                 (Opt::Dim, ("Приглушение", "Dimming"), [("Авто", "Auto"), ("Никогда", "Never"), ("Всегда", "Always")]),
                 (Opt::Source, ("Источник стекла", "Glass source"), [("Живой", "Live"), ("Простой", "Plain"), ("", "")]),
                 (Opt::Accent, ("Акцент", "Accent"), [("Синий", "Blue"), ("Из обоев", "Wallpaper"), ("", "")]),
+                (Opt::Scope, ("Акцент на", "Accent on"), [("Главном", "Main"), ("Везде", "Everywhere"), ("", "")]),
                 (Opt::Monitor, ("Монитор", "Monitor"), [("", ""), ("", ""), ("", "")]),
             ];
             let nums: Vec<String> = (1..=self.opt_n(Opt::Monitor)).map(|n| n.to_string()).collect();
@@ -1861,7 +1871,7 @@ mod tests {
             assert_eq!(ui.set_hit(p.x - 1.0, p.cy()), Hit::None);
             assert_eq!(ui.set_hit(1.0, 1.0), Hit::None);
             // reading order for the headless --hover
-            assert!(matches!(ui.nth_control(0), Hit::Look(0, _)) && ui.nth_control(l.rows.len() + 13) == Hit::Done && ui.nth_control(99) == Hit::None);
+            assert!(matches!(ui.nth_control(0), Hit::Look(0, _)) && ui.nth_control(l.rows.len() + 14) == Hit::Done && ui.nth_control(99) == Hit::None);
         }
     }
 
@@ -2066,6 +2076,7 @@ pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
     let env = SceneEnv { preview: true, hwnd: 0, lang: crate::layout::lang(), utc_off: crate::sys::local_utc_offset_min() };
     let mut scene = Scene::new(&gfx, w as i32, h as i32, cs, settings.glass, backdrop.bitmap(), &specs, &env).map_err(e("scene"))?;
     scene.set_params(&gfx, &look).map_err(e("look"))?;
+    crate::widget::set_tint(std::env::var("MSW_TINT").is_ok() || settings.accent_scope == AccentScope::All); // headless: `MSW_TINT=1` previews accentScope "all"
     let now = a.time.unwrap_or_else(Now::sample);
     scene.set_appearance_pref(a.appearance.unwrap_or(settings.appearance));
     for i in 0..scene.len() {
@@ -2089,6 +2100,7 @@ pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
     ui.appearance = a.appearance.unwrap_or(settings.appearance);
     ui.dim_mode = settings.dim;
     ui.accent_mode = settings.accent;
+    ui.accent_scope = settings.accent_scope;
     (ui.mon_count, ui.mon_sel) = a.monitors.unwrap_or(if ui.settings { (2, 0) } else { (1, 0) });
     ui.autostart = true; // sample state: the registry is never read by a headless render
     ui.check_start = settings.check_updates;

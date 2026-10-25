@@ -16,7 +16,7 @@ use crate::grid;
 use crate::layout;
 use crate::monitors;
 use crate::motion::{self, MatState};
-use crate::layout::AccentMode;
+use crate::layout::{AccentMode, AccentScope};
 use crate::tray::{self, TrayCmd};
 use crate::ui::{self, Hit, SAct, SKey, Ui};
 use crate::update::{self, UpdateState};
@@ -438,6 +438,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     // the accent colour is needed before the first card is recorded
     let (accent_rgb, accent_key) = resolve_accent(if o.no_config { AccentMode::Blue } else { settings.accent });
     crate::widget::set_accent(accent_rgb);
+    crate::widget::set_tint(!o.no_config && settings.accent_scope == AccentScope::All);
     // the look: defaults -> glass.json (the process-wide base) -> `widgetsLook` of config.json; its `card_k` scales the cards (not the host UI)
     let look_base = crate::glass::global_params();
     let look_cfg = if o.no_config { serde_json::json!({}) } else { layout::read_look() };
@@ -511,6 +512,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     (ui.gal_off, ui.set_off) = panels;
     let check_now = settings.check_updates && !o.no_config && o.bench.is_none();
     ui.accent_mode = settings.accent;
+    ui.accent_scope = settings.accent_scope;
 
     // premultiplied BGRA DIB the layered window is fed from (only the dirty rect is copied per frame)
     let screen = GetDC(None);
@@ -2382,6 +2384,7 @@ impl App {
         self.ui.dim_mode = self.settings.dim;
         self.ui.live = self.settings.live;
         self.ui.accent_mode = self.settings.accent;
+        self.ui.accent_scope = self.settings.accent_scope;
         self.ui.autostart = crate::autostart::enabled();
         self.ui.check_start = self.settings.check_updates;
     }
@@ -2742,6 +2745,13 @@ impl App {
                 self.write_setting("accentMode", serde_json::json!(m.key()));
                 self.refresh_accent(true);
             }
+            ui::Opt::Scope => {
+                let sc = ui::Opt::scope(k);
+                self.ui.accent_scope = sc;
+                self.settings.accent_scope = sc;
+                self.write_setting("accentScope", serde_json::json!(sc.key()));
+                self.apply_scope();
+            }
             ui::Opt::Monitor => return self.set_monitor(k), // redraws the panel itself
         }
         if let Some(d) = self.hover_dirty(Hit::Panel) {
@@ -3049,6 +3059,10 @@ impl App {
             self.ui.accent_mode = new.accent;
             self.refresh_accent(true);
         }
+        if new.accent_scope != old.accent_scope {
+            self.ui.accent_scope = new.accent_scope;
+            self.apply_scope();
+        }
         if new.live != old.live || new.capture_fps != old.capture_fps {
             self.ui.live = new.live;
             self.rebuild(true);
@@ -3235,6 +3249,18 @@ fn resolve_accent(mode: AccentMode) -> (Option<[u8; 3]>, Option<(String, Option<
 }
 
 impl App {
+    /// `accentScope`: "everywhere" tints all content of every card with the accent (Apple's Tinted style); "main" draws it as the widgets do.
+    unsafe fn apply_scope(&mut self) {
+        crate::widget::set_tint(self.settings.accent_scope == AccentScope::All);
+        self.scene.invalidate_all();
+        let now = self.now();
+        for i in 0..self.scene.len() {
+            let _ = self.scene.render_card(&self.gfx, i, &now);
+        }
+        let d = self.all_dirty();
+        self.frame(d);
+    }
+
     /// `accentMode`: take the accent from the wallpaper (again when the wallpaper file changed; `force` = the mode itself changed) or go back to blue,
     /// and record every card again when the colour is different. Runs on the 2 s config poll: one SystemParametersInfo call while nothing changed.
     unsafe fn refresh_accent(&mut self, force: bool) {
