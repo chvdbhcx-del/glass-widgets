@@ -179,6 +179,8 @@ pub struct CardView {
     glint_u: f32,
     /// the glass layer has to be re-rendered before the next compose (materialise blur changed)
     layer_stale: bool,
+    /// a size change in flight (S / M / L): the card is drawn by `Scene::draw_morph` until it settles
+    morph: Option<SizeMorph>,
     widget: Box<dyn Widget>,
     pub cfg: Value,
     flags: Flags,
@@ -190,6 +192,22 @@ pub struct CardView {
     lum_known: bool,
     err_logged: bool,
     frame_once: bool,
+}
+
+/// A card changing size class. The glass rectangle springs from the old to the new size (`motion::Morph`); the glass is cut out of
+/// `shell` (shadow + lens + tint + rim of the BIGGER of the two sizes, rendered once) as a 9-slice, so the corners and edges stay
+/// sharp and unscaled and the flat middle is cropped (it lines up with the real backdrop); the new content is laid out at its final
+/// size and clipped to the rectangle while the old layout fades out. Nothing is allocated per frame.
+struct SizeMorph {
+    m: motion::Morph,
+    shell: ID2D1Bitmap1,
+    /// card size (px, without margin) the shell was rendered for
+    shell_wh: (i32, i32),
+    /// the previous layout (per ink) with its text shadow
+    old: [Option<ID2D1CommandList>; 2],
+    old_shadow: ID2D1Effect,
+    /// every card rectangle (canvas px) the morph can touch, with the spring overshoot
+    cover: RECT,
 }
 
 /// A glass-only surface (no widget): the gallery panel, the settings strip and the text prompt. Drawn by the host between the cards and its own UI.
@@ -244,6 +262,8 @@ pub struct Scene {
     merge: Vec<(usize, usize, f32)>,
     liquid: Option<crate::liquid::Liquid>,
     fx_wake: bool,
+    /// a size morph settled since the host last asked (it re-syncs the backdrop regions and the window)
+    morph_done: bool,
     lift: Option<((i32, i32, u32), ID2D1Effect, ID2D1CommandList)>,
     /// (text, x, y) in canvas px, drawn small above cards by `--sheet`
     pub labels: Vec<(String, f32, f32)>,
@@ -309,7 +329,11 @@ pub fn xf_matrix(cx: f32, cy: f32, k: f32, rot_deg: f32) -> Matrix3x2 {
 impl CardView {
     /// No transform and no hover / press scale: drawn straight from its layer (the fast path, no scratch compose).
     fn upright(&self) -> bool {
-        self.xf.is_id() && self.bump.x == 1.0
+        self.xf.is_id() && self.bump.x == 1.0 && self.morph.is_none()
+    }
+    /// The card rectangle, or while it changes size everything it can touch (canvas px).
+    fn bounds(&self) -> RECT {
+        self.morph.as_ref().map_or(RECT { left: self.x, top: self.y, right: self.x + self.w, bottom: self.y + self.h }, |m| m.cover)
     }
     fn bump_goal(&self) -> f32 {
         motion::bump_target(self.hover_on, self.press_on)
@@ -352,6 +376,9 @@ fn hi_of(c: &CardView, base_angle: f32, s: f32) -> Hi {
 
 /// Card rectangle in canvas px as drawn: scaled about its centre by the transform (lift / materialise).
 fn eff_rect(c: &CardView) -> motion::R4 {
+    if let Some(mo) = &c.morph {
+        return mo.m.rect(); // the springing rectangle: the neighbours' necks follow it
+    }
     let (w, h) = (c.w as f32 * c.xf.scale, c.h as f32 * c.xf.scale);
     (c.x as f32 + (c.w as f32 - w) / 2.0, c.y as f32 + (c.h as f32 - h) / 2.0, w, h)
 }
@@ -413,6 +440,37 @@ unsafe fn push_opacity(dc: &ID2D1DeviceContext, a: f32) {
     dc.PushLayer(&lp, None::<&ID2D1Layer>);
 }
 
+/// The soft text shadow and the static content of one layout (both inks, cross-faded by the appearance `k`) into the current target,
+/// layer-local (the caller has set the transform), all of it at opacity `fade` (the shadow effect is scaled through its colour: layers
+/// around effects do not draw reliably, layers around the command lists do).
+unsafe fn draw_content(dc: &ID2D1DeviceContext, tshadow: &ID2D1Effect, content: &[Option<ID2D1CommandList>; 2], k: f32, lum: f32, s: f32, fade: f32) {
+    // subtle text shadow, stronger over a bright backdrop (CSS: text-shadow 0 1px 8px); nearly none under dark ink
+    if let Some(cl) = &content[if k >= 0.5 { 1 } else { 0 }] {
+        tshadow.SetInput(0, cl, true);
+        let _ = fx_vec4(tshadow, 1, [0.0, 0.0, 0.0, ((0.10 + 0.25 * lum) * (1.0 - k) + 0.03 * k) * fade]);
+        if let Ok(o) = tshadow.GetOutput() {
+            dc.DrawImage(&o, Some(&pt(0.0, s)), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+        }
+    }
+    // the content of the two inks cross-fades while the appearance changes
+    for l in 0..2 {
+        let a = (if l == 0 { 1.0 - k } else { k }) * fade;
+        if a < 0.002 {
+            continue;
+        }
+        if let Some(cl) = &content[l] {
+            let part = a < 0.998;
+            if part {
+                push_opacity(dc, a);
+            }
+            dc.DrawImage(cl, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+            if part {
+                dc.PopLayer();
+            }
+        }
+    }
+}
+
 impl Scene {
     /// An empty scene on a `w` x `h` px canvas over `backdrop` (canvas-sized).
     pub fn empty(gfx: &Gfx, w: i32, h: i32, s: f32, glass_g: f32, backdrop: &ID2D1Bitmap1, env: &SceneEnv) -> Result<Scene> {
@@ -439,6 +497,7 @@ impl Scene {
             merge: Vec::new(),
             liquid: None,
             fx_wake: false,
+            morph_done: false,
             lift: None,
             labels: Vec::new(),
         })
@@ -477,7 +536,7 @@ impl Scene {
     }
     /// Rectangles of the cards (canvas px), for hit-testing.
     pub fn card_rects(&self) -> Vec<RECT> {
-        self.cards.iter().map(|c| RECT { left: c.x, top: c.y, right: c.x + c.w, bottom: c.y + c.h }).collect()
+        self.cards.iter().map(|c| c.bounds()).collect()
     }
     /// Card layer rectangle (card + shadow margin) clipped to the canvas.
     pub fn layer_rect(&self, i: usize) -> RECT {
@@ -485,14 +544,13 @@ impl Scene {
     }
     /// Same with `extra` more px on every side (lifted / rotated cards draw outside their layer a little).
     pub fn layer_rect_ext(&self, i: usize, extra: i32) -> RECT {
-        let c = &self.cards[i];
+        let b = self.cards[i].bounds();
         let e = self.m + extra;
-        clip(RECT { left: c.x - e, top: c.y - e, right: c.x + c.w + e, bottom: c.y + c.h + e }, self.w, self.h)
+        clip(RECT { left: b.left - e, top: b.top - e, right: b.right + e, bottom: b.bottom + e }, self.w, self.h)
     }
     /// The card rectangle itself (canvas px): what an animating overlay repaints.
     pub fn card_rect(&self, i: usize) -> RECT {
-        let c = &self.cards[i];
-        RECT { left: c.x, top: c.y, right: c.x + c.w, bottom: c.y + c.h }
+        self.cards[i].bounds()
     }
     pub fn lum(&self, i: usize) -> f32 {
         self.cards[i].lum
@@ -574,6 +632,7 @@ impl Scene {
             spot_goal: (0.0, 0.0),
             glint_u: 0.0,
             layer_stale: false,
+            morph: None,
             widget: (def.make)(),
             cfg: if c.cfg.is_object() { c.cfg.clone() } else { json!({}) },
             flags: Flags::default(),
@@ -605,17 +664,52 @@ impl Scene {
         c.x = x;
         c.y = y;
         c.glass.set_pos(x, y);
+        if c.morph.take().is_some() {
+            // a drag / drop settle takes over: the size change ends where it stands
+            c.scratch_ok = false;
+            self.morph_done = true;
+        }
         self.update_merge();
     }
 
     /// New size class for card `i` (a fresh widget instance with the same settings, as the size of a Widget never changes) at (x, y).
-    pub fn resize_card(&mut self, gfx: &Gfx, i: usize, size: Size, x: i32, y: i32) -> Result<()> {
+    /// `animate`: the glass springs from what is on screen to the new rectangle (`SizeMorph`) instead of jumping; the host passes
+    /// false with reduced motion. The caller still ticks the fresh widget and renders the card (the final layer).
+    pub fn resize_card(&mut self, gfx: &Gfx, i: usize, size: Size, x: i32, y: i32, animate: bool) -> Result<()> {
         let (type_id, cfg) = (self.cards[i].type_id.clone(), self.cards[i].cfg.clone());
         let Some(def) = registry::global().get(&type_id) else { return Ok(()) };
         let (lw, lh) = size.logical();
         let (w, h) = ((lw * self.s).round() as i32, (lh * self.s).round() as i32);
         let (glass, layer, tshadow) = self.gpu(gfx, size, x, y, w, h)?;
+        // a size change in flight carries on from the rectangle drawn now
+        let (from, old_wh, k, lum) = {
+            let c = &self.cards[i];
+            (c.morph.as_ref().map_or((c.x as f32, c.y as f32, c.w as f32, c.h as f32), |mo| mo.m.rect()), (c.w, c.h), c.look, c.lum)
+        };
+        let to = (x as f32, y as f32, w as f32, h as f32);
+        let morph = if animate && from != to {
+            // the shell comes from whichever of the two glasses is bigger (sizes are nested: S in M in L)
+            let shell = if w * h >= old_wh.0 * old_wh.1 { self.render_shell(gfx, &glass, (w, h), k, lum) } else { self.render_shell(gfx, &self.cards[i].glass, old_wh, k, lum) };
+            match shell {
+                Ok(shell) => Some((shell, if w * h >= old_wh.0 * old_wh.1 { (w, h) } else { old_wh })),
+                Err(e) => {
+                    eprintln!("mswidgets: size morph unavailable: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let pad = (8.0 * self.s).ceil() as i32;
+        let cover = {
+            let (a, b) = (RECT { left: from.0.floor() as i32, top: from.1.floor() as i32, right: (from.0 + from.2).ceil() as i32, bottom: (from.1 + from.3).ceil() as i32 }, RECT { left: x, top: y, right: x + w, bottom: y + h });
+            let u = union(a, b);
+            RECT { left: u.left - pad, top: u.top - pad, right: u.right + pad, bottom: u.bottom + pad }
+        };
         let c = &mut self.cards[i];
+        let old_content = std::mem::take(&mut c.content);
+        let old_shadow = std::mem::replace(&mut c.tshadow, tshadow);
+        c.morph = morph.map(|(shell, shell_wh)| SizeMorph { m: motion::Morph::new(from, to), shell, shell_wh, old: old_content, old_shadow, cover });
         c.size = size;
         c.x = x;
         c.y = y;
@@ -623,11 +717,9 @@ impl Scene {
         c.h = h;
         c.glass = glass;
         c.layer = layer;
-        c.tshadow = tshadow;
         c.dimfx = None;
         c.scratch = None;
         c.scratch_ok = false;
-        c.content = [None, None];
         c.soften = None;
         c.key = (u64::MAX, 0);
         c.widget = (def.make)();
@@ -877,7 +969,7 @@ impl Scene {
     }
 
     /// Card cfg keys that start with an underscore drive the headless renderer (`--cards "clock:s@0,0{\"_light\":90}"`):
-    /// `_light` deg, `_mat` ms into the materialisation, `_mout` ms into the dematerialisation, `_move` [dx, dy] logical px from the grid cell, `_hover` [x, y] pointer in card px (glint + spot + lift + widget hover),
+    /// `_light` deg, `_mat` ms into the materialisation, `_mout` ms into the dematerialisation, `_move` [dx, dy] logical px from the grid cell, `_morph` ["s", ms] that far into a size change from the named size (the card's own size is the end size), `_hover` [x, y] pointer in card px (glint + spot + lift + widget hover),
     /// with `_hover_t` 0..1 (the ease-in progress, default 1) and `_press` true (the left button held: press scale, dimmer spot).
     pub fn apply_debug(&mut self, gfx: &Gfx, now: &Now) {
         for i in 0..self.cards.len() {
@@ -894,6 +986,23 @@ impl Scene {
             for (key, out) in [("_mat", false), ("_mout", true)] {
                 if let Some(ms) = cfg.get(key).and_then(|v| v.as_f64()) {
                     self.set_xf(i, mat_xf(&motion::materialize(ms as f32 / 1000.0, out, false), 0.0, 0.0));
+                }
+            }
+            if let Some(a) = cfg.get("_morph").and_then(|v| v.as_array()) {
+                // ["s", ms]: the card (its spec size is the END size) is `ms` into a size morph from the named size
+                let from = a.first().and_then(|v| v.as_str()).and_then(|k| Size::ALL.into_iter().find(|s| s.key() == k));
+                let ms = a.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let (to, x, y) = (self.cards[i].size, self.cards[i].x, self.cards[i].y);
+                if let Some(from) = from.filter(|f| *f != to) {
+                    let _ = self.resize_card(gfx, i, from, x, y, false);
+                    self.tick_card(gfx, i, now);
+                    let _ = self.render_card(gfx, i, now);
+                    let _ = self.resize_card(gfx, i, to, x, y, true);
+                    self.tick_card(gfx, i, now);
+                    if let Some(mo) = self.cards[i].morph.as_mut() {
+                        mo.m = motion::Morph::at(mo.m.from, mo.m.to, ms);
+                    }
+                    self.update_merge();
                 }
             }
             if let Some(h) = cfg.get("_hover").and_then(|v| v.as_array()) {
@@ -947,8 +1056,12 @@ impl Scene {
     pub fn fx_busy(&self) -> bool {
         (0..self.cards.len()).any(|i| {
             let c = &self.cards[i];
-            !c.light_settled || c.hover_busy() || (c.look - self.look_target(i)).abs() > 1e-3
+            !c.light_settled || c.hover_busy() || c.morph.is_some() || (c.look - self.look_target(i)).abs() > 1e-3
         })
+    }
+    /// A size morph settled since the last call: the host re-syncs the backdrop regions (they covered the whole morph) and the window.
+    pub fn take_morph_done(&mut self) -> bool {
+        std::mem::replace(&mut self.morph_done, false)
     }
     /// The pointer moved near an edge / the appearance preference changed: the host should arm its animation timer.
     pub fn take_fx_wake(&mut self) -> bool {
@@ -960,7 +1073,20 @@ impl Scene {
     pub fn step_fx(&mut self, gfx: &Gfx, dt: f32, now: &Now) -> Option<RECT> {
         let mut dirty: Option<RECT> = None;
         let ext = (60.0 * self.s) as i32;
+        let mut morphed = false;
         for i in 0..self.cards.len() {
+            // size change: the rectangle springs; the whole area it can touch is recomposed, the last frame lands on the final layer
+            if self.cards[i].morph.is_some() {
+                let r = self.layer_rect_ext(i, 0);
+                let c = &mut self.cards[i];
+                if c.morph.as_mut().is_some_and(|mo| mo.m.step(dt)) {
+                    c.morph = None;
+                    c.scratch_ok = false;
+                    self.morph_done = true;
+                }
+                morphed = true;
+                dirty = Some(dirty.map_or(r, |d| union(d, r)));
+            }
             let target = self.look_target(i);
             let c = &mut self.cards[i];
             let mut hi_changed = false;
@@ -1003,6 +1129,9 @@ impl Scene {
             if let Some(r) = r {
                 dirty = Some(dirty.map_or(r, |d| union(d, r)));
             }
+        }
+        if morphed {
+            self.update_merge(); // the necks to the neighbours follow the springing rectangle
         }
         dirty
     }
@@ -1167,37 +1296,106 @@ impl Scene {
             dc.SetTransform(&mat(1.0, 0.0, 0.0));
             let r = c.glass.draw(dc, &Fx { lum: c.lum, k, blur });
             if r.is_ok() {
-                // subtle text shadow, stronger over a bright backdrop (CSS: text-shadow 0 1px 8px); nearly none under dark ink
-                if let Some(cl) = &c.content[if k >= 0.5 { 1 } else { 0 }] {
-                    c.tshadow.SetInput(0, cl, true);
-                    let _ = fx_vec4(&c.tshadow, 1, [0.0, 0.0, 0.0, (0.10 + 0.25 * c.lum) * (1.0 - k) + 0.03 * k]);
-                    if let Ok(o) = c.tshadow.GetOutput() {
-                        dc.DrawImage(&o, Some(&pt(0.0, s)), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
-                    }
-                }
-                // the content of the two inks cross-fades while the appearance changes
-                for l in 0..2 {
-                    let a = if l == 0 { 1.0 - k } else { k };
-                    if a < 0.002 {
-                        continue;
-                    }
-                    if let Some(cl) = &c.content[l] {
-                        let part = a < 0.998;
-                        if part {
-                            push_opacity(dc, a);
-                        }
-                        dc.DrawImage(cl, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
-                        if part {
-                            dc.PopLayer();
-                        }
-                    }
-                }
+                draw_content(dc, &c.tshadow, &c.content, k, c.lum, s, 1.0);
             }
             let e = dc.EndDraw(None, None);
             dc.SetTarget(None::<&ID2D1Image>);
             r?;
             e
         }
+    }
+
+    /// The glass of a card without its content (shadow, lens, tint, veils, rim) in a layer-sized bitmap: the source of the morph's 9-slice.
+    fn render_shell(&self, gfx: &Gfx, glass: &Glass, (w, h): (i32, i32), k: f32, lum: f32) -> Result<ID2D1Bitmap1> {
+        let m = self.m;
+        let shell = gfx.target((w + 2 * m) as u32, (h + 2 * m) as u32)?;
+        let dc = &gfx.dc;
+        unsafe {
+            dc.SetTarget(&shell);
+            dc.BeginDraw();
+            dc.SetTransform(&mat(1.0, 0.0, 0.0));
+            let r = glass.draw(dc, &Fx { lum, k: k.clamp(0.0, 1.0), blur: 0.0 });
+            let e = dc.EndDraw(None, None);
+            dc.SetTarget(None::<&ID2D1Image>);
+            r?;
+            e?;
+        }
+        Ok(shell)
+    }
+
+    /// One frame of a card that changes size, inside an open frame session: the glass rectangle (9-slice of the shell), the old layout
+    /// fading out and the new one fading in, both clipped to the rectangle, the live overlay, and the specular highlights once it has landed.
+    unsafe fn draw_morph(&mut self, gfx: &Gfx, i: usize, now: &Now) {
+        let (s, m) = (self.s, self.m);
+        let base_angle = self.params.light_angle;
+        let dc = &gfx.dc;
+        let sh = &self.sh;
+        let c = &mut self.cards[i];
+        let Some(mo) = c.morph.as_ref() else { return };
+        let (ax, ay, aw, ah) = mo.m.rect();
+        let (x0, y0, w, h) = (ax.round() as i32, ay.round() as i32, aw.round() as i32, ah.round() as i32);
+        let (ox, oy) = (x0 - m, y0 - m);
+        // 9-slice: the corners (radius, rim, shadow) and the edge bands keep their pixels, the middle is cropped / stretched
+        let (sw, shh) = (mo.shell_wh.0 + 2 * m, mo.shell_wh.1 + 2 * m);
+        let (dw, dh) = (w + 2 * m, h + 2 * m);
+        let inset = (m + (40.0 * s) as i32).min(dw / 2).min(dh / 2).min(sw / 2).min(shh / 2);
+        let (dx, dy) = ([0, inset, dw - inset, dw], [0, inset, dh - inset, dh]);
+        let (sx, sy) = ([0, inset, sw - inset, sw], [0, inset, shh - inset, shh]);
+        for r in 0..3 {
+            for q in 0..3 {
+                if dx[q + 1] <= dx[q] || dy[r + 1] <= dy[r] {
+                    continue;
+                }
+                let d = rf((ox + dx[q]) as f32, (oy + dy[r]) as f32, (ox + dx[q + 1]) as f32, (oy + dy[r + 1]) as f32);
+                let src = rf(sx[q] as f32, sy[r] as f32, sx[q + 1] as f32, sy[r + 1] as f32);
+                dc.DrawBitmap(&mo.shell, Some(&d), 1.0, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, Some(&src), None);
+            }
+        }
+        // the content: recorded in layer-local coordinates, drawn under a translation to the rectangle's layer corner and clipped to the
+        // rectangle (the clip is set at the identity transform, in frame px)
+        let (q_old, q_new) = mo.m.fades();
+        let k = c.look.clamp(0.0, 1.0);
+        let (id, t) = (mat(1.0, 0.0, 0.0), mat(1.0, ox as f32, oy as f32));
+        dc.SetTransform(&id);
+        dc.PushAxisAlignedClip(&rf(x0 as f32, y0 as f32, (x0 + w) as f32, (y0 + h) as f32), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        dc.SetTransform(&t);
+        for (a, shadow, list) in [(q_old, &mo.old_shadow, &mo.old), (q_new, &c.tshadow, &c.content)] {
+            if a > 0.004 {
+                draw_content(dc, shadow, list, k, c.lum, s, a);
+            }
+        }
+        dc.SetTransform(&id);
+        dc.PopAxisAlignedClip();
+        // the live overlay of the new widget (second hand, equaliser): at the new size, fading in with the new layout
+        if (c.tick.animates() || sh.preview || c.frame_once) && q_new > 0.004 {
+            dc.SetTransform(&mat(1.0, 0.0, 0.0));
+            dc.PushAxisAlignedClip(&rf(x0 as f32, y0 as f32, (x0 + w) as f32, (y0 + h) as f32), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            let light = c.look >= 0.5;
+            let fade = q_new < 0.999; // (no layer once fully in: the overlays draw effects, which a layer does not wrap reliably)
+            if fade {
+                push_opacity(dc, q_new);
+            }
+            let r = with_cx(c, sh, gfx, now, mat(s, x0 as f32, y0 as f32), light, "overlay", |w, cx| w.overlay(cx));
+            if fade {
+                dc.PopLayer();
+            }
+            dc.PopAxisAlignedClip();
+            if let Some(Err(e)) = r {
+                if !c.err_logged {
+                    c.err_logged = true;
+                    eprintln!("mswidgets: widget '{}' overlay failed: {e}", c.type_id);
+                }
+            }
+            c.frame_once = false;
+        }
+        // the specular rim belongs to the final geometry: it fades in only as the rectangle lands on it
+        let landed = motion::smooth((c.morph.as_ref().map_or(1.0, |mo| mo.m.progress()) - 0.96) / 0.04);
+        if landed > 0.004 {
+            let mut hi = hi_of(c, base_angle, s);
+            hi.alpha = landed;
+            c.glass.draw_hi(dc, c.x as f32, c.y as f32, &hi);
+        }
+        dc.SetTransform(&mat(1.0, 0.0, 0.0));
     }
 
     /// The extra soft shadow of a lifted card (effect + its input, cached per card size).
@@ -1268,8 +1466,8 @@ impl Scene {
         }
         for i in 0..self.cards.len() {
             let lr = self.layer_rect_ext(i, (60.0 * s) as i32);
-            if self.cards[i].upright() || !hit(&lr, &clip) {
-                continue;
+            if self.cards[i].upright() || self.cards[i].morph.is_some() || !hit(&lr, &clip) {
+                continue; // (a card changing size is drawn straight into the frame by `draw_morph`)
             }
             if self.cards[i].layer_stale {
                 self.render_card(gfx, i, now)?; // the materialise blur moved: new glass layer
@@ -1411,6 +1609,10 @@ impl Scene {
                 if !hit(&lr, &clip) {
                     continue;
                 }
+                if self.cards[i].morph.is_some() {
+                    self.draw_morph(gfx, i, now);
+                    continue;
+                }
                 let c = &self.cards[i];
                 if c.upright() {
                     let at = pt((c.x - m) as f32, (c.y - m) as f32);
@@ -1540,7 +1742,8 @@ impl Scene {
 }
 
 fn clip_rect(c: &CardView, m: i32, w: i32, h: i32) -> RECT {
-    clip(RECT { left: c.x - m, top: c.y - m, right: c.x + c.w + m, bottom: c.y + c.h + m }, w, h)
+    let b = c.bounds();
+    clip(RECT { left: b.left - m, top: b.top - m, right: b.right + m, bottom: b.bottom + m }, w, h)
 }
 
 impl Probe {
@@ -1743,6 +1946,50 @@ mod tests {
         sc.set_params(&gfx, &p).unwrap();
     }
 
+    /// A card that grows towards a neighbour pulls the liquid neck while it is springing (the merge follows the animated rectangle),
+    /// and the animation stops asking for frames once it has landed.
+    #[test]
+    fn size_morph_keeps_the_merge_bridge_and_goes_idle() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        let gfx = Gfx::new(None).unwrap();
+        let bd = PlainBackdrop::new(&gfx, 800, 400).unwrap();
+        let env = SceneEnv { preview: true, hwnd: 0, lang: Lang::Ru, utc_off: 0 };
+        let mut sc = Scene::empty(&gfx, 800, 400, 1.0, 0.5, bd.bitmap(), &env).unwrap();
+        let now = Now::sample();
+        let full = RECT { left: 0, top: 0, right: 800, bottom: 400 };
+        // a at x 40 (S, ends at 210), b at 226: a 16 px gap, so S -> M (ends at 396) runs INTO b: the necks appear on the way
+        let a = sc.add_card(&gfx, &CardSpec { id: "clock-a".into(), type_id: "clock".into(), size: Size::S, cfg: json!({}), x: 40, y: 60, w: 170, h: 170 }).unwrap();
+        let b = sc.add_card(&gfx, &CardSpec { id: "clock-b".into(), type_id: "clock".into(), size: Size::S, cfg: json!({}), x: 226, y: 60, w: 170, h: 170 }).unwrap();
+        for i in [a, b] {
+            sc.tick_card(&gfx, i, &now);
+            sc.render_card(&gfx, i, &now).unwrap();
+        }
+        assert!(sc.merging().is_empty(), "resting cards 16 px apart do not merge");
+        sc.resize_card(&gfx, a, Size::M, 40, 60, true).unwrap();
+        sc.tick_card(&gfx, a, &now);
+        sc.render_card(&gfx, a, &now).unwrap();
+        assert!(sc.merging().is_empty(), "the morph starts on the old S rectangle");
+        let mut merged = false;
+        for _ in 0..40 {
+            let _ = sc.step_fx(&gfx, 0.004, &now);
+            if !sc.merging().is_empty() {
+                merged = true;
+                sc.composite(&gfx, full, None, &now).unwrap(); // the neck pass runs over the morphing card
+                break;
+            }
+        }
+        assert!(merged, "the springing rectangle reaches the neighbour: a neck");
+        // (this layout is deliberately overlapping at the end, so only idleness is checked: no frame is asked for once landed)
+        let mut n = 0;
+        while sc.fx_busy() && n < 200 {
+            let _ = sc.step_fx(&gfx, 0.016, &now);
+            n += 1;
+        }
+        assert!(!sc.fx_busy() && sc.step_fx(&gfx, 0.016, &now).is_none(), "settled: idle after {n} steps");
+    }
+
     /// Run-time edits of a scene on the GPU: add / move / lift + rotate (scratch path) / resize / glass slider / panel / reconfigure / remove.
     #[test]
     fn dynamic_scene_ops() {
@@ -1784,13 +2031,49 @@ mod tests {
         sc.set_xf(i, Xf::ID);
 
         // resize S -> M keeps the id / settings, makes a new widget, new geometry
-        sc.resize_card(&gfx, i, Size::M, 100, 100).unwrap();
+        sc.resize_card(&gfx, i, Size::M, 100, 100, false).unwrap();
         assert_eq!((sc.cards[i].w, sc.cards[i].h, sc.cards[i].uid), (356, 170, uid));
         sc.tick_card(&gfx, i, &now);
         sc.render_card(&gfx, i, &now).unwrap();
         sc.composite(&gfx, full, None, &now).unwrap();
         let (in_a, out_a) = (alpha_at(&mut sc, &gfx, 400, 185), alpha_at(&mut sc, &gfx, 700, 500));
         assert!(in_a > 150 && out_a == 0, "inside {in_a}, outside {out_a}");
+        assert!(sc.cards[i].morph.is_none() && !sc.fx_busy(), "no animation asked for, none running");
+
+        // animated M -> L: starts on the M rectangle, grows through the 9-slice path, lands on the L layer and then costs nothing
+        sc.resize_card(&gfx, i, Size::L, 100, 100, true).unwrap();
+        sc.tick_card(&gfx, i, &now);
+        sc.render_card(&gfx, i, &now).unwrap();
+        assert!(sc.cards[i].morph.is_some() && sc.fx_busy());
+        assert_eq!(sc.card_rect(i).bottom, 100 + 356 + 8, "the dirty area covers the whole morph");
+        sc.composite(&gfx, full, None, &now).unwrap();
+        assert!(alpha_at(&mut sc, &gfx, 400, 185) > 150, "the glass is there at the start");
+        assert_eq!(alpha_at(&mut sc, &gfx, 400, 400), 0, "the new area is still empty");
+        let (mut n, mut mid) = (0, 0);
+        while sc.fx_busy() && n < 200 {
+            let _ = sc.step_fx(&gfx, 0.016, &now);
+            n += 1;
+            if n == 8 {
+                sc.composite(&gfx, full, None, &now).unwrap();
+                mid = alpha_at(&mut sc, &gfx, 400, 130 + 170 + 20);
+            }
+        }
+        assert!(n < 60 && !sc.fx_busy(), "settles in {n} steps");
+        assert!(sc.take_morph_done() && !sc.take_morph_done());
+        assert!(mid > 100, "the glass reached below the old bottom edge mid-way: {mid}");
+        sc.composite(&gfx, full, None, &now).unwrap();
+        assert!(alpha_at(&mut sc, &gfx, 400, 400) > 150, "landed on the L card");
+        // and back: the shell of the bigger (old) glass
+        sc.resize_card(&gfx, i, Size::M, 100, 100, true).unwrap();
+        sc.tick_card(&gfx, i, &now);
+        sc.render_card(&gfx, i, &now).unwrap();
+        sc.composite(&gfx, full, None, &now).unwrap();
+        assert!(alpha_at(&mut sc, &gfx, 400, 400) > 150, "still L-sized at the start of the shrink");
+        while sc.fx_busy() {
+            let _ = sc.step_fx(&gfx, 0.016, &now);
+        }
+        sc.composite(&gfx, full, None, &now).unwrap();
+        assert_eq!(alpha_at(&mut sc, &gfx, 400, 400), 0, "shrunk to M");
 
         // glass slider + dim effect
         sc.set_glass(&gfx, 0.9).unwrap();

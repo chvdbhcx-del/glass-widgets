@@ -175,10 +175,15 @@ impl Bump {
     pub fn step(&mut self, dt: f32, target: f32) -> bool {
         // pressing: no overshoot (a press must not bounce); everything else: zeta 0.6
         let zeta2 = if target < self.x && target < 1.0 { 2.0 } else { 1.2 };
-        let c = zeta2 * Self::K.sqrt();
+        self.step_with(dt, target, Self::K, zeta2)
+    }
+
+    /// The same integrator with an explicit stiffness `k` (omega = sqrt k) and damping `zeta2` = 2 zeta (2 = critical).
+    pub fn step_with(&mut self, dt: f32, target: f32, k: f32, zeta2: f32) -> bool {
+        let c = zeta2 * k.sqrt();
         let h = dt / 4.0;
         for _ in 0..4 {
-            self.v += (Self::K * (target - self.x) - c * self.v) * h;
+            self.v += (k * (target - self.x) - c * self.v) * h;
             self.x += self.v * h;
         }
         let done = (target - self.x).abs() < 3e-4 && self.v.abs() < 6e-3;
@@ -436,6 +441,60 @@ pub fn look_step(look: f32, target: f32, dt: f32) -> f32 {
     }
 }
 
+// ---------------------------------------------------------------- size morph
+
+/// A card changing size class (S / M / L): the drawn rectangle springs from `from` to `to` (canvas px, x y w h) with a tiny overshoot
+/// (zeta ~0.8, about 1 %, 2-3 px: less than the 16 px gap to a neighbour). Nothing runs once `step` reported rest.
+#[derive(Clone, Copy, Debug)]
+pub struct Morph {
+    pub from: R4,
+    pub to: R4,
+    p: Bump,
+}
+impl Morph {
+    const K: f32 = 380.0; // omega ~ 19.5 rad/s: settles in ~0.3 s
+    const ZETA2: f32 = 1.6;
+
+    pub fn new(from: R4, to: R4) -> Morph {
+        Morph { from, to, p: Bump::resting(0.0) }
+    }
+
+    /// Progress at an arbitrary instant (headless filmstrips): `ms` after the start.
+    pub fn at(from: R4, to: R4, ms: f32) -> Morph {
+        let mut m = Morph::new(from, to);
+        let mut t = 0.0;
+        while t + 4.0 <= ms {
+            m.step(0.004);
+            t += 4.0;
+        }
+        m
+    }
+
+    /// One animation step; true when at rest on `to`.
+    pub fn step(&mut self, dt: f32) -> bool {
+        self.p.step_with(dt, 1.0, Self::K, Self::ZETA2)
+    }
+
+    /// 0 at the start, 1 at rest (slightly above 1 during the overshoot).
+    pub fn progress(&self) -> f32 {
+        self.p.x
+    }
+
+    /// The rectangle as drawn now.
+    pub fn rect(&self) -> R4 {
+        let k = self.p.x;
+        let l = |a: f32, b: f32| a + (b - a) * k;
+        (l(self.from.0, self.to.0), l(self.from.1, self.to.1), l(self.from.2, self.to.2).max(1.0), l(self.from.3, self.to.3).max(1.0))
+    }
+
+    /// Opacity of the old layout (1 -> 0 over the first 60 %) and of the new one (0 -> 1 from 10 % to 70 %): a smoothed cross-fade
+    /// whose two halves overlap, so the card is never empty in between.
+    pub fn fades(&self) -> (f32, f32) {
+        let k = self.p.x.clamp(0.0, 1.0);
+        (1.0 - smooth(k / 0.6), smooth((k - 0.1) / 0.6))
+    }
+}
+
 // ---------------------------------------------------------------- merge
 
 /// Cards closer than this (logical px) pull a liquid neck between them; the grid gap is 16 so resting cards never merge.
@@ -480,6 +539,32 @@ pub fn merge_pairs(rects: &[R4], scale: f32) -> Vec<(usize, usize, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_morph_springs_to_the_target_and_comes_to_rest() {
+        let (from, to) = ((20.0, 50.0, 170.0, 170.0), (20.0, 50.0, 356.0, 356.0));
+        let mut m = Morph::new(from, to);
+        assert_eq!(m.rect(), from);
+        let (mut t, mut max_w, mut done) = (0.0f32, 0.0f32, false);
+        while !done && t < 2.0 {
+            done = m.step(0.016);
+            t += 0.016;
+            max_w = max_w.max(m.rect().2);
+            assert_eq!((m.rect().0, m.rect().1), (20.0, 50.0), "the top-left stays");
+        }
+        assert!(done && m.rect() == to, "rest after {t}s: {:?}", m.rect());
+        assert!(t < 0.8, "settles within 0.8 s, took {t}");
+        assert!(max_w < to.2 + 8.0, "overshoot stays below the 16 px gap: {max_w}");
+        // a morph never leaves a frame behind once settled, and a filmstrip sample matches the stepped one
+        assert!((Morph::at(from, to, 100.0).progress() - Morph::at(from, to, 100.0).progress()).abs() < 1e-6);
+        let mid = Morph::at(from, to, 100.0);
+        assert!(mid.progress() > 0.2 && mid.progress() < 0.9, "{}", mid.progress());
+        let (old, new) = mid.fades();
+        assert!((0.0..=1.0).contains(&old) && (0.0..=1.0).contains(&new));
+        let (o0, n0) = Morph::new(from, to).fades();
+        let (o1, n1) = m.fades();
+        assert_eq!((o0, n0, o1, n1), (1.0, 0.0, 0.0, 1.0));
+    }
 
     #[test]
     fn light_swings_against_the_motion_and_settles() {
