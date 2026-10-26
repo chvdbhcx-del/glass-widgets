@@ -4,7 +4,9 @@
 //! non-loopback, non-tunnel interfaces count; when a physical adapter is up, virtual ones (Hyper-V / WSL / VPN, whose traffic is already
 //! counted on the physical NIC) are ignored so nothing is counted twice. Speeds are per-interface counter deltas, so an adapter that
 //! appears or resets never produces a spike.
-use super::sysmon::{fmt_rate_parts, fmt_size, Hist, PANEL};
+//! Units: "МБ/с" (default) is 1024-based (MiB/s, like the other widgets); a click on the unit label flips to "Мбит/с" = bytes * 8 / 1e6
+//! (decimal, as Task Manager, Steam and speed tests say it) and back. Stored as `cfg.unit = "mbit"` (absent = bytes).
+use super::sysmon::{fmt_bits_parts, fmt_rate_parts, fmt_size, Hist, PANEL};
 use crate::registry::{Registry, WidgetDef};
 use crate::widget::*;
 use std::collections::HashMap;
@@ -117,11 +119,14 @@ struct Network {
     total_rx: u64,
     total_tx: u64,
     online: bool,
+    /// click zones of the unit labels, filled by `overlay` (card px); `hot` = the cursor is over one
+    zones: Vec<Rect>,
+    hot: bool,
 }
 
 impl Network {
     fn new() -> Network {
-        Network { init: false, reader: Some(Reader::default()), job: None, spawned: None, last: None, down: Hist::new(60), up: Hist::new(60), total_rx: 0, total_tx: 0, online: true }
+        Network { init: false, reader: Some(Reader::default()), job: None, spawned: None, last: None, down: Hist::new(60), up: Hist::new(60), total_rx: 0, total_tx: 0, online: true, zones: Vec::new(), hot: false }
     }
 
     fn init_preview(&mut self, cx: &Cx) {
@@ -148,13 +153,35 @@ impl Network {
     }
 }
 
-/// Number + unit drawn on one baseline: the unit follows the measured width of the number.
-fn value_unit(cx: &Cx, x: f32, y: f32, h: f32, bps: f32, big: f32, unit_w: f32) {
-    let (n, u) = fmt_rate_parts(bps as f64, cx.lang);
+/// bits (`cfg.unit = "mbit"`) or bytes (default) per second
+fn bits(cx: &Cx) -> bool {
+    cx.cfg_str("unit") == Some("mbit")
+}
+
+fn rate_parts(bps: f32, bits: bool, lang: Lang) -> (String, &'static str) {
+    if bits {
+        fmt_bits_parts(bps as f64, lang)
+    } else {
+        fmt_rate_parts(bps as f64, lang)
+    }
+}
+
+/// A unit label's click zone: the label grown by a few px so it is easy to hit.
+fn zone_of(r: Rect) -> Rect {
+    Rect::new(r.x - 4.0, r.y - 4.0, r.w + 8.0, r.h + 8.0)
+}
+
+/// Number + unit drawn on one baseline: the unit follows the measured width of the number. Returns the unit's click zone; the unit is
+/// brighter while the cursor is over it (a click flips bytes / bits).
+fn value_unit(cx: &Cx, x: f32, y: f32, h: f32, bps: f32, big: f32, unit_w: f32) -> Rect {
+    let (n, u) = rate_parts(bps, bits(cx), cx.lang);
     let st = Style::new(big, 300).mono();
     let (nw, _) = cx.measure(&n, st, 400.0);
     cx.text(Rect::new(x, y, nw + 4.0, h), &n, st, TEXT);
-    cx.text(Rect::new(x + nw + 3.0, y + h * 0.5 + big * 0.12, unit_w, 16.0), u, Style::CAPTION.weight(500), DIM);
+    let r = Rect::new(x + nw + 3.0, y + h * 0.5 + big * 0.12, unit_w, 16.0);
+    let z = zone_of(Rect::new(r.x, r.y, cx.measure(u, Style::CAPTION.weight(500), unit_w).0, r.h));
+    cx.text(r, u, Style::CAPTION.weight(500), if cx.hovering(z) { TEXT } else { DIM });
+    z
 }
 
 fn scale_of(a: &Hist, b: Option<&Hist>) -> f32 {
@@ -190,12 +217,20 @@ impl Widget for Network {
         let c = cx.content();
         let (d, u) = (self.down.last().unwrap_or(0.0), self.up.last().unwrap_or(0.0));
         let lang = cx.lang;
+        self.zones.clear();
         match cx.size {
             Size::S => {
                 if self.online {
-                    value_unit(cx, c.x, c.y + 22.0, 46.0, d, 40.0, 50.0);
-                    let (n, un) = fmt_rate_parts(u as f64, lang);
-                    cx.text(Rect::new(c.x + 20.0, c.y + 70.0, c.w - 20.0, 20.0), &format!("{n} {un}"), Style::new(14.0, 500).mono().ellipsis(), TEXT);
+                    let z = value_unit(cx, c.x, c.y + 22.0, 46.0, d, 40.0, 50.0);
+                    self.zones.push(z);
+                    let (n, un) = rate_parts(u, bits(cx), lang);
+                    let st = Style::new(14.0, 500).mono();
+                    let (nw, _) = cx.measure(&n, st, 200.0);
+                    cx.text(Rect::new(c.x + 20.0, c.y + 70.0, nw + 4.0, 20.0), &n, st, TEXT);
+                    let r = Rect::new(c.x + 20.0 + nw + 5.0, c.y + 70.0, c.w - 25.0 - nw, 20.0);
+                    let z = zone_of(Rect::new(r.x, r.y, cx.measure(un, st, r.w).0, r.h));
+                    cx.text(r, un, st.ellipsis(), if cx.hovering(z) { TEXT } else { DIM });
+                    self.zones.push(z);
                 } else {
                     cx.text(Rect::new(c.x, c.y + 22.0, c.w, 46.0), "–", Style::new(40.0, 300), FAINT);
                     cx.text(Rect::new(c.x + 20.0, c.y + 70.0, c.w - 20.0, 20.0), cx.t("Нет подключения", "Offline"), Style::BODY.ellipsis(), DIM);
@@ -210,7 +245,8 @@ impl Widget for Network {
                     let lane = m_lane(i);
                     let (h, v, color) = if i == 0 { (&self.down, d, accent()) } else { (&self.up, u, UP) };
                     if self.online {
-                        value_unit(cx, lane.x, lane.y + 14.0, lane.h - 14.0, v, 28.0, 50.0);
+                        let z = value_unit(cx, lane.x, lane.y + 14.0, lane.h - 14.0, v, 28.0, 50.0);
+                        self.zones.push(z);
                     } else {
                         cx.text(Rect::new(lane.x, lane.y + 14.0, 110.0, lane.h - 14.0), "–", Style::new(28.0, 300), FAINT);
                     }
@@ -226,10 +262,17 @@ impl Widget for Network {
     }
 
     fn mouse(&mut self, ev: &MouseEv, cx: &mut Cx) -> bool {
+        let hot = ev.kind != MouseKind::Leave && self.zones.iter().any(|z| z.contains(ev.x, ev.y));
+        let changed = hot != self.hot && matches!(ev.kind, MouseKind::Move | MouseKind::Leave); // never claim a press: the card stays draggable
+        self.hot = hot;
         if ev.clicked(cx.bounds()) {
+            if hot {
+                cx.cfg_set("unit", serde_json::json!(if bits(cx) { "bytes" } else { "mbit" }));
+                return true;
+            }
             cx.open_card_target("network");
         }
-        false
+        changed
     }
 
     fn tick(&mut self, cx: &Cx) -> Tick {

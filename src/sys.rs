@@ -231,6 +231,167 @@ pub mod targets {
         })
     }
 
+    // ------------------------------------------------ "Click action": what the user chose for a card (cfg.click)
+
+    /// The user's choice for a card click, stored in the card's own cfg as `click: {kind: "preset"|"custom"|"none", value}`.
+    /// No key (or an unknown / empty one) = `Default`: the table `of`.
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum Click {
+        Default,
+        Nothing,
+        /// `Preset::key` of one of `presets(widget)`
+        Preset(String),
+        /// a value that passed `parse_custom`
+        Custom(String),
+    }
+
+    impl Click {
+        pub fn from_cfg(cfg: &serde_json::Value) -> Click {
+            let Some(c) = cfg.get("click") else { return Click::Default };
+            let v = c.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            match c.get("kind").and_then(|k| k.as_str()) {
+                Some("none") => Click::Nothing,
+                Some("preset") if !v.is_empty() => Click::Preset(v.to_string()),
+                Some("custom") if !v.is_empty() => Click::Custom(v.to_string()),
+                _ => Click::Default,
+            }
+        }
+
+        /// Write the choice into a card's cfg (`Default` removes the key, so an untouched card keeps a clean config).
+        pub fn store(&self, cfg: &mut serde_json::Value) {
+            let (kind, value) = match self {
+                Click::Default => {
+                    if let Some(o) = cfg.as_object_mut() {
+                        o.remove("click");
+                    }
+                    return;
+                }
+                Click::Nothing => ("none", ""),
+                Click::Preset(k) => ("preset", k.as_str()),
+                Click::Custom(v) => ("custom", v.as_str()),
+            };
+            if !cfg.is_object() {
+                *cfg = serde_json::json!({});
+            }
+            cfg["click"] = serde_json::json!({ "kind": kind, "value": value });
+        }
+    }
+
+    /// One ready-made choice of the "Click action" menu. `target` is what ShellExecute opens; for the weather sites it is the bare site,
+    /// used when no city is known (`weather_site` builds the city search).
+    pub struct Preset {
+        pub key: &'static str,
+        pub ru: &'static str,
+        pub en: &'static str,
+        pub target: &'static str,
+    }
+    const fn pr(key: &'static str, ru: &'static str, en: &'static str, target: &'static str) -> Preset {
+        Preset { key, ru, en, target }
+    }
+
+    static P_CALENDAR: &[Preset] = &[
+        pr("windows", "Календарь Windows", "Windows Calendar", CALENDAR_APP),
+        pr("google", "Google Calendar", "Google Calendar", CALENDAR_WEB),
+        pr("outlook", "Outlook (веб)", "Outlook (web)", "https://outlook.live.com/calendar/"),
+    ];
+    static P_WEATHER: &[Preset] = &[
+        pr("google", "Google", "Google", "https://www.google.com/search?q=weather"),
+        pr("yandex", "Яндекс", "Yandex", "https://yandex.ru/pogoda/"),
+        pr("gismeteo", "Gismeteo", "Gismeteo", "https://www.gismeteo.ru/"),
+        pr("open-meteo", "Open-Meteo", "Open-Meteo", "https://open-meteo.com/"),
+    ];
+    static P_SYSTEM: &[Preset] = &[
+        pr("taskmgr", "Диспетчер задач", "Task Manager", TASK_MANAGER),
+        pr("resmon", "Монитор ресурсов", "Resource Monitor", "resmon.exe"),
+        pr("about", "Параметры > Система", "Settings > System", "ms-settings:about"),
+    ];
+    static P_NETWORK: &[Preset] = &[
+        pr("taskmgr", "Диспетчер задач", "Task Manager", TASK_MANAGER),
+        pr("resmon", "Монитор ресурсов", "Resource Monitor", "resmon.exe"),
+        pr("network", "Параметры > Сеть", "Settings > Network", "ms-settings:network-status"),
+        pr("about", "Параметры > Система", "Settings > System", "ms-settings:about"),
+    ];
+    static P_DISKS: &[Preset] = &[pr("thispc", "Этот компьютер", "This PC", THIS_PC), pr("storage", "Параметры > Память", "Storage settings", "ms-settings:storagesense")];
+    static P_CLOCK: &[Preset] = &[pr("clock", "Будильники и часы", "Alarms & Clock", CLOCK), pr("datetime", "Параметры > Дата и время", "Date & time settings", "ms-settings:dateandtime")];
+    static P_BATTERIES: &[Preset] = &[pr("bluetooth", "Параметры Bluetooth", "Bluetooth settings", BLUETOOTH), pr("battery", "Параметры батареи", "Battery settings", "ms-settings:batterysaver")];
+
+    /// The presets of a widget's "Click action" menu (empty = the widget has no card-body click, so no menu item).
+    pub fn presets(widget: &str) -> &'static [Preset] {
+        match widget {
+            "calendar" | "nextevent" => P_CALENDAR,
+            "weather" => P_WEATHER,
+            "sysmon" | "processes" => P_SYSTEM,
+            "network" => P_NETWORK,
+            "disks" => P_DISKS,
+            "clock" | "worldclock" => P_CLOCK,
+            "batteries" => P_BATTERIES,
+            _ => &[],
+        }
+    }
+
+    /// The city search of a weather site preset (`word` = the localized "weather"; only the escaped city ever enters the URL).
+    pub fn weather_site(key: &str, word: &str, city: &str) -> Option<String> {
+        let base = P_WEATHER.iter().find(|p| p.key == key)?.target;
+        let c = query_escape(city);
+        if c.is_empty() {
+            return Some(base.to_string());
+        }
+        Some(match key {
+            "google" => weather_url(word, city),
+            "yandex" => format!("https://yandex.ru/search/?text={}+{c}", query_escape(word)),
+            "gismeteo" => format!("https://www.gismeteo.ru/search/{}/", c.replace('+', "%20")),
+            _ => base.to_string(), // open-meteo.com has no city search
+        })
+    }
+
+    /// Validate a user-typed custom click target. Accepted (and returned trimmed, without surrounding quotes): an `http(s)://` URL, a
+    /// `ms-settings:` / `ms-clock:` / `shell:` URI, or an absolute local drive path for which `exists` says yes. Everything else is
+    /// rejected: program names, command lines with arguments, UNC paths, other schemes, control characters. `exists` is a parameter so
+    /// the check is testable and a click-time re-check can skip the filesystem.
+    pub fn parse_custom(s: &str, exists: impl Fn(&str) -> bool) -> Option<String> {
+        let s = s.trim();
+        let s = s.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(s).trim();
+        if s.is_empty() || s.len() > 2048 || s.chars().any(|c| c.is_control()) {
+            return None;
+        }
+        let lower = s.to_ascii_lowercase();
+        let rest_of = |p: &str| lower.strip_prefix(p).map(|_| &s[p.len()..]);
+        // web: scheme, a host, no blanks or quotes anywhere, no user:password@ in front of the host
+        if let Some(r) = rest_of("https://").or_else(|| rest_of("http://")) {
+            let host = r.split(['/', '?', '#']).next().unwrap_or("");
+            let ok = !host.is_empty() && !host.contains('@') && !s.contains(|c: char| c.is_whitespace() || c == '"' || c == '<' || c == '>');
+            return ok.then(|| s.to_string());
+        }
+        // system URIs: ms-settings:page, ms-clock:, shell:Downloads, shell:::{CLSID}; no "..", only name characters
+        for (p, spaces) in [("ms-settings:", false), ("ms-clock:", false), ("shell:", true)] {
+            if let Some(r) = rest_of(p) {
+                let ok = r.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:{}\\!".contains(c) || (spaces && c == ' ') || (p == "ms-settings:" && "?=&".contains(c))) && !r.contains("..");
+                return ok.then(|| s.to_string());
+            }
+        }
+        // local drive path `C:\dir\file` (no UNC / device paths, no wildcards): the whole string must be a file or folder that exists
+        let b = s.as_bytes();
+        let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
+        (drive && !s[2..].contains(['<', '>', '|', '?', '*', ':']) && exists(s)).then(|| s.to_string())
+    }
+
+    /// What a click on the card of `widget` opens given its `cfg` (None = nothing). `weather` = (localized word, city) for the weather card.
+    /// A preset the table no longer knows or a custom value that fails the syntax check (a hand-edited config) falls back to the default.
+    pub fn resolve(widget: &str, cfg: &serde_json::Value, weather: (&str, &str)) -> Option<String> {
+        let default = || if widget == "weather" { Some(weather_url(weather.0, weather.1)) } else { of(widget).map(str::to_string) };
+        match Click::from_cfg(cfg) {
+            Click::Default => default(),
+            Click::Nothing => None,
+            Click::Custom(v) => parse_custom(&v, |_| true).or_else(default),
+            Click::Preset(k) => match presets(widget).iter().find(|p| p.key == k) {
+                Some(_) if widget == "weather" => weather_site(&k, weather.0, weather.1),
+                Some(p) if p.target == CALENDAR_APP && calendar() != CALENDAR_APP => Some(CALENDAR_WEB.to_string()), // no Calendar app installed
+                Some(p) => Some(p.target.to_string()),
+                None => default(),
+            },
+        }
+    }
+
     /// Percent-encode `s` for a URL query value: unreserved ASCII stays, a space becomes '+', everything else is %XX of its UTF-8 bytes.
     pub fn query_escape(s: &str) -> String {
         let mut o = String::with_capacity(s.len() * 3);
@@ -300,6 +461,162 @@ pub mod targets {
             // widgets with their own clicks stay out of the table
             for id in ["timer", "weather", "controls", "rates", "crypto", "quote", "photos", "countdown", "reminders", "notes", "clipboard", "music", "shortcuts"] {
                 assert_eq!(of(id), None, "{id}");
+            }
+        }
+
+        fn cfg(kind: &str, value: &str) -> serde_json::Value {
+            serde_json::json!({ "click": { "kind": kind, "value": value } })
+        }
+        const NOWHERE: (&str, &str) = ("weather", "Paris");
+
+        #[test]
+        fn click_defaults_and_roundtrip() {
+            assert_eq!(Click::from_cfg(&serde_json::json!({})), Click::Default);
+            assert_eq!(Click::from_cfg(&serde_json::json!(null)), Click::Default);
+            assert_eq!(Click::from_cfg(&cfg("preset", "")), Click::Default); // empty value
+            assert_eq!(Click::from_cfg(&cfg("bogus", "x")), Click::Default);
+            assert_eq!(Click::from_cfg(&cfg("none", "")), Click::Nothing);
+            for c in [Click::Nothing, Click::Preset("resmon".into()), Click::Custom("https://example.com".into())] {
+                let mut v = serde_json::json!({ "city": "Oslo" });
+                c.store(&mut v);
+                assert_eq!(Click::from_cfg(&v), c);
+                assert_eq!(v["city"], "Oslo", "other keys survive");
+            }
+            let mut v = cfg("none", "");
+            Click::Default.store(&mut v);
+            assert!(v.get("click").is_none());
+            let mut n = serde_json::json!(null);
+            Click::Preset("a".into()).store(&mut n);
+            assert_eq!(n["click"]["kind"], "preset");
+        }
+
+        #[test]
+        fn resolve_default_none_preset() {
+            let empty = serde_json::json!({});
+            for id in ["sysmon", "network", "processes", "disks", "clock", "worldclock", "batteries"] {
+                assert_eq!(resolve(id, &empty, NOWHERE).as_deref(), of(id), "{id}: default is the table");
+                assert_eq!(resolve(id, &cfg("none", ""), NOWHERE), None, "{id}: nothing");
+            }
+            assert_eq!(resolve("weather", &empty, ("weather", "Paris")).unwrap(), weather_url("weather", "Paris"));
+            assert_eq!(resolve("timer", &empty, NOWHERE), None, "no target, no default");
+            assert_eq!(resolve("sysmon", &cfg("preset", "resmon"), NOWHERE).as_deref(), Some("resmon.exe"));
+            assert_eq!(resolve("network", &cfg("preset", "network"), NOWHERE).as_deref(), Some("ms-settings:network-status"));
+            assert_eq!(resolve("clock", &cfg("preset", "datetime"), NOWHERE).as_deref(), Some("ms-settings:dateandtime"));
+            assert_eq!(resolve("disks", &cfg("preset", "storage"), NOWHERE).as_deref(), Some("ms-settings:storagesense"));
+            assert_eq!(resolve("batteries", &cfg("preset", "battery"), NOWHERE).as_deref(), Some("ms-settings:batterysaver"));
+            assert_eq!(resolve("calendar", &cfg("preset", "google"), NOWHERE).as_deref(), Some(CALENDAR_WEB));
+            assert!(resolve("nextevent", &cfg("preset", "outlook"), NOWHERE).unwrap().starts_with("https://outlook."));
+            assert!(matches!(resolve("calendar", &cfg("preset", "windows"), NOWHERE).as_deref(), Some(CALENDAR_APP | CALENDAR_WEB)));
+            // a preset of another widget / a removed one: back to the default
+            assert_eq!(resolve("clock", &cfg("preset", "resmon"), NOWHERE).as_deref(), Some(CLOCK));
+            // a widget without presets still honours "nothing" but a preset key means nothing there
+            assert_eq!(resolve("timer", &cfg("preset", "x"), NOWHERE), None);
+        }
+
+        #[test]
+        fn resolve_weather_sites() {
+            let w = ("погода", "Санкт-Петербург");
+            assert_eq!(resolve("weather", &cfg("preset", "google"), w).unwrap(), weather_url(w.0, w.1));
+            assert!(resolve("weather", &cfg("preset", "yandex"), w).unwrap().starts_with("https://yandex.ru/search/?text=%D0%BF"));
+            assert!(resolve("weather", &cfg("preset", "gismeteo"), w).unwrap().starts_with("https://www.gismeteo.ru/search/%D0%A1"));
+            assert_eq!(resolve("weather", &cfg("preset", "open-meteo"), w).unwrap(), "https://open-meteo.com/");
+            assert_eq!(resolve("weather", &cfg("preset", "gismeteo"), ("weather", " ")).unwrap(), "https://www.gismeteo.ru/");
+            assert_eq!(resolve("weather", &cfg("preset", "gismeteo"), ("weather", "New York")).unwrap(), "https://www.gismeteo.ru/search/New%20York/");
+            // a hostile city cannot leave the query
+            let u = resolve("weather", &cfg("preset", "yandex"), ("weather", "x&y=1 #z")).unwrap();
+            assert_eq!(u.matches('&').count(), 0);
+            assert_eq!(resolve("weather", &cfg("none", ""), w), None);
+        }
+
+        #[test]
+        fn custom_accepts_only_safe_targets() {
+            let yes = |_: &str| true;
+            for ok in [
+                "https://example.com",
+                "HTTP://example.com/a?b=c&d=e#f",
+                "  https://calendar.google.com/  ",
+                "ms-settings:display",
+                "ms-settings:network-wifi",
+                "ms-clock:",
+                "shell:Downloads",
+                "shell:Common Start Menu",
+                "shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}",
+                "C:\\Windows\\notepad.exe",
+                "\"C:\\Program Files\\App\\app.exe\"",
+                "D:/Games",
+            ] {
+                assert!(parse_custom(ok, yes).is_some(), "{ok}");
+            }
+            assert_eq!(parse_custom("  \"C:\\Games\"  ", yes).as_deref(), Some("C:\\Games"));
+            for bad in [
+                "",
+                "   ",
+                "calc.exe",
+                "cmd /c calc",
+                "powershell -enc AAAA",
+                "C:\\Windows\\notepad.exe C:\\secret.txt",
+                "javascript:alert(1)",
+                "file:///C:/Windows/notepad.exe",
+                "ftp://example.com",
+                "https://",
+                "https:///path",
+                "https://user:pw@evil.example",
+                "https://exa mple.com",
+                "https://example.com\" --flag",
+                "http://a.b\nc",
+                "\\\\server\\share\\x.exe",
+                "\\\\?\\C:\\x",
+                "relative\\path.exe",
+                "C:file.txt",
+                "C:\\*.exe",
+                "C:\\a|b",
+                "ms-settings:display && calc",
+                "ms-settings:..\\x",
+                "ms-windows-store:",
+                "shell:..\\..\\x.exe",
+                "shell:Downloads\" /x",
+                "ms-clock:\u{0}",
+            ] {
+                assert!(parse_custom(bad, yes).is_none(), "{bad:?}");
+            }
+            // a drive path must exist
+            assert!(parse_custom("C:\\definitely\\not\\here", |_| false).is_none());
+            assert!(parse_custom(&std::env::temp_dir().to_string_lossy(), |p| std::path::Path::new(p).exists()).is_some());
+            assert!(parse_custom(&std::env::current_exe().unwrap().to_string_lossy(), |p| std::path::Path::new(p).is_file()).is_some());
+            // arguments after an existing program: the whole string is not a file, so it is refused
+            let real = |p: &str| std::path::Path::new(p).exists();
+            assert!(parse_custom("C:\\Windows\\notepad.exe /s", real).is_none());
+            assert!(parse_custom("C:\\Windows\\notepad.exe", real).is_some());
+            // URLs and URIs never touch the filesystem check
+            assert!(parse_custom("https://example.com", |_| false).is_some());
+            assert!(parse_custom(&"a".repeat(3000), yes).is_none());
+        }
+
+        #[test]
+        fn hand_edited_custom_falls_back_to_default() {
+            assert_eq!(resolve("sysmon", &cfg("custom", "cmd /c calc"), NOWHERE).as_deref(), Some(TASK_MANAGER));
+            assert_eq!(resolve("sysmon", &cfg("custom", "https://example.com/x"), NOWHERE).as_deref(), Some("https://example.com/x"));
+            assert_eq!(resolve("sysmon", &cfg("custom", "C:\\Tools\\mon.exe"), NOWHERE).as_deref(), Some("C:\\Tools\\mon.exe"));
+        }
+
+        #[test]
+        fn preset_table_is_wellformed() {
+            for id in ["calendar", "nextevent", "weather", "sysmon", "network", "processes", "disks", "clock", "worldclock", "batteries"] {
+                let ps = presets(id);
+                assert!(ps.len() >= 2, "{id}");
+                for (i, p) in ps.iter().enumerate() {
+                    assert!(!p.key.is_empty() && !p.ru.is_empty() && !p.en.is_empty() && !p.target.is_empty() && !p.target.contains(' '), "{id}/{}", p.key);
+                    assert!(ps.iter().skip(i + 1).all(|q| q.key != p.key), "{id}: duplicate key {}", p.key);
+                    assert!(p.target == CALENDAR_APP || parse_custom(p.target, |_| true).is_some() || !p.target.contains(':') && p.target.ends_with(".exe"), "{id}/{}: {}", p.key, p.target);
+                }
+                assert!(ps.len() < 20, "menu id range");
+            }
+            // every widget with a table default has presets, and only those
+            for id in ["sysmon", "network", "processes", "disks", "clock", "worldclock", "batteries", "calendar", "nextevent"] {
+                assert!(!presets(id).is_empty());
+            }
+            for id in ["timer", "controls", "rates", "notes", "music"] {
+                assert!(presets(id).is_empty(), "{id}");
             }
         }
 

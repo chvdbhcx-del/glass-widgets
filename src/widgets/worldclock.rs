@@ -1,5 +1,6 @@
 //! World clock: M = up to 4 city columns (mini analog clock, city, digital time, "Сегодня, +3 ч"); L = up to 6 rows
 //! (mini clock, city, day + offset, 28 light digital time). A face is light by day and dark by night (like Apple's widget).
+//! The small title "МИРОВЫЕ ЧАСЫ" at the top opens Alarms & Clock (`cx.open_card_target`, honours the card's "Click action").
 //! Click a city = remove it; the "+" slot (while there is room) asks for a name (`cx.prompt_text`) and fuzzy-matches it
 //! (case-insensitive exact / prefix / contains, Russian or English or id, spaces and hyphens ignored) against the zone table.
 //! Settings: `cfg.zones = ["Москва", "london", ...]` (names or ids; absent = Москва, Лондон, Нью-Йорк, Токио (+ Дубай, Сидней on L)).
@@ -135,6 +136,8 @@ struct WorldClock {
     min: u64,
     ver: u64,
     hover: Option<usize>,
+    /// the cursor is over the title
+    head_hot: bool,
     prompt: Option<Pending<Option<String>>>,
     /// last typed name that matched nothing (shown in the "+" slot)
     miss: String,
@@ -143,10 +146,22 @@ struct WorldClock {
 
 fn cell(size: Size, i: usize) -> Rect {
     if size == Size::L {
-        Rect::new(16.0, 22.0 + 52.0 * i as f32, 324.0, 52.0)
+        Rect::new(16.0, 30.0 + 52.0 * i as f32, 324.0, 52.0)
     } else {
-        Rect::new(16.0 + 81.0 * i as f32, 16.0, 81.0, 138.0)
+        Rect::new(16.0 + 81.0 * i as f32, 26.0, 81.0, 128.0)
     }
+}
+
+/// The small title at the top ("МИРОВЫЕ ЧАСЫ"): a click opens Alarms & Clock (`cx.open_card_target`), the cells below keep their own clicks.
+fn head_label(cx: &Cx) -> &'static str {
+    cx.t("МИРОВЫЕ ЧАСЫ", "WORLD CLOCK")
+}
+fn head_style() -> Style {
+    Style::LABEL.size(10.5)
+}
+fn head_zone(cx: &Cx) -> Rect {
+    let (w, _) = cx.measure(head_label(cx), head_style(), 0.0);
+    Rect::new(10.0, 6.0, (w + 20.0).min(cx.w - 20.0), 22.0)
 }
 
 /// Mini analog clock: light face + dark hands by day, dark face + light hands by night.
@@ -206,6 +221,11 @@ impl WorldClock {
 impl Widget for WorldClock {
     fn draw(&mut self, cx: &mut Cx) -> Result<()> {
         let size = cx.size;
+        let hz = head_zone(cx);
+        if self.head_hot {
+            cx.rrect(hz, 9.0, Color::rgba(1.0, 1.0, 1.0, 0.10));
+        }
+        cx.text(Rect::new(hz.x + 10.0, hz.y, hz.w - 10.0, hz.h), head_label(cx), head_style().ellipsis(), if self.head_hot { TEXT } else { DIM });
         for i in 0..self.slots(size) {
             let c = cell(size, i);
             let hovered = self.hover == Some(i);
@@ -302,9 +322,13 @@ impl Widget for WorldClock {
             self.persist(cx);
         }
         let size = cx.size;
-        let h = if ev.kind == MouseKind::Leave { None } else { self.hit(size, ev.x, ev.y) };
-        let mut changed = h != self.hover;
-        self.hover = h;
+        let head = ev.inside(head_zone(cx));
+        let h = if ev.kind == MouseKind::Leave || head { None } else { self.hit(size, ev.x, ev.y) };
+        let mut changed = h != self.hover || head != self.head_hot;
+        (self.hover, self.head_hot) = (h, head);
+        if head && ev.clicked(cx.bounds()) {
+            cx.open_card_target("worldclock"); // Alarms & Clock, or the card's "Click action"
+        }
         if ev.kind == MouseKind::Up && ev.button == Button::Left {
             if let Some(i) = h {
                 if i < self.list.len() {

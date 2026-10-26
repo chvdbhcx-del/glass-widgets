@@ -54,6 +54,8 @@ const UNITS_RU: [&str; 5] = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
 const UNITS_EN: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
 const RATES_RU: [&str; 3] = ["КБ/с", "МБ/с", "ГБ/с"];
 const RATES_EN: [&str; 3] = ["KB/s", "MB/s", "GB/s"];
+const BIT_RATES_RU: [&str; 3] = ["Кбит/с", "Мбит/с", "Гбит/с"];
+const BIT_RATES_EN: [&str; 3] = ["Kbit/s", "Mbit/s", "Gbit/s"];
 
 /// "12.4" / "412" (decimal comma in Russian). `dec` digits after the point.
 fn num(v: f64, dec: usize, lang: Lang) -> String {
@@ -117,6 +119,20 @@ pub(crate) fn fmt_rate_parts(bps: f64, lang: Lang) -> (String, &'static str) {
     };
     let n = if v < 0.05 { "0".to_string() } else { num(v, auto_dec(v), lang) };
     (n, (if lang == Lang::Ru { &RATES_RU } else { &RATES_EN })[u])
+}
+/// ("98,9", "Мбит/с") for a speed in bytes per second, as the network gear / Task Manager / Steam / speed tests state it:
+/// DECIMAL bits (bytes * 8 / 1000 per step), unlike `fmt_rate_parts` whose "МБ/с" is 1024-based (MiB/s).
+pub(crate) fn fmt_bits_parts(bps: f64, lang: Lang) -> (String, &'static str) {
+    let bits = bps.max(0.0) * 8.0;
+    let (v, u) = if bits < 1e6 {
+        (bits / 1e3, 0)
+    } else if bits < 1e9 {
+        (bits / 1e6, 1)
+    } else {
+        (bits / 1e9, 2)
+    };
+    let n = if v < 0.05 { "0".to_string() } else { num(v, auto_dec(v), lang) };
+    (n, (if lang == Lang::Ru { &BIT_RATES_RU } else { &BIT_RATES_EN })[u])
 }
 
 /// Fixed-length history (oldest first) drawn as a sparkline that grows in from the right edge.
@@ -744,6 +760,20 @@ mod tests {
         assert_eq!(fmt_rate_parts(1000.0 * 1024.0, Lang::En), ("1.0".into(), "MB/s"));
         assert_eq!(fmt_rate_parts(12.4 * 1048576.0, Lang::Ru), ("12,4".into(), "МБ/с"));
         assert_eq!(fmt_rate_parts(2.0 * 1073741824.0, Lang::En), ("2.0".into(), "GB/s"));
+    }
+
+    #[test]
+    fn bit_rates_are_decimal() {
+        assert_eq!(fmt_bits_parts(0.0, Lang::En), ("0".into(), "Kbit/s"));
+        assert_eq!(fmt_bits_parts(-5.0, Lang::En), ("0".into(), "Kbit/s"));
+        assert_eq!(fmt_bits_parts(125.0, Lang::En), ("1.0".into(), "Kbit/s")); // 1000 bit/s
+        assert_eq!(fmt_bits_parts(125_000.0, Lang::En), ("1.0".into(), "Mbit/s")); // 1e6 bit/s
+        assert_eq!(fmt_bits_parts(12_362_500.0, Lang::Ru), ("98,9".into(), "Мбит/с")); // 98.9 Mbit/s, as Task Manager says
+        assert_eq!(fmt_bits_parts(125_000_000.0, Lang::En), ("1.0".into(), "Gbit/s"));
+        assert_eq!(fmt_bits_parts(60_000.0, Lang::En), ("480".into(), "Kbit/s"));
+        // the same traffic in the 1024-based byte unit reads 8 / 1.048576 times smaller than Mbit/s: 11.7 MB/s ~ 98 Mbit/s
+        assert_eq!(fmt_rate_parts(11.7 * 1048576.0, Lang::En).0, "11.7");
+        assert_eq!(fmt_bits_parts(11.7 * 1048576.0, Lang::En), ("98.1".into(), "Mbit/s"));
     }
 
     #[test]

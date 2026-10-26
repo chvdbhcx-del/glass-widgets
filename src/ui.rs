@@ -3288,11 +3288,13 @@ pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
             None => ((lw * 0.4, lh * 0.4), Size::ALL.to_vec(), Size::M),
         };
         let sizes = if a.state == "menu-one" { vec![cur] } else { sizes };
-        ui.open_menu(&scene, &gfx, menu::card_menu(env.lang, false, &sizes, cur), anchor, Rect::new(0.0, 0.0, lw, lh));
+        // `menu-click`: the "Click action" submenu of the first card (its widget must have one) open, `--hover n` = its row n
+        let click = if a.state == "menu-click" { scene.cards.first().and_then(|c| menu::click_item(env.lang, &c.type_id, &crate::sys::targets::Click::from_cfg(&c.cfg))) } else { None };
+        ui.open_menu(&scene, &gfx, menu::card_menu_with(env.lang, false, &sizes, cur, click), anchor, Rect::new(0.0, 0.0, lw, lh));
         if let Some(m) = ui.menu.as_mut() {
             (m.t, m.sub_t) = (1.0, 1.0);
-            if a.state == "menu-size" {
-                m.open_sub(1, false);
+            if a.state == "menu-size" || a.state == "menu-click" {
+                m.open_sub(if a.state == "menu-click" { 2 } else { 1 }, false);
                 m.sub_t = 1.0;
                 m.hot[1] = Some(a.hover.unwrap_or(1));
             } else {

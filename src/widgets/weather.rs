@@ -750,7 +750,7 @@ impl Widget for Weather {
                     self.prompt = Some(cx.prompt_text(cx.t("Город", "City"), &cur, false));
                 }
             } else {
-                cx.invoke_system(Action::Open(targets::weather_url(cx.t("погода", "weather"), &self.site_city(cx))));
+                cx.open_weather(cx.t("погода", "weather"), &self.site_city(cx)); // honours the card's "Click action"
             }
         }
         changed

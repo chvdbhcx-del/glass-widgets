@@ -854,6 +854,12 @@ impl Scene {
         let c = &self.cards[i];
         c.flags.cfg_dirty.replace(false).then(|| (c.id.clone(), c.cfg.clone()))
     }
+    /// The host changed card `i`'s `cfg` itself (the "Click action" menu): have `take_cfg` hand it over for persisting.
+    pub fn touch_cfg(&mut self, i: usize, f: impl FnOnce(&mut Value)) {
+        let c = &mut self.cards[i];
+        f(&mut c.cfg);
+        c.flags.cfg_dirty.set(true);
+    }
     pub fn animating(&self) -> bool {
         self.cards.iter().any(|c| c.tick.animates())
     }

@@ -22,7 +22,7 @@ use crate::monitors;
 use crate::motion::{self, MatState};
 use crate::prompt::{Act, Key, Mods};
 use crate::layout::{AccentMode, AccentScope};
-use crate::menu::{self, MAct, CMD_DELETE, CMD_EDIT, CMD_SIZE};
+use crate::menu::{self, ClickPick, MAct, CMD_DELETE, CMD_EDIT, CMD_SIZE};
 use crate::tray::{self, TrayCmd};
 use crate::ui::{self, Hit, SAct, SKey, Ui};
 use crate::update::{self, UpdateState};
@@ -55,6 +55,9 @@ const WM_PROMPT: u32 = WM_APP + 21;
 const WM_PROFILE_NAME: u32 = WM_APP + 20;
 /// the longest layout name
 const PROFILE_NAME_MAX: usize = 40;
+/// posted by the "Click action > Custom…" prompt thread with a validated target (it waits in `CLICK_CUSTOM` with the card's uid)
+const WM_CLICK_CUSTOM: u32 = WM_APP + 22;
+static CLICK_CUSTOM: std::sync::Mutex<Option<(usize, String)>> = std::sync::Mutex::new(None);
 static PROFILE_NAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 const T_HIT: usize = 1;
 const T_GUARD: usize = 2;
@@ -191,6 +194,8 @@ struct MenuReq {
     cur: Size,
     editing: bool,
     lang: Lang,
+    /// the "Click action" submenu (None = the widget has no card-body click)
+    click: Option<menu::Item>,
 }
 
 struct App {
@@ -799,6 +804,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(|app| app.profile_named());
             LRESULT(0)
         }
+        WM_CLICK_CUSTOM => {
+            with_app(|app| app.click_custom_named());
+            LRESULT(0)
+        }
         WM_PROMPT => {
             let ran = std::cell::Cell::new(false);
             with_app(|app| {
@@ -929,6 +938,21 @@ unsafe fn run_menu(hwnd: HWND, r: &MenuReq) -> usize {
     }
     let size_label = t("Размер", "Size");
     let _ = AppendMenuW(menu, MF_POPUP | if r.sizes.len() > 1 { MF_ENABLED } else { MF_GRAYED }, sub.0 as usize, PCWSTR(size_label.as_ptr()));
+    if let (Some(it), Ok(csub)) = (&r.click, CreatePopupMenu()) {
+        for e in &it.children {
+            match e {
+                menu::Entry::Sep => {
+                    let _ = AppendMenuW(csub, MF_SEPARATOR, 0, PCWSTR::null());
+                }
+                menu::Entry::Item(k) => {
+                    let l = wide(&k.label);
+                    let _ = AppendMenuW(csub, MF_STRING | if k.checked { MF_CHECKED } else { MF_UNCHECKED }, k.id, PCWSTR(l.as_ptr()));
+                }
+            }
+        }
+        let l = wide(&it.label);
+        let _ = AppendMenuW(menu, MF_POPUP, csub.0 as usize, PCWSTR(l.as_ptr())); // destroyed with `menu`
+    }
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let del = t("Удалить виджет", "Remove Widget");
     let _ = AppendMenuW(menu, MF_STRING, CMD_DELETE, PCWSTR(del.as_ptr()));
@@ -2262,7 +2286,72 @@ impl App {
         let c = &self.scene.cards[i];
         let def = crate::registry::global().get(&c.type_id)?;
         let (x, y) = unpack(lp);
-        Some(MenuReq { uid, x, y, sizes: def.sizes.to_vec(), cur: c.size, editing: self.ui.edit, lang: self.ui.lang })
+        let click = menu::click_item(self.ui.lang, &c.type_id, &crate::sys::targets::Click::from_cfg(&c.cfg));
+        Some(MenuReq { uid, x, y, sizes: def.sizes.to_vec(), cur: c.size, editing: self.ui.edit, lang: self.ui.lang, click })
+    }
+
+    /// A "Click action" menu command for card `uid`: store the choice in the card's cfg (persisted like any widget setting), or ask for a
+    /// custom target.
+    unsafe fn click_choice(&mut self, uid: usize, cmd: usize) {
+        use crate::sys::targets::{presets, Click};
+        let Some(i) = self.scene.index_of_uid(uid) else { return };
+        let widget = self.scene.cards[i].type_id.clone();
+        let choice = match menu::click_pick(cmd) {
+            Some(ClickPick::Default) => Click::Default,
+            Some(ClickPick::Nothing) => Click::Nothing,
+            Some(ClickPick::Preset(k)) => match presets(&widget).get(k) {
+                Some(p) => Click::Preset(p.key.to_string()),
+                None => return,
+            },
+            Some(ClickPick::Custom) => {
+                let cur = match Click::from_cfg(&self.scene.cards[i].cfg) {
+                    Click::Custom(v) => v,
+                    _ => String::new(),
+                };
+                return self.ask_click_custom(uid, cur);
+            }
+            None => return,
+        };
+        self.set_click(uid, choice);
+    }
+
+    unsafe fn set_click(&mut self, uid: usize, choice: crate::sys::targets::Click) {
+        let Some(i) = self.scene.index_of_uid(uid) else { return };
+        self.scene.touch_cfg(i, |cfg| choice.store(cfg));
+        let now = self.now();
+        if let Some(r) = self.settle(i, &now, false) {
+            self.frame(r);
+        }
+    }
+
+    /// "Custom…": the prompt runs on its own thread (it has a message loop) and asks again until the value passes `parse_custom` or the
+    /// user cancels; a good value comes back as `WM_CLICK_CUSTOM`.
+    unsafe fn ask_click_custom(&mut self, uid: usize, initial: String) {
+        let (lang, hwnd) = (self.ui.lang, self.hwnd.0 as isize);
+        let _ = std::thread::Builder::new().name("click-custom".into()).spawn(move || {
+            let mut text = initial;
+            let mut bad = false;
+            loop {
+                let title = if bad { lang.pick("Не подходит. Нужен адрес или файл", "Not allowed. Use a web address or a file") } else { lang.pick("Что открывать по клику", "What to open on click") };
+                let mut o = crate::input::PromptOpts::new(title, &text, false);
+                (o.placeholder, o.ok_label, o.lang) = (lang.pick("https://…, ms-settings:…, shell:… или C:\\путь", "https://…, ms-settings:…, shell:… or C:\\path").to_string(), lang.pick("Сохранить", "Save").to_string(), lang);
+                let Some(raw) = crate::input::prompt_ex(o) else { return };
+                if let Some(v) = crate::sys::targets::parse_custom(&raw, |p| std::path::Path::new(p).exists()) {
+                    if let Ok(mut g) = CLICK_CUSTOM.lock() {
+                        *g = Some((uid, v));
+                        let _ = PostMessageW(HWND(hwnd as *mut _), WM_CLICK_CUSTOM, WPARAM(0), LPARAM(0));
+                    }
+                    return;
+                }
+                (text, bad) = (raw, true);
+            }
+        });
+    }
+
+    unsafe fn click_custom_named(&mut self) {
+        if let Some((uid, v)) = CLICK_CUSTOM.lock().ok().and_then(|mut g| g.take()) {
+            self.set_click(uid, crate::sys::targets::Click::Custom(v));
+        }
     }
 
     unsafe fn menu_result(&mut self, req: &MenuReq, cmd: usize) {
@@ -2277,6 +2366,7 @@ impl App {
             }
             c if (CMD_SIZE..CMD_SIZE + 3).contains(&c) => self.change_size(req.uid, Size::ALL[c - CMD_SIZE]),
             CMD_DELETE => self.remove_card(req.uid),
+            c if menu::click_pick(c).is_some() => self.click_choice(req.uid, c),
             _ => {}
         }
         if !self.ui.edit {
@@ -4054,7 +4144,7 @@ impl App {
         self.modal_begin();
         self.boost_capture();
         self.reduced = reduced_motion();
-        self.ui.open_menu(&self.scene, &self.gfx, menu::card_menu(req.lang, req.editing, &req.sizes, req.cur), anchor, work);
+        self.ui.open_menu(&self.scene, &self.gfx, menu::card_menu_with(req.lang, req.editing, &req.sizes, req.cur, req.click.clone()), anchor, work);
         self.menu_uid = req.uid;
         (self.prompt_was_fg, self.prompt_t0, self.menu_last, self.menu_shown) = (false, Instant::now(), Instant::now(), None);
         let full = RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h };
@@ -4155,6 +4245,7 @@ impl App {
         match id {
             c if (CMD_SIZE..CMD_SIZE + 3).contains(&c) => self.change_size(uid, Size::ALL[c - CMD_SIZE]),
             CMD_DELETE => self.remove_card(uid),
+            c if menu::click_pick(c).is_some() => self.click_choice(uid, c),
             _ => {}
         }
     }
