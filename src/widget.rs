@@ -1028,6 +1028,13 @@ impl<'a> Cx<'a> {
             sys::perform(&a);
         }
     }
+    /// A click on the body of widget `id`'s card: open the Windows tool mapped to it in `sys::targets::of` (Task Manager, This PC, ...).
+    /// No-op in preview mode (like `invoke_system`) and for ids without a target.
+    pub fn open_card_target(&self, id: &str) {
+        if let Some(t) = sys::targets::of(id) {
+            self.invoke_system(Action::Open(t.to_string()));
+        }
+    }
     /// Current UTC instant as unix seconds (derived from `now` and the local offset, so previews are stable).
     pub fn utc_secs(&self) -> i64 {
         self.now.local_secs() - self.utc_off as i64 * 60

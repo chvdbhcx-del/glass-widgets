@@ -332,6 +332,9 @@ impl Widget for Processes {
             cx.cfg_set("sort", json!(if self.by_ram { "ram" } else { "cpu" }));
             return true;
         }
+        if ev.clicked(cx.bounds()) {
+            cx.open_card_target("processes"); // the rest of the card: Task Manager
+        }
         false
     }
 

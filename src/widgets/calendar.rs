@@ -184,10 +184,17 @@ impl Widget for Calendar {
     }
 
     fn mouse(&mut self, ev: &MouseEv, cx: &mut Cx) -> bool {
+        let (p, n, name) = Self::nav_rects();
         if cx.size != Size::L {
+            if ev.clicked(cx.bounds()) {
+                cx.open_card_target("calendar");
+            }
             return false;
         }
-        let (p, n, name) = Self::nav_rects();
+        // L: the arrows and the month name keep their clicks; anywhere else opens the calendar
+        if ev.clicked(cx.bounds()) && !ev.inside(p) && !ev.inside(n) && !(ev.inside(name) && self.offset != 0) {
+            cx.open_card_target("calendar");
+        }
         let hot = if ev.kind == MouseKind::Leave {
             None
         } else if ev.inside(p) {

@@ -176,3 +176,140 @@ pub fn perform(a: &Action) {
         }
     }
 }
+
+/// Is Ctrl held right now (as of the message being handled)? For hidden-but-safe alternatives to a card's plain click.
+pub fn ctrl_down() -> bool {
+    unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 }
+}
+
+// ---------------------------------------------------------------- click targets
+
+/// What a left click on a card opens (`Cx::open_card_target`). Every target lives here so the mapping can be tested; all go through
+/// ShellExecute "open" (`Action::Open`): a URI scheme, a `shell:` folder, a program or a URL.
+pub mod targets {
+    use windows::core::w;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::*;
+
+    pub const TASK_MANAGER: &str = "taskmgr.exe";
+    pub const THIS_PC: &str = "shell:MyComputerFolder";
+    pub const CLOCK: &str = "ms-clock:";
+    pub const BLUETOOTH: &str = "ms-settings:bluetooth";
+    pub const SOUND: &str = "ms-settings:sound";
+    pub const DISPLAY: &str = "ms-settings:display";
+    /// Outlook / Calendar app, only when the `outlookcal` protocol is registered
+    pub const CALENDAR_APP: &str = "outlookcal:";
+    pub const CALENDAR_WEB: &str = "https://calendar.google.com";
+
+    /// Is the URI scheme `name` registered (HKCR\<name> exists)? Cached by the caller, this reads the registry.
+    fn protocol_registered(name: windows::core::PCWSTR) -> bool {
+        unsafe {
+            let mut hk = HKEY::default();
+            let ok = RegOpenKeyExW(HKEY_CLASSES_ROOT, name, 0, KEY_QUERY_VALUE, &mut hk) == ERROR_SUCCESS;
+            if ok {
+                let _ = RegCloseKey(hk);
+            }
+            ok
+        }
+    }
+
+    /// The calendar to open: the Windows Calendar / Outlook app when `outlookcal:` is registered, else Google Calendar.
+    pub fn calendar() -> &'static str {
+        static C: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+        C.get_or_init(|| if protocol_registered(w!("outlookcal")) { CALENDAR_APP } else { CALENDAR_WEB })
+    }
+
+    /// Widget type id -> what its card body opens (`None` = the widget has its own clicks).
+    pub fn of(widget: &str) -> Option<&'static str> {
+        Some(match widget {
+            "sysmon" | "network" | "processes" => TASK_MANAGER,
+            "disks" => THIS_PC,
+            "clock" | "worldclock" => CLOCK,
+            "batteries" => BLUETOOTH,
+            "calendar" | "nextevent" => calendar(),
+            _ => return None,
+        })
+    }
+
+    /// Percent-encode `s` for a URL query value: unreserved ASCII stays, a space becomes '+', everything else is %XX of its UTF-8 bytes.
+    pub fn query_escape(s: &str) -> String {
+        let mut o = String::with_capacity(s.len() * 3);
+        for b in s.trim().bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => o.push(b as char),
+                b' ' => o.push('+'),
+                _ => o.push_str(&format!("%{b:02X}")),
+            }
+        }
+        o
+    }
+
+    /// A web search for the weather: `https://www.google.com/search?q=<word>+<city>`; `word` is the localized "weather", nothing else
+    /// but the escaped city ever ends up in the URL. An empty city searches for the bare word.
+    pub fn weather_url(word: &str, city: &str) -> String {
+        let city = query_escape(city);
+        let word = query_escape(word);
+        if city.is_empty() {
+            format!("https://www.google.com/search?q={word}")
+        } else {
+            format!("https://www.google.com/search?q={word}+{city}")
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn escapes_city() {
+            assert_eq!(query_escape("London"), "London");
+            assert_eq!(query_escape(" New York "), "New+York");
+            assert_eq!(query_escape("Москва"), "%D0%9C%D0%BE%D1%81%D0%BA%D0%B2%D0%B0");
+            assert_eq!(query_escape("a&b=c#d%e/?"), "a%26b%3Dc%23d%25e%2F%3F");
+            assert_eq!(query_escape("St. John's"), "St.+John%27s");
+        }
+
+        #[test]
+        fn weather_urls() {
+            assert_eq!(weather_url("погода", "Санкт-Петербург"), "https://www.google.com/search?q=%D0%BF%D0%BE%D0%B3%D0%BE%D0%B4%D0%B0+%D0%A1%D0%B0%D0%BD%D0%BA%D1%82-%D0%9F%D0%B5%D1%82%D0%B5%D1%80%D0%B1%D1%83%D1%80%D0%B3");
+            assert_eq!(weather_url("weather", "New York"), "https://www.google.com/search?q=weather+New+York");
+            assert_eq!(weather_url("weather", ""), "https://www.google.com/search?q=weather");
+            assert_eq!(weather_url("weather", "  "), "https://www.google.com/search?q=weather");
+            // a hostile city name cannot add a parameter or leave the query
+            let u = weather_url("weather", "x&y=1 http://evil");
+            assert!(u.starts_with("https://www.google.com/search?q=weather+x%26y%3D1+http%3A%2F%2Fevil"));
+            assert_eq!(u.matches('&').count(), 0);
+        }
+
+        #[test]
+        fn mapping() {
+            for (id, want) in [
+                ("sysmon", TASK_MANAGER),
+                ("network", TASK_MANAGER),
+                ("processes", TASK_MANAGER),
+                ("disks", THIS_PC),
+                ("clock", CLOCK),
+                ("worldclock", CLOCK),
+                ("batteries", BLUETOOTH),
+            ] {
+                assert_eq!(of(id), Some(want), "{id}");
+            }
+            for id in ["calendar", "nextevent"] {
+                assert!(matches!(of(id), Some(CALENDAR_APP | CALENDAR_WEB)), "{id}");
+            }
+            // widgets with their own clicks stay out of the table
+            for id in ["timer", "weather", "controls", "rates", "crypto", "quote", "photos", "countdown", "reminders", "notes", "clipboard", "music", "shortcuts"] {
+                assert_eq!(of(id), None, "{id}");
+            }
+        }
+
+        #[test]
+        fn targets_are_wellformed() {
+            for t in [TASK_MANAGER, THIS_PC, CLOCK, BLUETOOTH, SOUND, DISPLAY, CALENDAR_APP, CALENDAR_WEB] {
+                assert!(!t.is_empty() && !t.contains(' '), "{t}");
+            }
+            assert!(CALENDAR_WEB.starts_with("https://"));
+            assert!(SOUND.starts_with("ms-settings:") && DISPLAY.starts_with("ms-settings:"));
+        }
+    }
+}

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.12] - 2026-10-27
+
+### Added
+- Widgets open Task Manager / Explorer / calendar / weather site / settings on click. A left click on a card now opens the matching Windows tool: System, Network and Processes open Task Manager, Disks opens This PC, Clock opens Alarms & Clock, Batteries opens the Bluetooth settings, Calendar and Next event open the calendar app (or Google Calendar when none is installed), Weather opens a web search for the weather in the shown city. In Quick Actions the glyph left of the volume slider opens the Sound settings and the one left of the brightness slider the Display settings (the slider itself is not touched). Nothing opens in edit mode, while a card is dragged or in previews.
+- Weather: the city is now changed by clicking the city name (it lights up under the pointer); the rest of the card opens the weather site. Without a forecast ("City not found") the whole card still asks for a city.
+- Next event: with a working calendar a click opens the calendar, Ctrl+click changes the .ics path or link; an unset or broken source keeps the plain click that asks for it.
+
 ## [0.5.11] - 2026-10-26
 
 ### Fixed

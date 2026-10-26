@@ -13,6 +13,7 @@
 //! "Click again") cross-fades: `draw` leaves it out for ~170 ms and `overlay` paints the old and the new look. `Tick::Fps(60)` only while
 //! something moves.
 use crate::registry::{Registry, WidgetDef};
+use crate::sys::targets;
 use crate::widget::*;
 use std::time::Instant;
 use windows::core::{w, PCWSTR};
@@ -224,6 +225,17 @@ impl Lay {
             return Some(Hit::Bri);
         }
         self.items.iter().find(|i| i.hit.contains(x, y)).map(|i| Hit::Btn(i.btn))
+    }
+    /// The glyph left of a slider (the track starts 30 px in): the Settings page it opens.
+    fn icon_at(&self, x: f32, y: f32) -> Option<&'static str> {
+        let z = |r: Rect| Rect::new(r.x, r.y, 28.0, r.h).contains(x, y);
+        if self.vol.is_some_and(z) {
+            Some(targets::SOUND)
+        } else if self.bri.is_some_and(z) {
+            Some(targets::DISPLAY)
+        } else {
+            None
+        }
     }
 }
 
@@ -490,6 +502,8 @@ struct Controls {
     drag: Option<Hit>,
     hot: Option<Hit>,
     down: Option<Hit>,
+    /// the press began on a slider's glyph (its Settings page opens on release over the same glyph); the slider itself is not touched
+    icon_down: Option<&'static str>,
     /// last user interaction (snapshots right after it must not overwrite the optimistic values)
     touched: Instant,
     arm: Arm,
@@ -532,6 +546,7 @@ impl Default for Controls {
             drag: None,
             hot: None,
             down: None,
+            icon_down: None,
             touched: now - Duration::from_secs(60),
             arm: Arm::default(),
             arm_shown: None,
@@ -1075,11 +1090,12 @@ impl Widget for Controls {
         }
         let lay = self.lay(cx.size);
         let hit = if ev.kind == MouseKind::Leave { None } else { lay.hit(ev.x, ev.y) };
+        let icon = if ev.kind == MouseKind::Leave { None } else { lay.icon_at(ev.x, ev.y) };
         let mut changed = false;
         match ev.kind {
             MouseKind::Leave => {
                 changed = self.hot.is_some() || self.drag.is_some() || self.down.is_some();
-                (self.hot, self.down) = (None, None);
+                (self.hot, self.down, self.icon_down) = (None, None, None);
                 self.drag = None;
             }
             MouseKind::Move => {
@@ -1102,6 +1118,9 @@ impl Widget for Controls {
                 }
             }
             MouseKind::Down if ev.button == Button::Left => {
+                // a press on a slider's glyph is a click on the glyph, not a jump of the slider to its start
+                self.icon_down = icon;
+                let hit = if icon.is_some() { None } else { hit };
                 self.down = hit;
                 self.hot = hit;
                 match (hit, lay.vol, lay.bri) {
@@ -1120,6 +1139,9 @@ impl Widget for Controls {
                 changed = hit.is_some();
             }
             MouseKind::Up if ev.button == Button::Left => {
+                if let Some(t) = self.icon_down.take().filter(|&t| icon == Some(t)) {
+                    cx.invoke_system(Action::Open(t.to_string()));
+                }
                 let (down, drag) = (self.down.take(), self.drag.take());
                 if drag.is_some() {
                     self.act(cx, || {}, false);
@@ -1285,6 +1307,11 @@ mod tests {
         assert_eq!(l.hit(100.0, 30.0), Some(Hit::Vol));
         assert_eq!(l.hit(100.0, 70.0), Some(Hit::Bri));
         assert_eq!(l.hit(1.0, 1.0), None);
+        // the glyphs left of the sliders open Settings; the track and the buttons are not glyph hits
+        assert_eq!(l.icon_at(24.0, 30.0), Some(targets::SOUND));
+        assert_eq!(l.icon_at(24.0, 70.0), Some(targets::DISPLAY));
+        assert_eq!(l.icon_at(100.0, 30.0), None);
+        assert!(l.items.iter().all(|i| l.icon_at(i.hit.cx(), i.hit.cy()).is_none()));
     }
 
     /// Read-only hardware probe, run once by hand: `cargo test -- --ignored --nocapture hw_probe`

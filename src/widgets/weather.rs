@@ -1,12 +1,13 @@
 //! Weather: S city + big temperature + condition + H/L; M current block + 5 hourly columns; L current block + 7 hourly
 //! columns + 5-day list with gradient range bars. Data: Open-Meteo (keyless), refreshed every 15 min in a `cx.spawn` job.
 //! Settings: `cfg.city` (string, optional; geocoded via Open-Meteo, empty = auto-detect once by IP through ipwho.is),
-//! `cfg.units` ("c" default | "f"). Clicking the card asks for a city (`cx.prompt_text`) and stores it into `cfg.city`.
+//! `cfg.units` ("c" default | "f"). Clicking the city label asks for a city (`cx.prompt_text`) and stores it into `cfg.city`; the rest of the card opens a weather web search for that city.
 //! Files (%APPDATA%\macshell\cache): `weather_loc.json` (resolved city/auto -> lat/lon/name), `weather_<lat>_<lon>.json`
 //! (last good forecast, shown instantly at start; offline keeps it with a dim "нет сети").
 //! Core gap: `tick` only gets `&Cx`, so it cannot write `cfg`; a city typed in the prompt is flushed to `cfg.city` on the
 //! next mouse event (and is kept in memory meanwhile), lat/lon of auto-detect live in weather_loc.json instead of cfg.
 use crate::registry::{Registry, WidgetDef};
+use crate::sys::targets;
 use crate::widget::*;
 use serde_json::Value as Json;
 use std::path::PathBuf;
@@ -370,6 +371,8 @@ struct Weather {
     /// typed in the prompt, not yet in cfg
     city_override: Option<String>,
     flush_city: Option<String>,
+    /// the pointer is over the city label
+    city_hot: bool,
 }
 
 impl Weather {
@@ -432,10 +435,34 @@ impl Weather {
         cx.text(Rect::new(b.x, my + 22.0, b.w, 16.0), sub, Style::CAPTION.center().ellipsis(), FAINT);
     }
 
+    /// The city row of the card (S / M left block / L).
+    fn row_of(size: Size) -> Rect {
+        Rect::new(16.0, 16.0, match size { Size::S => 138.0, Size::M => 140.0, Size::L => 324.0 }, 18.0)
+    }
+
+    /// The tappable city label: the name (+ arrow) with some air around it, never wider than its row. A tap there asks for another city.
+    fn city_zone(&self, cx: &Cx, row: Rect) -> Rect {
+        let room = if self.offline { 56.0 } else { 0.0 };
+        let (w, _) = cx.measure(&self.place, Style::TITLE, 0.0);
+        let w = (w + if self.auto { 20.0 } else { 0.0 }).clamp(24.0, row.w - room);
+        Rect::new(row.x - 6.0, row.y - 5.0, w + 12.0, row.h + 10.0)
+    }
+
+    /// The place the weather site is asked about: the resolved name on the card, else what was typed / configured.
+    fn site_city(&self, cx: &Cx) -> String {
+        if !self.place.is_empty() {
+            return self.place.clone();
+        }
+        self.city_override.clone().or_else(|| cx.cfg_str("city").map(str::to_string)).unwrap_or_default()
+    }
+
     /// City name (+ location arrow when auto-detected) and the dim "нет сети" caption on the right.
     fn city_row(&self, cx: &Cx, r: Rect) {
         let room = if self.offline { 56.0 } else { 0.0 };
         let tw = r.w - room;
+        if self.city_hot {
+            cx.rrect(self.city_zone(cx, r), 9.0, Color::rgba(1.0, 1.0, 1.0, 0.10));
+        }
         cx.text(Rect::new(r.x, r.y, tw, r.h), &self.place, Style::TITLE.ellipsis(), TEXT);
         if self.auto {
             let (w, _) = cx.measure(&self.place, Style::TITLE, 0.0);
@@ -451,7 +478,7 @@ impl Weather {
     /// S and the left half of M: city, big temperature, then glyph / condition / H:L anchored to the bottom.
     fn left_block(&self, cx: &Cx, wx: &Wx, today: Option<&Day>, x: f32, w: f32, f: bool) {
         let bottom = 154.0;
-        self.city_row(cx, Rect::new(x, 16.0, w, 18.0));
+        self.city_row(cx, Rect::new(x, 16.0, w, 18.0)); // = row_of(S / M)
         cx.text(Rect::new(x - 1.0, 32.0, w + 2.0, 56.0), &fmt_t(wx.temp, f), Style::BIG.size(50.0).track(-1.0), TEXT);
         let (kind, ru, en) = wmo(wx.code, wx.day);
         draw_kind(cx, kind, wx.day, Rect::new(x, bottom - 56.0, 22.0, 22.0), TEXT);
@@ -706,11 +733,27 @@ impl Widget for Weather {
         if let Some(c) = self.flush_city.take() {
             cx.cfg_set("city", json!(c));
         }
-        if ev.clicked(cx.bounds()) && self.prompt.as_ref().map_or(true, |p| !p.busy()) {
-            let cur = self.city_override.clone().or_else(|| cx.cfg_str("city").map(str::to_string)).unwrap_or_else(|| self.place.clone());
-            self.prompt = Some(cx.prompt_text(cx.t("Город", "City"), &cur, false));
+        // no forecast yet ("city not found" / "no data"): the whole card asks for a city, as before. With a forecast only the city label
+        // does; the rest of the card opens the weather site for that city.
+        let zone = if self.wx.is_none() { cx.bounds() } else { self.city_zone(cx, Self::row_of(cx.size)) };
+        let hot = ev.kind != MouseKind::Leave && self.wx.is_some() && zone.contains(ev.x, ev.y);
+        let mut changed = false;
+        if hot != self.city_hot {
+            self.city_hot = hot;
+            self.ver += 1;
+            changed = matches!(ev.kind, MouseKind::Move | MouseKind::Leave); // never claim a press: the card stays draggable
         }
-        false
+        if ev.clicked(cx.bounds()) {
+            if ev.inside(zone) {
+                if self.prompt.as_ref().map_or(true, |p| !p.busy()) {
+                    let cur = self.city_override.clone().or_else(|| cx.cfg_str("city").map(str::to_string)).unwrap_or_else(|| self.place.clone());
+                    self.prompt = Some(cx.prompt_text(cx.t("Город", "City"), &cur, false));
+                }
+            } else {
+                cx.invoke_system(Action::Open(targets::weather_url(cx.t("погода", "weather"), &self.site_city(cx))));
+            }
+        }
+        changed
     }
 
     fn version(&self) -> u64 {

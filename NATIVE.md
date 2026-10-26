@@ -96,6 +96,9 @@ pub trait Widget {
   cursor is over the card (the window is click-through elsewhere). `cx.hover` / `cx.hovering(rect)` give the cursor position. A hover look that lives in `draw`
   needs a version bump when the hovered thing changes (calendar.rs: chevrons appear on hover). Return true only when something changed.
   Do not draw in `mouse`: change state, return true, the framework re-records/recomposes.
+  Card-body clicks that open a Windows tool (Task Manager, This PC, Alarms & Clock, calendar, Settings pages, the weather search) are the table
+  `sys::targets::of(widget_id)` + `cx.open_card_target(id)`; add a widget there, not a literal in the widget. The host already sends no click while editing, after a
+  drag started (> 5 px) or in previews (`invoke_system` is a no-op there).
 
 ## 4. Cx reference
 

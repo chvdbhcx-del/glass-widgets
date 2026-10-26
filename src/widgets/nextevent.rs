@@ -966,7 +966,12 @@ impl Widget for NextEvent {
         if let Some(p) = self.save_path.take() {
             cx.cfg_set("ics", json!(p));
         }
-        if ev.clicked(cx.bounds()) && !cx.preview && self.prompt.is_none() {
+        // a working calendar: a click opens the calendar app / site, Ctrl+click changes the source. Anything else (unset, broken, loading)
+        // keeps the plain click that asks for the path or link, as the card says.
+        let works = self.status == Some(Status::Ok);
+        if ev.clicked(cx.bounds()) && works && !crate::sys::ctrl_down() {
+            cx.open_card_target("nextevent");
+        } else if ev.clicked(cx.bounds()) && !cx.preview && self.prompt.is_none() {
             let cur = self.path.clone().unwrap_or_default();
             self.prompt = Some(cx.prompt_text_ex(cx.t("Путь к .ics или ссылка на календарь", "Path to an .ics file or a calendar link"), &cur, false, r"C:\Users\you\calendar.ics  |  https://…", ""));
         }

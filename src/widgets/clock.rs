@@ -89,6 +89,13 @@ impl Widget for Clock {
         Ok(())
     }
 
+    fn mouse(&mut self, ev: &MouseEv, cx: &mut Cx) -> bool {
+        if ev.clicked(cx.bounds()) {
+            cx.open_card_target("clock");
+        }
+        false
+    }
+
     fn tick(&mut self, cx: &Cx) -> Tick {
         self.min = cx.now.minute_key();
         if cx.preview {

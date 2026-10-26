@@ -225,6 +225,13 @@ impl Widget for Network {
         Ok(())
     }
 
+    fn mouse(&mut self, ev: &MouseEv, cx: &mut Cx) -> bool {
+        if ev.clicked(cx.bounds()) {
+            cx.open_card_target("network");
+        }
+        false
+    }
+
     fn tick(&mut self, cx: &Cx) -> Tick {
         if cx.preview {
             self.init_preview(cx);
