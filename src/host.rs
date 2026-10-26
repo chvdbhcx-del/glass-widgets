@@ -2222,7 +2222,8 @@ impl App {
         };
         let old = self.scene.layer_rect_ext(i, self.ext());
         let (x, y, _, _) = cell_rect(size, p.col, p.row, self.cs);
-        if let Err(e) = self.scene.resize_card(&self.gfx, i, size, x, y) {
+        // the glass springs to the new size (a plain jump with "animation effects" off)
+        if let Err(e) = self.scene.resize_card(&self.gfx, i, size, x, y, !self.reduced) {
             eprintln!("mswidgets: resize: {e}");
             return;
         }
@@ -2235,10 +2236,7 @@ impl App {
             it.col = p.col as u32;
             it.row = p.row as u32;
         }
-        if !self.reduced {
-            self.pops.insert(uid, Pop { t0: Instant::now(), out: false });
-            self.scene.set_xf(i, mat_xf(&motion::materialize(0.0, false, false), 0.0, 0.0));
-        }
+        self.pops.remove(&uid); // a pending condense of the old size is moot
         self.save_layout();
         self.sync_regions();
         self.update_tick_timer();
@@ -2494,6 +2492,9 @@ impl App {
         // glass motion: light spring, pointer glint, appearance cross-fade
         if let Some(r) = self.scene.step_fx(&self.gfx, dt, &now0) {
             add(&mut dirty, r);
+        }
+        if self.scene.take_morph_done() {
+            self.sync_regions(); // a size change landed: the capture regions and the window shrink back to the final rectangles
         }
         // the settings controls (hover, sliding segment, switches, handles) repaint only the controls that moved
         if let Some(r) = self.ui.step_sa(dt, self.reduced) {
