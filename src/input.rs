@@ -1,12 +1,22 @@
-//! A modal text prompt for widgets (reminders, notes, shortcuts, timer duration...): `cx.prompt_text(...)` runs `prompt_ex` on a
+//! The text prompt of the widgets (reminders, notes, shortcuts, timer duration...): `cx.prompt_text(...)` runs `prompt_ex` on a
 //! worker thread (`cx.spawn`), so the widget layer (NOACTIVATE, click-through) never needs keyboard focus itself.
-//! A real Win32 EDIT control is used on purpose: IME, selection, clipboard and accessibility come for free. Everything around it
-//! (panel, rounded "well" with a focus ring, placeholder, buttons) is drawn by Direct2D into a premultiplied DIB that is BitBlt-ed
-//! into the window, so the pixels carry alpha and the DWM acrylic backdrop shines through the panel (Windows 11; elsewhere the
-//! panel is an opaque dark tint). Enter = OK (multiline: Ctrl+Enter), Esc / click elsewhere = cancel, Tab walks field > OK > Cancel.
-//! The panel is a plain opaque dark one: GDI pixels of the EDIT in an acrylic frame get alpha 0 and show up as a grey slab. `MSWIDGETS_PROMPT_ACRYLIC=1` opts into the backdrop anyway.
+//!
+//! Normally the prompt is ON THE HOST'S CANVAS: `prompt_ex` hands the request to the host window (`set_host` / `take_request`, a private
+//! window message) and blocks the worker on a channel until the host answers; the host draws the glass panel with its own text field
+//! (prompt.rs = the model, ui.rs = the drawing, host.rs = keys and mouse). The UI thread is never blocked.
+//!
+//! THIS FILE'S WIN32 POPUP IS NOW ONLY THE FALLBACK: it runs when no host is running (previews, `--bench`, tests, `--prompt-demo`), when the host
+//! cannot show the prompt right now (the layer is hidden by the fullscreen guard, a card is being dragged) and with
+//! `MSWIDGETS_PROMPT_WIN32=1`. It uses a real Win32 EDIT control: IME, selection, clipboard and accessibility come for free. Everything around
+//! it (panel, rounded "well" with a focus ring, placeholder, buttons) is drawn by Direct2D into a premultiplied DIB that is BitBlt-ed into the
+//! window. Enter = OK (multiline: Ctrl+Enter), Esc / click elsewhere = cancel, Tab walks field > OK > Cancel (the same semantics as the canvas
+//! prompt). The panel is a plain opaque dark one: GDI pixels of the EDIT in an acrylic frame get alpha 0 and show up as a grey slab.
+//! `MSWIDGETS_PROMPT_ACRYLIC=1` opts into the backdrop anyway.
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Mutex;
+use std::time::Duration;
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -25,13 +35,18 @@ use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::gfx::{col, pt, rf, rr};
-use crate::widget::{accent, Lang};
+use crate::widget::Lang;
 
 static BUSY: AtomicBool = AtomicBool::new(false);
+/// The host window and the private message that asks it to show a prompt on its canvas (None = no host: previews, `--bench`, tests).
+static HOST: Mutex<Option<(isize, u32)>> = Mutex::new(None);
+/// The request the host picks up with `take_request` (one at a time: `BUSY` sees to that).
+static PENDING: Mutex<Option<Request>> = Mutex::new(None);
 
 // ---------------------------------------------------------------- public API
 
 /// Everything the prompt can show. `PromptOpts::new` fills the rest with defaults (language from config.json, button "Готово"/"Done").
+#[derive(Clone)]
 pub struct PromptOpts {
     pub title: String,
     pub initial: String,
@@ -50,7 +65,34 @@ impl PromptOpts {
     }
 }
 
-/// Blocks (own message loop) until the user answers. `None` = cancelled / empty / another prompt is open / the window could not be created.
+/// A prompt the host is asked to show: what to show, the screen point to open next to and where the answer goes.
+pub struct Request {
+    pub opts: PromptOpts,
+    pub anchor: (i32, i32),
+    pub reply: mpsc::Sender<Reply>,
+}
+
+/// The host's answer to a `Request`.
+pub enum Reply {
+    /// the user's answer (None = cancelled / blank)
+    Answer(Option<String>),
+    /// the host cannot show it now: the worker runs the Win32 popup instead
+    Fallback,
+}
+
+/// The host announces itself (its window and the message to post for a prompt) or leaves (`None`).
+pub fn set_host(h: Option<(isize, u32)>) {
+    if let Ok(mut g) = HOST.lock() {
+        *g = h;
+    }
+}
+
+/// The host's side of the message: the request that was posted.
+pub fn take_request() -> Option<Request> {
+    PENDING.lock().ok().and_then(|mut g| g.take())
+}
+
+/// Blocks until the user answers. `None` = cancelled / empty / another prompt is open / the window could not be created.
 pub fn prompt(title: &str, initial: &str, multiline: bool) -> Option<String> {
     prompt_ex(PromptOpts::new(title, initial, multiline))
 }
@@ -59,9 +101,48 @@ pub fn prompt_ex(o: PromptOpts) -> Option<String> {
     if BUSY.swap(true, Ordering::SeqCst) {
         return None;
     }
-    let r = unsafe { run(o) };
+    let r = match via_host(&o) {
+        Some(answer) => answer,
+        None => unsafe { run(o) },
+    };
     BUSY.store(false, Ordering::SeqCst);
     r
+}
+
+/// Ask the host to show the prompt on its canvas and wait for the answer. None = no host / it cannot show it: use the popup.
+/// The host dying while we wait (window gone, `Sender` dropped) counts as a cancel: the worker never hangs.
+fn via_host(o: &PromptOpts) -> Option<Option<String>> {
+    if std::env::var_os("MSWIDGETS_PROMPT_WIN32").is_some() {
+        return None;
+    }
+    let (hwnd, msg) = (*HOST.lock().ok()?)?;
+    let anchor = o.anchor.unwrap_or_else(|| {
+        let mut p = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut p);
+        }
+        (p.x, p.y)
+    });
+    let (tx, rx) = mpsc::channel();
+    *PENDING.lock().ok()? = Some(Request { opts: o.clone(), anchor, reply: tx });
+    let h = HWND(hwnd as *mut _);
+    if unsafe { PostMessageW(h, msg, WPARAM(0), LPARAM(0)) }.is_err() {
+        take_request();
+        return None;
+    }
+    loop {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Reply::Answer(a)) => return Some(a),
+            Ok(Reply::Fallback) => return None,
+            Err(RecvTimeoutError::Timeout) => {
+                if !unsafe { IsWindow(h) }.as_bool() {
+                    take_request();
+                    return Some(None);
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return Some(None),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- pure parts (unit-tested)
@@ -152,7 +233,7 @@ impl Layout {
 
 /// Top-left of a `size` window opened next to `anchor`: centred on it horizontally, below it (above when there is no room),
 /// then kept `margin` px inside the monitor work area `work` (the left/top edge wins when it does not fit at all).
-fn place(anchor: (i32, i32), size: (i32, i32), work: RECT, gap: i32, margin: i32) -> (i32, i32) {
+pub(crate) fn place(anchor: (i32, i32), size: (i32, i32), work: RECT, gap: i32, margin: i32) -> (i32, i32) {
     let (w, h) = size;
     let mut y = anchor.1 + gap;
     if y + h > work.bottom - margin {
@@ -167,12 +248,12 @@ fn ease_out(p: f32) -> f32 {
     1.0 - q * q * q
 }
 
-struct Texts {
-    hint: String,
-    ok: String,
-    cancel: &'static str,
+pub(crate) struct Texts {
+    pub hint: String,
+    pub ok: String,
+    pub cancel: &'static str,
 }
-fn texts(lang: Lang, multiline: bool, ok_label: &str) -> Texts {
+pub(crate) fn texts(lang: Lang, multiline: bool, ok_label: &str) -> Texts {
     let ok = ok_label.trim();
     Texts {
         hint: match (lang, multiline) {
@@ -251,10 +332,11 @@ fn cref(r: u8, g: u8, b: u8) -> COLORREF {
 }
 
 // palette (straight RGB 0..255; the well is opaque so the EDIT, which GDI paints opaque, matches it exactly)
-const PANEL: (u8, u8, u8) = (26, 28, 34);
-const WELL: (u8, u8, u8) = (44, 47, 55);
+const PANEL: (u8, u8, u8) = (28, 29, 34);
+const WELL: (u8, u8, u8) = (55, 56, 61); // the panel with 12 % white on it, like the gallery's search field (opaque for the EDIT)
 const INK: (u8, u8, u8) = (245, 245, 247);
-const CUE: (u8, u8, u8) = (140, 146, 158);
+const CUE: (u8, u8, u8) = (136, 138, 146);
+const ON_WHITE: (u8, u8, u8) = (18, 18, 23);
 const PANEL_ALPHA: f32 = 0.66; // with the acrylic backdrop; opaque without it
 const TIMER: usize = 1;
 const EN_CHANGE: u32 = 0x0300;
@@ -263,9 +345,6 @@ const EM_GETLINECOUNT: u32 = 0x00BA;
 
 fn c8(c: (u8, u8, u8), a: f32) -> D2D1_COLOR_F {
     col(c.0 as f32 / 255.0, c.1 as f32 / 255.0, c.2 as f32 / 255.0, a)
-}
-pub(crate) fn acc(a: f32) -> D2D1_COLOR_F {
-    col(accent().r, accent().g, accent().b, a)
 }
 fn white(a: f32) -> D2D1_COLOR_F {
     col(1.0, 1.0, 1.0, a)
@@ -562,47 +641,55 @@ unsafe fn render(s: &St) {
     rt.BeginDraw();
     rt.Clear(Some(&col(0.0, 0.0, 0.0, 0.0)));
     // panel + hairline rim (DWM rounds the window itself)
-    rt.FillRectangle(&rf(0.0, 0.0, lay.w as f32, lay.h as f32), fill(c8(PANEL, if s.backdrop { PANEL_ALPHA } else { 1.0 })));
-    rt.DrawRoundedRectangle(&rr(0.5, 0.5, lay.w as f32 - 1.0, lay.h as f32 - 1.0, 8.0 * k), fill(white(0.10)), 1.0, None::<&ID2D1StrokeStyle>);
+    // neutral glass, no accent (like the gallery and the settings): a light sheen fading down from the top, a hairline rim
+    // (DWM rounds the window itself)
+    let (pw, ph) = (lay.w as f32, lay.h as f32);
+    rt.FillRectangle(&rf(0.0, 0.0, pw, ph), fill(c8(PANEL, if s.backdrop { PANEL_ALPHA } else { 1.0 })));
+    let strips = 24;
+    let sheen_h = (ph * 0.55).min(110.0 * k);
+    for i in 0..strips {
+        let t = i as f32 / strips as f32;
+        let a = 0.075 * (1.0 - t) * (1.0 - t);
+        rt.FillRectangle(&rf(0.0, t * sheen_h, pw, (t + 1.0 / strips as f32) * sheen_h + 0.5), fill(white(a)));
+    }
+    rt.DrawRoundedRectangle(&rr(0.5, 0.5, pw - 1.0, ph - 1.0, 8.0 * k), fill(white(0.14)), 1.0, None::<&ID2D1StrokeStyle>);
     text(s, &s.title, &s.f_title, lay.title, c8(INK, 1.0));
 
-    // the well; focused = accent border + a soft three-step glow
+    // the well (a white 12 % layer, as the gallery's search field); focused = a white ring with a soft halo
     let wl = lay.well;
     let (wx, wy, ww, wh, rad) = (wl.left as f32, wl.top as f32, (wl.right - wl.left) as f32, (wl.bottom - wl.top) as f32, 10.0 * k);
     rt.FillRoundedRectangle(&rr(wx, wy, ww, wh, rad), fill(c8(WELL, 1.0)));
     if s.focus == Item::Edit {
-        for i in 1..=3 {
-            let e = i as f32 * k;
-            rt.DrawRoundedRectangle(&rr(wx - e, wy - e, ww + 2.0 * e, wh + 2.0 * e, rad + e), fill(acc(0.20 / i as f32)), k, None::<&ID2D1StrokeStyle>);
-        }
-        rt.DrawRoundedRectangle(&rr(wx + 0.75 * k, wy + 0.75 * k, ww - 1.5 * k, wh - 1.5 * k, rad - 0.75 * k), fill(acc(1.0)), 1.5 * k, None::<&ID2D1StrokeStyle>);
+        let e = 2.0 * k;
+        rt.DrawRoundedRectangle(&rr(wx - e, wy - e, ww + 2.0 * e, wh + 2.0 * e, rad + e), fill(white(0.16)), 3.0 * k, None::<&ID2D1StrokeStyle>);
+        rt.DrawRoundedRectangle(&rr(wx, wy, ww, wh, rad), fill(white(0.70)), 1.4 * k, None::<&ID2D1StrokeStyle>);
     } else {
-        rt.DrawRoundedRectangle(&rr(wx + 0.5, wy + 0.5, ww - 1.0, wh - 1.0, rad), fill(white(0.12)), 1.0, None::<&ID2D1StrokeStyle>);
+        rt.DrawRoundedRectangle(&rr(wx + 0.5, wy + 0.5, ww - 1.0, wh - 1.0, rad), fill(white(0.10)), 1.0, None::<&ID2D1StrokeStyle>);
     }
     text(s, &wide(&s.tx.hint), &s.f_hint, lay.hint, white(0.50));
 
-    // buttons: primary = filled accent, secondary = quiet glass; hover lightens, press darkens, keyboard focus gets a ring
+    // buttons are pills: primary = white glass with dark text (the gallery's "Done"), secondary = quiet white layer;
+    // hover lightens, press darkens, keyboard focus gets a ring
     for it in [Item::Cancel, Item::Ok] {
         let (r, label, primary) = if it == Item::Ok { (lay.ok, wide(&s.tx.ok), true) } else { (lay.cancel, wide(s.tx.cancel), false) };
         let (hot, down) = (s.hover == Some(it), s.pressed == Some(it) && s.hover == Some(it));
-        let base = if primary { acc(1.0) } else { white(0.09) };
-        let c = if down {
-            if primary { mixc(base, (0.0, 0.0, 0.0), 0.18) } else { white(0.04) }
-        } else if hot {
-            if primary { mixc(base, (1.0, 1.0, 1.0), 0.16) } else { white(0.16) }
-        } else {
-            base
-        };
         let (x, y, bw, bh) = (r.left as f32, r.top as f32, (r.right - r.left) as f32, (r.bottom - r.top) as f32);
-        rt.FillRoundedRectangle(&rr(x, y, bw, bh, 8.0 * k), fill(c));
-        if !primary {
-            rt.DrawRoundedRectangle(&rr(x + 0.5, y + 0.5, bw - 1.0, bh - 1.0, 8.0 * k), fill(white(0.12)), 1.0, None::<&ID2D1StrokeStyle>);
+        let rad = bh / 2.0;
+        let c = if primary {
+            let base = white(if hot { 1.0 } else { 0.92 });
+            if down { mixc(base, (0.0, 0.0, 0.0), 0.14) } else { base }
+        } else {
+            white(if down { 0.08 } else if hot { 0.20 } else { 0.12 })
+        };
+        if primary && !down {
+            rt.FillRoundedRectangle(&rr(x, y + 1.5 * k, bw, bh, rad), fill(col(0.0, 0.0, 0.0, 0.20)));
         }
+        rt.FillRoundedRectangle(&rr(x, y, bw, bh, rad), fill(c));
         if s.ring && s.focus == it {
             let e = 2.5 * k;
-            rt.DrawRoundedRectangle(&rr(x - e, y - e, bw + 2.0 * e, bh + 2.0 * e, 8.0 * k + e), fill(white(0.90)), 1.5 * k, None::<&ID2D1StrokeStyle>);
+            rt.DrawRoundedRectangle(&rr(x - e, y - e, bw + 2.0 * e, bh + 2.0 * e, rad + e), fill(white(0.90)), 1.5 * k, None::<&ID2D1StrokeStyle>);
         }
-        text(s, &label, &s.f_btn, r, if primary { c8((8, 22, 36), 1.0) } else { c8(INK, 1.0) });
+        text(s, &label, &s.f_btn, r, if primary { c8(ON_WHITE, 1.0) } else { c8(INK, 1.0) });
     }
     let _ = rt.EndDraw(None, None);
 }
@@ -919,6 +1006,43 @@ mod tests {
         assert_eq!(place((50, 50), (3000, 3000), work, 12, 8), (8, 8));
     }
 
+    /// The worker never hangs on the host: a window that is gone is a cancel, a host that cannot show the prompt sends `Fallback`, an answer
+    /// arrives as it was sent. (Posts to the NULL window = this thread's own queue, so no window is needed.)
+    #[test]
+    fn host_bridge_answers_and_never_hangs() {
+        let o = PromptOpts { title: "t".into(), initial: String::new(), multiline: false, placeholder: String::new(), ok_label: String::new(), lang: Lang::En, anchor: Some((1, 2)) };
+        assert_eq!(via_host(&o), None); // no host: the popup
+        set_host(Some((0, WM_APP + 77)));
+        assert_eq!(via_host(&o), Some(None)); // IsWindow(NULL) is false: the host is gone
+        for reply in [Reply::Fallback, Reply::Answer(Some("hello".into())), Reply::Answer(None)] {
+            let expect = match &reply {
+                Reply::Fallback => None,
+                Reply::Answer(a) => Some(a.clone()),
+            };
+            let th = std::thread::spawn(move || loop {
+                if let Some(r) = take_request() {
+                    assert_eq!((r.anchor, r.opts.title.as_str()), ((1, 2), "t"));
+                    let _ = r.reply.send(reply);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            });
+            assert_eq!(via_host(&o), expect);
+            th.join().unwrap();
+        }
+        // a host that drops the request (shutting down) is a cancel too
+        let th = std::thread::spawn(|| loop {
+            if take_request().is_some() {
+                return; // the Sender is dropped here
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        });
+        assert_eq!(via_host(&o), Some(None));
+        th.join().unwrap();
+        set_host(None);
+        assert_eq!(via_host(&o), None);
+    }
+
     #[test]
     fn strings_follow_language_and_mode() {
         let ru = texts(Lang::Ru, false, "");
@@ -928,6 +1052,59 @@ mod tests {
         assert_eq!((en.ok.as_str(), en.cancel), ("Add", "Cancel"));
         assert!(en.hint.starts_with("Ctrl+Enter"));
         assert_eq!(texts(Lang::En, false, "").ok, "Done");
+    }
+
+    /// Manual: `MSW_PROMPT_SHOTS=<dir> cargo test --release -- --ignored prompt_shots`. Opens the prompt three ways and copies
+    /// only the window's own rectangle from the screen into <dir>\prompt<N>.bmp (the window flashes up for about a second each).
+    #[test]
+    #[ignore]
+    fn prompt_shots() {
+        let Some(dir) = std::env::var_os("MSW_PROMPT_SHOTS") else { return };
+        let cases: [(&str, &str, bool, &str); 3] = [
+            ("Новое напоминание", "", false, "Например: позвонить маме в 18:00"),
+            ("Новое напоминание", "Купить молоко и хлеб", false, ""),
+            ("Заметка", "Первая строка\r\nВторая строка", true, ""),
+        ];
+        for (n, (title, initial, multi, cue)) in cases.into_iter().enumerate() {
+            let o = PromptOpts { placeholder: cue.into(), anchor: Some((900, 300)), ..PromptOpts::new(title, initial, multi) };
+            let th = std::thread::spawn(move || prompt_ex(o));
+            std::thread::sleep(std::time::Duration::from_millis(900));
+            unsafe {
+                let Ok(hwnd) = FindWindowW(w!("MsWidgetsPrompt"), PCWSTR::null()) else { panic!("no prompt window") };
+                let mut r = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut r);
+                let (w, h) = (r.right - r.left, r.bottom - r.top);
+                let screen = GetDC(None);
+                let mem = CreateCompatibleDC(screen);
+                let bmi = BITMAPINFO { bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, ..Default::default() }, ..Default::default() };
+                let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+                let bmp = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+                let old = SelectObject(mem, bmp);
+                let _ = BitBlt(mem, 0, 0, w, h, screen, r.left, r.top, SRCCOPY | CAPTUREBLT);
+                let px = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize).to_vec();
+                SelectObject(mem, old);
+                let _ = DeleteObject(bmp);
+                let _ = DeleteDC(mem);
+                ReleaseDC(None, screen);
+                // 32 bit top-down BMP (BITMAPINFOHEADER with a negative height)
+                let mut f = Vec::new();
+                f.extend_from_slice(b"BM");
+                f.extend_from_slice(&(54 + px.len() as u32).to_le_bytes());
+                f.extend_from_slice(&[0; 4]);
+                f.extend_from_slice(&54u32.to_le_bytes());
+                f.extend_from_slice(&40u32.to_le_bytes());
+                f.extend_from_slice(&w.to_le_bytes());
+                f.extend_from_slice(&(-h).to_le_bytes());
+                f.extend_from_slice(&1u16.to_le_bytes());
+                f.extend_from_slice(&32u16.to_le_bytes());
+                f.extend_from_slice(&[0; 24]);
+                f.extend_from_slice(&px);
+                std::fs::write(std::path::Path::new(&dir).join(format!("prompt{n}.bmp")), f).unwrap();
+                let _ = PostMessageW(hwnd, WM_KEYDOWN, WPARAM(VK_ESCAPE.0 as usize), LPARAM(0));
+            }
+            let _ = th.join();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
     }
 
     #[test]

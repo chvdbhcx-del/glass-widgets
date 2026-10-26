@@ -376,7 +376,14 @@ struct Music {
     hov: u8,
     /// equalizer bars: (angular speed rad/s, phase, amplitude)
     bars: [(f64, f64, f64); 24],
+    /// a play <-> pause change in flight (the state it left, since when): `draw` leaves the icon out, `overlay` cross-fades the two
+    pp_tr: Option<(bool, Instant)>,
+    /// M: the previous cover fading out over the new one (None inside = the no-cover gradient)
+    cov_tr: Option<(Option<Bitmap>, Instant)>,
 }
+/// Play / pause icon swap and cover cross-fade durations (seconds).
+const PP_T: f32 = 0.12;
+const COVER_T: f32 = 0.25;
 
 impl Music {
     fn new() -> Music {
@@ -412,6 +419,8 @@ impl Music {
             tsz: 13.0,
             hov: 0,
             bars,
+            pp_tr: None,
+            cov_tr: None,
         }
     }
 
@@ -450,6 +459,9 @@ impl Music {
         let s = self.shared.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut changed = false;
         if s.has != self.has || s.playing != self.playing || s.dur_ms != self.dur_ms {
+            if s.has && self.has && s.playing != self.playing && !self.preview && !reduced_motion() {
+                self.pp_tr = Some((self.playing, Instant::now()));
+            }
             self.has = s.has;
             self.playing = s.playing;
             self.dur_ms = s.dur_ms;
@@ -464,6 +476,9 @@ impl Music {
         self.pos_ms = s.pos_ms;
         self.pos_at = s.stamp;
         if s.cover_id != self.cover_id {
+            if self.has && s.has && cx.size == Size::M && !self.preview && !reduced_motion() {
+                self.cov_tr = Some((self.cover.clone(), Instant::now()));
+            }
             self.cover_id = s.cover_id;
             match s.cover.as_ref().and_then(|c| cx.image(&c.dec).ok().map(|b| (b, c.accent))) {
                 Some((b, a)) => {
@@ -515,7 +530,11 @@ impl Music {
 
     /// Cover (or the no-cover gradient + note) into `r` with corner radius `rad`.
     fn paint_cover(&self, cx: &Cx, r: Rect, rad: f32) {
-        if let Some(b) = &self.cover {
+        self.paint_cover_of(cx, &self.cover, r, rad);
+    }
+
+    fn paint_cover_of(&self, cx: &Cx, cover: &Option<Bitmap>, r: Rect, rad: f32) {
+        if let Some(b) = cover {
             cx.bitmap_round(r, b, Fit::Cover, rad);
         } else {
             cx.gradient_rrect(r, rad, hsl_to_color(self.hue, 0.55, 0.42), hsl_to_color(self.hue + 40.0, 0.6, 0.26), 150.0);
@@ -549,7 +568,16 @@ impl Music {
         cx.circle(l.pp.center(), l.pp.w / 2.0, c);
         let g = l.pp.w * 0.54;
         let dx = if self.playing { 0.0 } else { 0.8 }; // optical centring of the triangle
-        cx.icon(if self.playing { Glyph::Pause } else { Glyph::Play }, Rect::new(l.pp.cx() - g / 2.0 + dx, l.pp.cy() - g / 2.0, g, g), WHITE);
+        if self.pp_tr.is_none() {
+            cx.icon(if self.playing { Glyph::Pause } else { Glyph::Play }, Rect::new(l.pp.cx() - g / 2.0 + dx, l.pp.cy() - g / 2.0, g, g), WHITE);
+        } // else `overlay` swaps the two icons
+    }
+
+    /// The play <-> pause icon of the big button at size factor `k` and opacity `a`.
+    fn pp_icon(cx: &Cx, l: &Lay, playing: bool, k: f32, a: f32) {
+        let g = l.pp.w * 0.54 * k;
+        let dx = if playing { 0.0 } else { 0.8 };
+        cx.icon(if playing { Glyph::Pause } else { Glyph::Play }, Rect::new(l.pp.cx() - g / 2.0 + dx, l.pp.cy() - g / 2.0, g, g), WHITE.fade(a));
     }
 
     /// Equalizer: a frozen resting state (`live` = false, drawn in `draw`) or the animated one (overlay).
@@ -646,6 +674,20 @@ impl Widget for Music {
     }
 
     fn overlay(&mut self, cx: &mut Cx) -> Result<()> {
+        if self.has {
+            let l = lay(cx.size);
+            // the old icon shrinks away, the new one grows in
+            if let Some((from, t0)) = self.pp_tr {
+                let p = (t0.elapsed().as_secs_f32() / PP_T).clamp(0.0, 1.0);
+                Self::pp_icon(cx, &l, from, 1.0 - 0.3 * p, 1.0 - p);
+                Self::pp_icon(cx, &l, self.playing, 0.7 + 0.3 * p, p);
+            }
+            // M: the previous cover fades out over the new one
+            if let (Some((old, t0)), Size::M) = (&self.cov_tr, cx.size) {
+                let p = (t0.elapsed().as_secs_f32() / COVER_T).clamp(0.0, 1.0);
+                cx.with_opacity(1.0 - p, |c| self.paint_cover_of(c, old, l.cover, 18.0));
+            }
+        }
         if !self.has || !self.playing {
             return Ok(());
         }
@@ -679,6 +721,17 @@ impl Widget for Music {
             return Tick::Never;
         }
         self.sync(cx);
+        // the swap / cross-fade in flight: 60 fps until it is over, then the static layer takes the final look
+        if self.pp_tr.is_some_and(|(_, t0)| t0.elapsed().as_secs_f32() >= PP_T) {
+            self.pp_tr = None;
+            self.ver += 1;
+        }
+        if self.cov_tr.as_ref().is_some_and(|(_, t0)| t0.elapsed().as_secs_f32() >= COVER_T) {
+            self.cov_tr = None;
+        }
+        if self.pp_tr.is_some() || self.cov_tr.is_some() {
+            return Tick::Fps(60);
+        }
         if !(self.has && self.playing) {
             return Tick::Never;
         }

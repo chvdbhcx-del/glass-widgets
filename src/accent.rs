@@ -1,7 +1,7 @@
 //! The accent colour taken from the desktop wallpaper (`accentMode` "wallpaper"): the wallpaper path comes from
 //! `SystemParametersInfo(SPI_GETDESKWALLPAPER)`, WIC decodes it at <= 64 px (`sys::decode_image_file`), `pick` finds the dominant saturated hue
 //! (a 36 bin hue histogram weighted by saturation x brightness) and clamps saturation / lightness so the colour stays legible on dark glass
-//! and on light glass (where the ink pass darkens it by 20 %). Grey / near-black / near-white wallpapers give `None` = the default blue.
+//! and on light glass (where the ink pass darkens it by 20 %). Grey / near-black / near-white wallpapers give `None` from `pick`; the callers turn that into `NEUTRAL` with `pick_or_neutral` (the accent follows a monochrome wallpaper too).
 use std::time::SystemTime;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -124,9 +124,39 @@ pub fn wallpaper_key() -> Option<(String, Option<SystemTime>)> {
     })
 }
 
-/// Accent of the wallpaper file at `path` (`None` when it cannot be decoded or has no dominant hue).
+/// The accent of a wallpaper without a dominant hue (grey, black, white): a neutral light tone, so the accent still follows the wallpaper
+/// (white-ish titles on a monochrome desktop) instead of falling back to the blue of `accentMode` "blue".
+pub const NEUTRAL: [u8; 3] = [220, 223, 230];
+
+/// `pick`, but a wallpaper that has pixels and no hue gives [`NEUTRAL`]; `None` only for no pixels at all (nothing captured / undecodable).
+pub fn pick_or_neutral(bgra: &[u8]) -> Option<[u8; 3]> {
+    if bgra.len() < 4 {
+        return None;
+    }
+    pick(bgra).or(Some(NEUTRAL))
+}
+
+/// Accent of the wallpaper file at `path` (`None` when it cannot be decoded).
 pub fn from_file(path: &str) -> Option<[u8; 3]> {
-    pick(&crate::sys::decode_image_file(path, 64, 64)?.bgra)
+    pick_or_neutral(&crate::sys::decode_image_file(path, 64, 64)?.bgra)
+}
+
+fn cache_path() -> Option<std::path::PathBuf> {
+    Some(crate::layout::config_path()?.with_file_name("accent.txt"))
+}
+
+/// The accent the live capture produced last time ("r g b"): used at start-up so the first frames already have the live colour
+/// instead of the colour of the wallpaper file.
+pub fn load_cache() -> Option<[u8; 3]> {
+    let s = std::fs::read_to_string(cache_path()?).ok()?;
+    let v: Vec<u8> = s.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+    (v.len() == 3).then(|| [v[0], v[1], v[2]])
+}
+
+pub fn save_cache(rgb: [u8; 3]) {
+    if let Some(p) = cache_path() {
+        let _ = std::fs::write(p, format!("{} {} {}", rgb[0], rgb[1], rgb[2]));
+    }
 }
 
 #[cfg(test)]
@@ -211,5 +241,14 @@ mod tests {
             let back = hsl_to_rgb(h, s, l);
             assert!((0..3).all(|i| (back[i] - rgb[i]).abs() < 1e-4), "{rgb:?} {back:?}");
         }
+    }
+
+    #[test]
+    fn a_wallpaper_without_hue_gets_the_neutral_accent() {
+        assert_eq!(pick(&solid([120, 120, 122], 100)), None);
+        assert_eq!(pick_or_neutral(&solid([120, 120, 122], 100)), Some(NEUTRAL));
+        assert_eq!(pick_or_neutral(&solid([0, 0, 0], 100)), Some(NEUTRAL));
+        assert_eq!(pick_or_neutral(&[]), None); // nothing captured: no opinion
+        assert_ne!(pick_or_neutral(&solid([255, 90, 20], 100)), Some(NEUTRAL)); // a colourful one keeps its hue
     }
 }

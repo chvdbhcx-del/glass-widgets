@@ -284,6 +284,7 @@ Reference implementations here: `clock.rs`, `calendar.rs`. Product contract: `..
 * ONLY the UI thread touches Direct2D/DirectWrite (`draw`, `overlay`, `tick`, `mouse`, `cx.image`). Workers get plain data and return plain data (`Send + 'static`).
 * A static scene costs ~0 CPU: all static visuals in `draw`, animation only in `overlay`, `Tick::Never` (or `Poll`) unless something actually moves. `Fps(30)` only for hands / waveforms; `Second` for per-second text.
 * Do not call `invalidate()` per frame: every re-record re-renders the glass layer. Bump `version()` only when the displayed value really changed (compare, then bump).
+* Hover / press easing inside a widget: `HoverAnim` (widget.rs). `set(cell, cx)` from `mouse` (it pokes `tick` for you), `if hv.step(cx) { Tick::Fps(60) } else { <idle schedule> }` in `tick`, `hv.get(cell)` 0..1 in `overlay`. It requests the last frame itself, so a settled widget costs nothing. A value that must change look for ~150 ms (a toggle, a month change) is left out of `draw` meanwhile and painted by `overlay` (old and new look at complementary opacity: `cx.with_opacity(k, ..)`, `cx.scaled(c, k, ..)`), then `version()` is bumped once to bring it back. Honour `reduced_motion()` (the system's "show animations" switch): jump to the end value.
 * `overlay` must not allocate bitmaps, create fonts or parse anything; precompute in `tick` / `draw`. Typical budget: far under 1 ms.
 * No unbounded growth (histories are fixed-length ring buffers), no polling loops, no `sleep` on the UI thread; `cx.spawn` threads end by themselves.
 * A panic in `draw` / `overlay` / `tick` / `mouse` is caught per call (release profile `panic = "unwind"`): the card keeps its last picture and the process lives, but still: no `unwrap()` on I/O results, parse defensively, `.get()` instead of indexing.
@@ -333,7 +334,15 @@ glint, light angle, light-appearance multipliers, shadow). Override with `--glas
 `mswidgets --calib defaults` prints the defaults as JSON (`calib/glass_defaults.json`).
 
 **Light.** Default direction `light_angle` = 315 deg (from the upper left). While a card is dragged or springs into its cell its light is pushed against the card velocity and relaxes back with a spring
-(~400 ms, `LightSpring`); only that card's rectangle is repainted. The pointer glint follows the nearest contour point while the cursor is within ~62 px of an edge (fades in / out in ~120 ms).
+(~400 ms, `LightSpring`); only that card's rectangle is repainted.
+
+**Hover / press** (`Scene::mouse` -> `step_fx`, pure parts in `motion.rs`). Live mode only (edit mode and a drag send `Leave`). The hover progress ramps in 180 ms / out 250 ms (smoothstep) and is
+held while the pointer stays on the card (no timeout). While hovered: a soft white light spot under the pointer (`hover_spot` 0.10 alpha on dark glass, x1.6 on light, radius `hover_spot_r`
+78 px, filled into the card shape, trails the pointer with a 70 ms low-pass) and the rim glint at the contour point nearest to that smoothed pointer (strength `hover_rim`: 0.5 floor inside,
+1 on the edge; the contour fraction is low-passed the short way round, so a jump across the card slides along the rim). The card scale springs (`motion::Bump`, omega 24) to 1.012 on
+hover with a soft overshoot, to 0.985 while the left button is held (critically damped, the spot dims 40 %) and back with a small overshoot on release; the widget still receives every
+event unchanged. The scale is a draw-time factor on top of `Xf` (not part of the merge distance), composed through the scratch path with the cubic filter (crisp text).
+Nothing animates once the ramps are done and the spring rests: a pointer resting on a hovered card arms no timer.
 There is NO idle drift: a static scene arms no timer. Everything animates on the host's single 16 ms animation timer, which stops when `Scene::fx_busy()` is false.
 
 **Materialise.** A card that appears (start-up staggered by 70 ms, gallery add, resize) condenses: scale 0.92 -> 1 with a spring overshoot, lens blur sigma 24 -> normal, fade in, the rim sweeps once around the contour
@@ -347,7 +356,7 @@ flip to light at >= 0.66, back to dark at <= 0.56, the score is low-passed and a
 Config `widgetsAppearance`: `auto` (default) | `dark` | `light`; CLI `--appearance auto|dark|light` (also for the headless renders); per card in `--cards`: `{"_appearance":"light"}`.
 
 **Headless knobs.** `--dump` / `--sheet` / `--dump-ui` accept `--appearance` and `--glass-params`. Card cfg keys starting with `_` drive the renderer (`--cards "calendar:s@0,0{\"_light\":90}"`):
-`_light` deg (fixed light direction), `_mat` ms / `_mout` ms (a card that far into its materialise / dematerialise), `_move` [dx, dy] logical px off its cell (merge tests), `_hover` [x, y] card px (glint + widget hover), `_appearance`.
+`_light` deg (fixed light direction), `_mat` ms / `_mout` ms (a card that far into its materialise / dematerialise), `_move` [dx, dy] logical px off its cell (merge tests), `_hover` [x, y] logical card px (spot + glint + lift + widget hover; `_hover_t` 0..1 = that far into the ease-in, default 1; `_press` true = button held, the widget hears no click), `_appearance`.
 `--anim-strip out.png --cards "calendar:s@0,0" [--times 0,40,...] [--anim-out]` renders the first card once per time step side by side (filmstrip).
 
 **Glass calibration** (`calib.rs`, `calib/ref/*.png` = the Apple reference screenshots, `calib/glass_*.json`). Reproduce: `mswidgets --calib eval [--glass-params p.json] [--calib-dump dir]` (table + side by side PNGs

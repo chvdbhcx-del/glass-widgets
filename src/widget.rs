@@ -10,6 +10,7 @@
 //! All drawing helpers take LOGICAL px (the framework applies the UI scale) in card-local coordinates (0,0 = top-left of the card).
 use crate::gfx::*;
 use crate::icons;
+use crate::motion::HoverRamps;
 use crate::sys;
 pub use crate::icons::Glyph;
 pub use crate::sys::{decode_image_bytes, decode_image_file, http_get, powershell, run_hidden, spawn_hidden, Action, Decoded, MediaKey, PowerOp};
@@ -22,14 +23,15 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 pub use std::time::Duration;
+use std::time::Instant;
 use windows::core::{w, Interface, HSTRING};
 use windows::Foundation::Numerics::Matrix3x2;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP};
 pub use windows::core::Result;
 pub use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1 as Bitmap;
 
@@ -89,6 +91,88 @@ impl Size {
 }
 
 /// When the framework should wake the widget next. The loop sleeps (0 % CPU) when every visible card says `Never`/`Poll`.
+/// The system's "show animations" setting is off (SPI_GETCLIENTAREAANIMATION): motion goes straight to its end value.
+pub fn reduced_motion() -> bool {
+    unsafe {
+        let mut on = BOOL(1);
+        let ok = SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut BOOL as *mut std::ffi::c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).is_ok();
+        ok && !on.as_bool()
+    }
+}
+
+/// Hover ramps INSIDE a widget (a hot cell, a calendar day, a list row): `set` from `mouse` with the cell under the pointer, `step` from
+/// `tick` (it advances by the real time elapsed), `get(i)` 0..1 in `overlay`. Draw the highlight in `overlay`, not in `draw`: the glass
+/// layer is not re-rendered. While a ramp is moving `step` is true, so the widget returns `Tick::Fps(60)`; the frame after the last
+/// movement is requested here, then the widget goes back to its idle schedule and costs nothing. Reduced motion and previews jump to the end.
+pub struct HoverAnim {
+    ramps: HoverRamps,
+    hot: Option<usize>,
+    since: Option<Instant>,
+    t_in: f32,
+    t_out: f32,
+}
+impl Default for HoverAnim {
+    fn default() -> HoverAnim {
+        HoverAnim::new(0)
+    }
+}
+impl HoverAnim {
+    /// A hover ramp: 120 ms in, 180 ms out.
+    pub fn new(cells: usize) -> HoverAnim {
+        HoverAnim::timed(cells, 0.12, 0.18)
+    }
+
+    /// With its own times in seconds (a press: faster in, slower out).
+    pub fn timed(cells: usize, t_in: f32, t_out: f32) -> HoverAnim {
+        HoverAnim { ramps: HoverRamps::new(cells), hot: None, since: None, t_in, t_out }
+    }
+
+    /// The cell under the pointer (None = none). True when it changed; the ramps start moving on their own after that.
+    pub fn set(&mut self, hot: Option<usize>, cx: &Cx) -> bool {
+        if hot == self.hot {
+            return false;
+        }
+        self.hot = hot;
+        let h = hot;
+        if let Some(i) = hot {
+            self.ramps.ensure(i + 1);
+        }
+        if cx.preview || reduced_motion() {
+            self.ramps.snap(|i| Some(i) == h, |_| {}); // previews have no timers: show the end state
+        } else {
+            self.since.get_or_insert_with(Instant::now);
+            cx.waker().wake(); // mouse events do not call `tick`: poke it so the schedule starts now
+        }
+        true
+    }
+
+    /// Advance to now (call from `tick`). True while something is still moving: the widget returns `Tick::Fps(60)`.
+    pub fn step(&mut self, cx: &Cx) -> bool {
+        let Some(t0) = self.since else { return false };
+        let now = Instant::now();
+        let dt = now.saturating_duration_since(t0).as_secs_f32().min(0.05);
+        let h = self.hot;
+        self.ramps.step(dt, self.t_in, self.t_out, |i| Some(i) == h, |_| {});
+        if self.ramps.busy(|i| Some(i) == h) {
+            self.since = Some(now);
+            return true;
+        }
+        self.since = None;
+        cx.request_frame(); // the last position of the ramps
+        false
+    }
+
+    /// Eased hover amount of cell `i`.
+    pub fn get(&self, i: usize) -> f32 {
+        self.ramps.get(i)
+    }
+
+    /// Cell under the pointer.
+    pub fn hot(&self) -> Option<usize> {
+        self.hot
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Tick {
     /// static scene: nothing until a mouse event, a finished job or `cx.request_frame()`
@@ -921,7 +1005,8 @@ impl<'a> Cx<'a> {
         }
         p
     }
-    /// Ask the user for a line of text (a small popup with a real EDIT control near the cursor; Enter = OK, Esc = cancel; `multiline`: Ctrl+Enter).
+    /// Ask the user for a line of text (a glass panel on the host's canvas next to the cursor, with its own text field; Enter = OK, Esc = cancel;
+    /// `multiline`: Ctrl+Enter; the Win32 popup of input.rs only when the host cannot show the panel).
     /// Returns a `Pending`: poll `take()` in `tick`; the value is `Some(text)` (non-empty) or `None` when cancelled. No-op in preview mode.
     pub fn prompt_text(&self, title: &str, initial: &str, multiline: bool) -> Pending<Option<String>> {
         self.prompt_text_ex(title, initial, multiline, "", "")
@@ -1309,10 +1394,35 @@ impl<'a> Cx<'a> {
         f(self);
         self.pop_clip();
     }
+    /// `f` draws as one group at opacity `k` (a picture that cross-fades into the next one).
+    pub fn with_opacity(&self, k: f32, f: impl FnOnce(&Cx)) {
+        if k >= 0.999 {
+            return f(self);
+        }
+        let lp = D2D1_LAYER_PARAMETERS1 {
+            contentBounds: rf(-3.0e38, -3.0e38, 3.0e38, 3.0e38),
+            geometricMask: ManuallyDrop::new(None),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform: mat(1.0, 0.0, 0.0),
+            opacity: k.clamp(0.0, 1.0),
+            opacityBrush: ManuallyDrop::new(None),
+            layerOptions: D2D1_LAYER_OPTIONS1_NONE,
+        };
+        unsafe { self.dc.PushLayer(&lp, None::<&ID2D1Layer>) };
+        f(self);
+        unsafe { self.dc.PopLayer() };
+    }
     /// `f` draws rotated by `deg` (clockwise) around `center`.
     pub fn rotated(&self, center: Pt, deg: f32, f: impl FnOnce(&Cx)) {
         let saved = self.cur.get();
         self.set_tf(mul(&rotation(deg, center), &saved));
+        f(self);
+        self.set_tf(saved);
+    }
+    /// `f` draws scaled by `k` about `center` (a pressed button, a knob that swells).
+    pub fn scaled(&self, center: Pt, k: f32, f: impl FnOnce(&Cx)) {
+        let saved = self.cur.get();
+        self.set_tf(mul(&Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: center.0 - k * center.0, M32: center.1 - k * center.1 }, &saved));
         f(self);
         self.set_tf(saved);
     }

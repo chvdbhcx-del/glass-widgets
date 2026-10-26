@@ -7,7 +7,7 @@
 //! Icons: `IShellItemImageFactory` (96 px) on a worker -> premultiplied BGRA -> D2D bitmap on the UI thread, kept in memory only.
 //! URL tiles show the site's own icon: `/apple-touch-icon.png`, else `/favicon.ico` (worker, `net::http_get`), the raw bytes cached in
 //! `%APPDATA%\macshell\cache\favicons\{host}.bin` (a host without a usable icon is skipped for 24 h); no icon -> the globe tile.
-//! Everything static is recorded in `draw`; the hover look (a plate + the icon scaled 1.12) lives in `overlay` (`Tick::Never`).
+//! Everything static is recorded in `draw`; the hover look (a plate + the icon scaled 1.12) lives in `overlay` and eases in / out (`HoverAnim`; `Tick::Fps(60)` only while it moves, else `Never`).
 //! Preview: eight+ sample tiles (coloured squircles with letters, one URL tile with a globe), no I/O.
 use crate::registry::{Registry, WidgetDef};
 use crate::widget::*;
@@ -414,8 +414,8 @@ struct Shortcuts {
     asked: HashSet<String>,
     job: Option<Pending<Vec<(String, Option<Decoded>)>>>,
     prompt: Option<Pending<Option<String>>>,
-    /// slot under the cursor (items, then the "+" slot)
-    hot: Option<usize>,
+    /// slot under the cursor (items, then the "+" slot) and its eased hover amount
+    hv: HoverAnim,
     /// `items` changed in `tick` (which cannot write the config): flushed from `mouse` / `draw`
     cfg_dirty: bool,
     ver: u64,
@@ -529,17 +529,23 @@ impl Widget for Shortcuts {
     fn overlay(&mut self, cx: &mut Cx) -> Result<()> {
         let g = grid(cx.size);
         let n = shown(self.items.len(), g.cap());
-        let hot = self.hot.or(if cx.preview { cx.cfg_f64("preview_hot").map(|v| v as usize) } else { None });
-        let Some(slot) = hot.filter(|&s| s <= n) else { return Ok(()) };
-        let (icon, _) = g.parts(g.cell(slot));
-        // plate behind + the icon scaled up around its centre
-        cx.rrect(icon.inset(-7.0), 15.0, WHITE.alpha(0.14));
-        let big = icon.centered(icon.w * 1.12, icon.h * 1.12);
-        if slot < n {
-            let it = &self.items[slot];
-            self.paint_item(cx, big, it);
-        } else {
-            Self::paint_plus(cx, big, 1.0);
+        let pre = if cx.preview { cx.cfg_f64("preview_hot").map(|v| v as usize) } else { None };
+        // the slot under the cursor and the one it just left (still fading out): a plate behind + the icon scaled up around its centre
+        for slot in 0..=n {
+            let k = if pre == Some(slot) { 1.0 } else { self.hv.get(slot) };
+            if k <= 0.0 {
+                continue;
+            }
+            let (icon, _) = g.parts(g.cell(slot));
+            cx.rrect(icon.inset(-7.0), 15.0, WHITE.alpha(0.14 * k));
+            let s = 1.0 + 0.12 * k;
+            let big = icon.centered(icon.w * s, icon.h * s);
+            if slot < n {
+                let it = &self.items[slot];
+                self.paint_item(cx, big, it);
+            } else {
+                Self::paint_plus(cx, big, k);
+            }
         }
         Ok(())
     }
@@ -609,7 +615,11 @@ impl Widget for Shortcuts {
                 }
             }
         }
-        Tick::Never
+        if self.hv.step(cx) {
+            Tick::Fps(60) // the hover plate eases in / out
+        } else {
+            Tick::Never
+        }
     }
 
     fn mouse(&mut self, ev: &MouseEv, cx: &mut Cx) -> bool {
@@ -617,8 +627,7 @@ impl Widget for Shortcuts {
         let g = grid(cx.size);
         let n = shown(self.items.len(), g.cap());
         let slot = if ev.kind == MouseKind::Leave { None } else { (0..=n).find(|&i| g.cell(i).contains(ev.x, ev.y)) };
-        let mut changed = slot != self.hot;
-        self.hot = slot;
+        let mut changed = self.hv.set(slot, cx);
         if let Some(i) = slot {
             let cell = g.cell(i);
             if ev.clicked(cell) {

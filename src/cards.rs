@@ -7,7 +7,7 @@
 //! Cards can be added, removed, moved and resized at run time (drag & drop, gallery, size menu); a card with a non-identity `Xf`
 //! (jiggle, lift, pop) is first composed upright into its own scratch bitmap and then drawn rotated / scaled / faded.
 use crate::gfx::*;
-use crate::glass::{self, contour_point, nearest_contour, tl_corner_u, Fx, Glass, GlassParams, GlassStyle, Hi};
+use crate::glass::{self, contour_point, contour_u, nearest_contour, tl_corner_u, Fx, Glass, GlassParams, GlassStyle, Hi};
 use crate::motion::{self, Appearance, AppearancePref, AppearanceState, LightSpring};
 pub use crate::grid::{ORIGIN, PITCH};
 use crate::layout::Item;
@@ -163,13 +163,20 @@ pub struct CardView {
     look: f32,
     app: AppearanceState,
     forced: Option<Appearance>,
-    /// inertial light of this card, its drive (opposite to the velocity), pointer glint (current / goal / contour point, card px)
+    /// inertial light of this card, its drive (opposite to the velocity)
     light: LightSpring,
     light_drive: (f32, f32),
     light_settled: bool,
-    glint: f32,
-    glint_goal: f32,
-    glint_pt: (f32, f32),
+    /// pointer hover / press: linear progress 0..1 (eased on use) and whether they are on, the card scale spring,
+    /// the smoothed pointer (light spot) and its goal (card px), the smoothed contour fraction of the rim glint
+    hover_t: f32,
+    hover_on: bool,
+    press_t: f32,
+    press_on: bool,
+    bump: motion::Bump,
+    spot: (f32, f32),
+    spot_goal: (f32, f32),
+    glint_u: f32,
     /// the glass layer has to be re-rendered before the next compose (materialise blur changed)
     layer_stale: bool,
     widget: Box<dyn Widget>,
@@ -185,7 +192,7 @@ pub struct CardView {
     frame_once: bool,
 }
 
-/// A glass-only surface (no widget): the gallery panel and the settings strip. Drawn by the host between the cards and its own UI.
+/// A glass-only surface (no widget): the gallery panel, the settings strip and the text prompt. Drawn by the host between the cards and its own UI.
 pub struct GlassPanel {
     pub x: i32,
     pub y: i32,
@@ -208,6 +215,9 @@ pub struct PanelSpec {
     pub g: f32,
 }
 
+/// Glass panels of the host UI: gallery / settings, strip, text prompt, context menu, its submenu (see `ui::SLOT_*`).
+pub const PANEL_SLOTS: usize = 5;
+
 pub struct Scene {
     pub w: i32,
     pub h: i32,
@@ -215,7 +225,7 @@ pub struct Scene {
     m: i32,
     g: f32,
     pub cards: Vec<CardView>,
-    pub panels: [Option<GlassPanel>; 2],
+    pub panels: [Option<GlassPanel>; PANEL_SLOTS],
     sh: Shared,
     backdrop: ID2D1Bitmap1,
     maps: HashMap<(i32, i32, u32), ID2D1Bitmap1>,
@@ -296,15 +306,48 @@ pub fn xf_matrix(cx: f32, cy: f32, k: f32, rot_deg: f32) -> Matrix3x2 {
     Matrix3x2 { M11: k * c, M12: k * s, M21: -k * s, M22: k * c, M31: cx - cx * k * c + cy * k * s, M32: cy - cx * k * s - cy * k * c }
 }
 
-/// The highlight inputs of a card: light direction (base + inertia), appearance, glint, materialise sweep.
-fn hi_of(c: &CardView, base_angle: f32) -> Hi {
+impl CardView {
+    /// No transform and no hover / press scale: drawn straight from its layer (the fast path, no scratch compose).
+    fn upright(&self) -> bool {
+        self.xf.is_id() && self.bump.x == 1.0
+    }
+    fn bump_goal(&self) -> f32 {
+        motion::bump_target(self.hover_on, self.press_on)
+    }
+    /// Where the rim glint heads: the contour fraction of the point nearest to the smoothed pointer.
+    fn glint_goal(&self) -> f32 {
+        let (w, h) = self.glass.size_px();
+        let r = self.glass.radius_px();
+        contour_u(w, h, r, nearest_contour(w, h, r, self.spot.0, self.spot.1).0)
+    }
+    /// Hover / press still easing (the animation timer must run); a pointer resting on a fully hovered card is idle.
+    fn hover_busy(&self) -> bool {
+        let on = |b: bool| if b { 1.0 } else { 0.0 };
+        self.hover_t != on(self.hover_on)
+            || self.press_t != on(self.press_on)
+            || !self.bump.at_rest(self.bump_goal())
+            || (self.hover_t > 0.0 && (self.spot != self.spot_goal || motion::wrap_dist(self.glint_u, self.glint_goal()) != 0.0))
+    }
+}
+
+/// The highlight inputs of a card: light direction (base + inertia), appearance, hover glint + spot, materialise sweep.
+fn hi_of(c: &CardView, base_angle: f32, s: f32) -> Hi {
     let (w, h) = c.glass.size_px();
     let r = c.glass.radius_px();
     let sweep = (c.xf.sweep >= 0.0).then(|| {
         let p = contour_point(w, h, r, tl_corner_u(w, h, r) + c.xf.sweep);
         (p.0, p.1, (std::f32::consts::PI * c.xf.sweep).sin().max(0.0).powf(0.7))
     });
-    Hi { angle: c.light.angle(base_angle), k: c.look, glint: (c.glint > 0.004).then_some((c.glint_pt.0, c.glint_pt.1, c.glint)), sweep, alpha: 1.0 }
+    let e = motion::smooth(c.hover_t);
+    let (glint, spot) = if e > 0.004 {
+        let d = nearest_contour(w, h, r, c.spot.0, c.spot.1).1;
+        let g = contour_point(w, h, r, c.glint_u);
+        // a press dims the spot a little
+        (Some((g.0, g.1, e * motion::hover_rim(d, s))), Some((c.spot.0, c.spot.1, e * (1.0 - 0.4 * motion::smooth(c.press_t)))))
+    } else {
+        (None, None)
+    };
+    Hi { angle: c.light.angle(base_angle), k: c.look, glint, sweep, spot, alpha: 1.0 }
 }
 
 /// Card rectangle in canvas px as drawn: scaled about its centre by the transform (lift / materialise).
@@ -381,7 +424,7 @@ impl Scene {
             m: (MARGIN * s).round() as i32,
             g: glass_g,
             cards: Vec::new(),
-            panels: [None, None],
+            panels: [None, None, None, None, None],
             sh,
             backdrop: backdrop.clone(),
             maps: HashMap::new(),
@@ -522,9 +565,14 @@ impl Scene {
             light: LightSpring::default(),
             light_drive: (0.0, 0.0),
             light_settled: true,
-            glint: 0.0,
-            glint_goal: 0.0,
-            glint_pt: (0.0, 0.0),
+            hover_t: 0.0,
+            hover_on: false,
+            press_t: 0.0,
+            press_on: false,
+            bump: motion::Bump::default(),
+            spot: (0.0, 0.0),
+            spot_goal: (0.0, 0.0),
+            glint_u: 0.0,
             layer_stale: false,
             widget: (def.make)(),
             cfg: if c.cfg.is_object() { c.cfg.clone() } else { json!({}) },
@@ -678,7 +726,7 @@ impl Scene {
             c.key = (u64::MAX, 0);
             c.lum_known = false;
         }
-        self.panels = [None, None];
+        self.panels = [None, None, None, None, None];
         self.liquid = None;
         self.update_merge();
         Ok(())
@@ -766,15 +814,28 @@ impl Scene {
         let c = &mut self.cards[i];
         let (lx, ly) = ((px - c.x) as f32 / s, (py - c.y) as f32 / s);
         c.hover = if kind == MouseKind::Leave { None } else { Some((lx, ly)) };
-        // pointer glint: the contour point nearest to the pointer, strength by distance (animated by `step_fx`)
-        let (gp, gd) = nearest_contour(c.w as f32, c.h as f32, c.glass.radius_px(), (px - c.x) as f32, (py - c.y) as f32);
-        let goal = if kind == MouseKind::Leave { 0.0 } else { motion::glint_target(gd, s) };
-        let moved = (gp.0 - c.glint_pt.0).abs() + (gp.1 - c.glint_pt.1).abs() > 1.5;
-        if (goal - c.glint_goal).abs() > 0.01 || (goal > 0.0 && moved) {
-            c.glint_goal = goal;
-            if goal > 0.0 {
-                c.glint_pt = gp;
+        // hover / press response (eased by `step_fx`; the widget below hears the event unchanged, nothing is delayed)
+        let on = kind != MouseKind::Leave;
+        let press = match (kind, button) {
+            (MouseKind::Down, Button::Left) => true,
+            (MouseKind::Up, Button::Left) | (MouseKind::Leave, _) => false,
+            _ => c.press_on,
+        };
+        let mut wake = on != c.hover_on || press != c.press_on;
+        if on {
+            let p = ((px - c.x) as f32, (py - c.y) as f32);
+            if c.hover_t <= 0.0 && !c.hover_on {
+                // entering from rest: spot and glint start under the pointer instead of sliding in from the last place
+                c.spot = p;
+                c.spot_goal = p;
+                c.glint_u = c.glint_goal();
             }
+            wake |= (p.0 - c.spot_goal.0).abs() + (p.1 - c.spot_goal.1).abs() > 0.5;
+            c.spot_goal = p;
+        }
+        c.hover_on = on;
+        c.press_on = press;
+        if wake {
             self.fx_wake = true;
         }
         let ev = MouseEv { kind, x: lx, y: ly, button, delta };
@@ -810,7 +871,8 @@ impl Scene {
     }
 
     /// Card cfg keys that start with an underscore drive the headless renderer (`--cards "clock:s@0,0{\"_light\":90}"`):
-    /// `_light` deg, `_mat` ms into the materialisation, `_mout` ms into the dematerialisation, `_move` [dx, dy] logical px from the grid cell, `_hover` [x, y] pointer in card px (glint + widget hover).
+    /// `_light` deg, `_mat` ms into the materialisation, `_mout` ms into the dematerialisation, `_move` [dx, dy] logical px from the grid cell, `_hover` [x, y] pointer in card px (glint + spot + lift + widget hover),
+    /// with `_hover_t` 0..1 (the ease-in progress, default 1) and `_press` true (the left button held: press scale, dimmer spot).
     pub fn apply_debug(&mut self, gfx: &Gfx, now: &Now) {
         for i in 0..self.cards.len() {
             let cfg = self.cards[i].cfg.clone();
@@ -832,7 +894,14 @@ impl Scene {
                 if let (Some(x), Some(y)) = (h.first().and_then(|v| v.as_f64()), h.get(1).and_then(|v| v.as_f64())) {
                     let (px, py) = (self.cards[i].x + (x as f32 * self.s) as i32, self.cards[i].y + (y as f32 * self.s) as i32);
                     self.mouse(gfx, i, MouseKind::Move, px, py, Button::None, 0.0, now);
-                    self.cards[i].glint = self.cards[i].glint_goal;
+                    // `_press`: the left button is held; `_hover_t` 0..1: that far into the hover ease-in (default: fully in)
+                    let c = &mut self.cards[i];
+                    c.press_on = cfg.get("_press").and_then(|v| v.as_bool()) == Some(true); // the widget hears no click
+                    c.hover_t = cfg.get("_hover_t").and_then(|v| v.as_f64()).map_or(1.0, |t| t.clamp(0.0, 1.0) as f32);
+                    c.press_t = if c.press_on { 1.0 } else { 0.0 };
+                    let rest = if c.press_on { motion::PRESS_SCALE } else { 1.0 + (motion::HOVER_SCALE - 1.0) * motion::smooth(c.hover_t) };
+                    c.bump = motion::Bump::resting(rest);
+                    c.scratch_ok = false;
                 }
             }
         }
@@ -868,11 +937,11 @@ impl Scene {
         }
     }
 
-    /// Something of the glass motion is still moving (light spring, glint fade, appearance cross-fade): keep the animation timer.
+    /// Something of the glass motion is still moving (light spring, hover / press, appearance cross-fade): keep the animation timer.
     pub fn fx_busy(&self) -> bool {
         (0..self.cards.len()).any(|i| {
             let c = &self.cards[i];
-            !c.light_settled || (c.glint - c.glint_goal).abs() > 1e-3 || (c.look - self.look_target(i)).abs() > 1e-3
+            !c.light_settled || c.hover_busy() || (c.look - self.look_target(i)).abs() > 1e-3
         })
     }
     /// The pointer moved near an edge / the appearance preference changed: the host should arm its animation timer.
@@ -893,23 +962,35 @@ impl Scene {
                 c.light_settled = c.light.step(dt, c.light_drive);
                 hi_changed = true;
             }
-            let g = motion::approach(c.glint, c.glint_goal, dt, 0.12);
-            if g != c.glint {
-                c.glint = g;
+            // hover / press: progress ramps, the spot trails the pointer (~70 ms), the glint slides along the rim (~80 ms), the scale springs
+            let mut scaled = false;
+            if c.hover_busy() {
+                use motion::{follow, ramp};
+                c.hover_t = ramp(c.hover_t, c.hover_on, dt, motion::HOVER_IN, motion::HOVER_OUT);
+                c.press_t = ramp(c.press_t, c.press_on, dt, motion::PRESS_IN, motion::PRESS_OUT);
+                c.spot = (follow(c.spot.0, c.spot_goal.0, dt, 0.07, 0.25), follow(c.spot.1, c.spot_goal.1, dt, 0.07, 0.25));
+                let gu = c.glint_goal();
+                c.glint_u = motion::follow_wrap(c.glint_u, gu, dt, 0.08, 5e-4);
+                let (b0, goal) = (c.bump.x, c.bump_goal());
+                c.bump.step(dt, goal);
+                scaled = c.bump.x != b0;
                 hi_changed = true;
             }
             let look_changed = (c.look - target).abs() > 1e-4;
             if look_changed {
                 c.look = motion::look_step(c.look, target, dt);
             }
+            // the hover / press scale (<= 1.2 %) stays inside the shadow margin; the edit transforms (rotation, lift) need the extension
+            let e = if self.cards[i].xf.is_id() { 0 } else { ext };
             let r = if look_changed {
                 if let Err(e) = self.render_card(gfx, i, now) {
                     eprintln!("mswidgets: render card {i}: {e}");
                 }
-                Some(self.layer_rect_ext(i, if self.cards[i].xf.is_id() { 0 } else { ext }))
+                Some(self.layer_rect_ext(i, e))
             } else if hi_changed {
                 self.cards[i].scratch_ok = false;
-                Some(if self.cards[i].xf.is_id() { self.card_rect(i) } else { self.layer_rect_ext(i, ext) })
+                // a scale step (also the last one back to upright) repaints the margin the bigger card covered
+                Some(if self.cards[i].upright() && !scaled { self.card_rect(i) } else { self.layer_rect_ext(i, e) })
             } else {
                 None
             };
@@ -1181,7 +1262,7 @@ impl Scene {
         }
         for i in 0..self.cards.len() {
             let lr = self.layer_rect_ext(i, (60.0 * s) as i32);
-            if self.cards[i].xf.is_id() || !hit(&lr, &clip) {
+            if self.cards[i].upright() || !hit(&lr, &clip) {
                 continue;
             }
             if self.cards[i].layer_stale {
@@ -1227,7 +1308,7 @@ impl Scene {
                 continue;
             }
             let shadow = if self.cards[i].xf.lift > 0.0 { Some(self.lift_shadow(gfx, self.cards[i].w, self.cards[i].h, self.radius_of(self.cards[i].size))?) } else { None };
-            let sh = &self.sh;
+            let (sh, dim) = (&self.sh, self.dim);
             let c = &mut self.cards[i];
             let Some(scratch) = c.scratch.clone() else { continue };
             let dc = &gfx.dc;
@@ -1242,7 +1323,11 @@ impl Scene {
                     }
                     dc.DrawImage(sd, Some(&pt(0.0, 18.0 * s * c.xf.lift)), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
                 }
-                dc.DrawImage(&c.layer, None, None, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                // "Dim widgets on desktop" holds for a transformed (hovered, pressed) card too
+                match (&c.dimfx, dim) {
+                    (Some((_, out)), true) => dc.DrawImage(out, None, None, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_OVER),
+                    _ => dc.DrawImage(&c.layer, None, None, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_OVER),
+                }
                 if c.tick.animates() || sh.preview || c.frame_once {
                     dc.PushAxisAlignedClip(&rf(m as f32, m as f32, (m + c.w) as f32, (m + c.h) as f32), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
                     let light = c.look >= 0.5;
@@ -1256,7 +1341,7 @@ impl Scene {
                     }
                     c.frame_once = false;
                 }
-                let hi = hi_of(c, base_angle);
+                let hi = hi_of(c, base_angle, s);
                 c.glass.draw_hi(dc, m as f32, m as f32, &hi);
                 let e = dc.EndDraw(None, None);
                 dc.SetTarget(None::<&ID2D1Image>);
@@ -1270,7 +1355,8 @@ impl Scene {
 
     /// Drop the scratch bitmaps (edit mode / drag over).
     pub fn release_scratch(&mut self) {
-        for c in &mut self.cards {
+        // a hovered / pressed card keeps composing through its scratch (no re-allocation per animation end)
+        for c in self.cards.iter_mut().filter(|c| c.upright()) {
             c.scratch = None;
             c.soften = None;
             c.scratch_ok = false;
@@ -1320,7 +1406,7 @@ impl Scene {
                     continue;
                 }
                 let c = &self.cards[i];
-                if c.xf.is_id() {
+                if c.upright() {
                     let at = pt((c.x - m) as f32, (c.y - m) as f32);
                     match (&c.dimfx, self.dim) {
                         (Some((_, out)), true) => dc.DrawImage(out, Some(&at), None, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_OVER),
@@ -1328,7 +1414,9 @@ impl Scene {
                     }
                 } else if let Some(sc) = &c.scratch {
                     let (lw, lh) = ((c.w + 2 * m) as f32, (c.h + 2 * m) as f32);
-                    let t = xf_matrix(c.x as f32 + c.w as f32 / 2.0, c.y as f32 + c.h as f32 / 2.0, c.xf.scale, c.xf.rot);
+                    let t = xf_matrix(c.x as f32 + c.w as f32 / 2.0, c.y as f32 + c.h as f32 / 2.0, c.xf.scale * c.bump.x, c.xf.rot);
+                    // a pure scale (hover / press) resamples with the cubic filter: the text stays crisp at 1.2 %
+                    let interp = if c.xf.rot.abs() < 0.004 { D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC } else { D2D1_INTERPOLATION_MODE_LINEAR };
                     dc.SetTransform(&t);
                     let dest = rf((c.x - m) as f32, (c.y - m) as f32, (c.x - m) as f32 + lw, (c.y - m) as f32 + lh);
                     match (&c.soften, c.xf.blur > 0.002) {
@@ -1338,7 +1426,7 @@ impl Scene {
                                 dc.DrawImage(&o, Some(&pt(dest.left, dest.top)), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
                             }
                         }
-                        _ => dc.DrawBitmap(sc, Some(&dest), c.xf.alpha.clamp(0.0, 1.0), D2D1_INTERPOLATION_MODE_LINEAR, Some(&rf(0.0, 0.0, lw, lh)), None),
+                        _ => dc.DrawBitmap(sc, Some(&dest), c.xf.alpha.clamp(0.0, 1.0), interp, Some(&rf(0.0, 0.0, lw, lh)), None),
                     }
                     dc.SetTransform(&mat(1.0, 0.0, 0.0));
                 }
@@ -1347,7 +1435,7 @@ impl Scene {
             let sh = &self.sh;
             for c in self.cards.iter_mut() {
                 let lr = clip_rect(c, m, self.w, self.h);
-                if !c.xf.is_id() || !hit(&lr, &clip) || !(c.tick.animates() || sh.preview || c.frame_once) {
+                if !c.upright() || !hit(&lr, &clip) || !(c.tick.animates() || sh.preview || c.frame_once) {
                     continue;
                 }
                 dc.SetTransform(&mat(1.0, 0.0, 0.0)); // the clip rectangle is in frame px
@@ -1366,10 +1454,10 @@ impl Scene {
             // the dynamic highlights (specular rim following the light, glint, sweep) over the finished identity cards
             let base_angle = self.params.light_angle;
             for c in self.cards.iter() {
-                if !c.xf.is_id() || !hit(&clip_rect(c, 0, self.w, self.h), &clip) {
+                if !c.upright() || !hit(&clip_rect(c, 0, self.w, self.h), &clip) {
                     continue;
                 }
-                c.glass.draw_hi(dc, c.x as f32, c.y as f32, &hi_of(c, base_angle));
+                c.glass.draw_hi(dc, c.x as f32, c.y as f32, &hi_of(c, base_angle, s));
             }
             dc.SetTransform(&mat(1.0, 0.0, 0.0));
         }
@@ -1581,6 +1669,32 @@ mod tests {
             guard += 1;
         }
         assert!(guard > 5 && guard < 25 && sc.look(0) == 0.0, "cross-fade took {guard} steps");
+        // hover: eases in and then rests (no timer while the pointer stays), press + release spring back, leave goes idle and upright
+        let (cx0, cy0) = (sc.cards[0].x + 60, sc.cards[0].y + 70);
+        let settle = |sc: &mut Scene| {
+            let mut n = 0;
+            while sc.fx_busy() && n < 100 {
+                sc.step_fx(&gfx, 0.016, &now);
+                n += 1;
+            }
+            n
+        };
+        sc.mouse(&gfx, 0, MouseKind::Move, cx0, cy0, Button::None, 0.0, &now);
+        assert!(sc.take_fx_wake() && sc.fx_busy());
+        let n = settle(&mut sc);
+        assert!(n > 8 && n < 60 && sc.cards[0].hover_t == 1.0 && sc.cards[0].bump.x == motion::HOVER_SCALE, "hover in {n} steps");
+        sc.composite(&gfx, full, None, &now).unwrap();
+        sc.mouse(&gfx, 0, MouseKind::Move, cx0 + 1, cy0, Button::None, 0.0, &now); // a sub-pixel jitter is no animation
+        assert!(!sc.fx_busy() || settle(&mut sc) < 30);
+        sc.mouse(&gfx, 0, MouseKind::Down, cx0, cy0, Button::Left, 0.0, &now);
+        settle(&mut sc);
+        assert_eq!(sc.cards[0].bump.x, motion::PRESS_SCALE);
+        sc.mouse(&gfx, 0, MouseKind::Up, cx0, cy0, Button::Left, 0.0, &now);
+        settle(&mut sc);
+        assert_eq!(sc.cards[0].bump.x, motion::HOVER_SCALE);
+        sc.mouse(&gfx, 0, MouseKind::Leave, 0, 0, Button::None, 0.0, &now);
+        let n = settle(&mut sc);
+        assert!(n < 60 && !sc.fx_busy() && sc.cards[0].upright() && sc.cards[0].hover_t == 0.0, "leave in {n} steps");
     }
 
     /// The settings sliders: `set_params` swaps every card's effect graph at run time; the widget instances stay, the pixels change

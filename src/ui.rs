@@ -7,7 +7,10 @@ use crate::gfx::*;
 use crate::glass::{self, GlassParams, GlassStyle, LOOK};
 use crate::grid;
 use crate::layout::{AccentMode, AccentScope, Dim};
-use crate::motion::AppearancePref;
+use crate::input::{self, PromptOpts};
+use crate::motion::{self, AppearancePref, Bump, HoverRamps};
+use crate::menu::{self, Entry, MenuPanel};
+use crate::prompt::{self, Act, Focus, Key, Mods, PromptPanel};
 use crate::registry::{self, WidgetDef};
 use crate::update::UpdateState;
 use crate::widget::*;
@@ -38,6 +41,15 @@ const OPT_ROW: f32 = 38.0;
 pub const SETTINGS_DIM: f32 = 0.12;
 pub const SLOT_GALLERY: usize = 0;
 pub const SLOT_TOOLBAR: usize = 1;
+/// the text prompt (a glass panel of its own; it shares the region bit of the gallery, see host.rs `sync_regions`)
+pub const SLOT_PROMPT: usize = 2;
+const PROMPT_R: f32 = 22.0;
+/// the context menu and its submenu (glass panels of their own; they share the region bit of the gallery like the prompt)
+pub const SLOT_MENU: usize = 3;
+pub const SLOT_SUB: usize = 4;
+/// text of the menu rows; a separator is inset this far from the panel's rows
+const MENU_FONT: Style = Style::new(13.0, 500);
+const PAD_SEP: f32 = 8.0;
 
 // ---------------------------------------------------------------- text input
 
@@ -252,6 +264,20 @@ pub struct Ui {
     /// grid cell under a dragged card: canvas px rect + corner radius px
     pub placeholder: Option<(RECT, f32)>,
     pub toast: Option<String>,
+    /// toast motion: seconds since it appeared, seconds into its fade-out (None = held), the opacity and the rise (logical px) being drawn
+    pub toast_t: f32,
+    /// gallery: seconds since the list of previews changed (the tiles fade in with a stagger) and a signature of the list shown
+    gal_fade: f32,
+    gal_sig: u64,
+    pub toast_out: Option<f32>,
+    toast_a: f32,
+    toast_rise: f32,
+    /// the motion of the settings panel's controls (hover ramps, sliding segment, switches ...)
+    sa: SetAnim,
+    /// the modal text prompt drawn on the canvas (any mode); None = no prompt
+    pub prompt: Option<PromptPanel>,
+    /// the context menu of a card drawn on the canvas (any mode); None = no menu
+    pub menu: Option<MenuPanel>,
     pub caret_on: bool,
     /// values shown by the settings strip
     pub glass: f32,
@@ -288,9 +314,449 @@ const ON_WHITE: Color = Color::rgba(0.07, 0.07, 0.09, 1.0);
 
 /// The "Done" button of both panels: white glass pill with dark text (like the selected segment).
 fn done_button(cx: &Cx, r: Rect, label: &str, hot: bool) {
+    done_button_k(cx, r, label, if hot { 1.0 } else { 0.0 });
+}
+
+/// `done_button` with a hover amount 0..1 (the settings panel ramps it).
+fn done_button_k(cx: &Cx, r: Rect, label: &str, hot: f32) {
     cx.pill(r.offset(0.0, 1.5), Color::rgba(0.0, 0.0, 0.0, 0.20));
-    cx.pill(r, Color::rgba(1.0, 1.0, 1.0, if hot { 1.0 } else { 0.92 }));
+    cx.pill(r, Color::rgba(1.0, 1.0, 1.0, 0.92 + 0.08 * hot));
     cx.text(r, label, Style::new(13.0, 600).center(), ON_WHITE);
+}
+
+// ---------------------------------------------------------------- settings panel motion
+
+// Animation keys of the controls (`hkey`): the look sliders first, then everything else.
+const K_RESET: usize = 16;
+const K_OPT: usize = 20; // + option index * MON_SEGS + segment
+const K_AUTO: usize = K_OPT + 6 * MON_SEGS;
+const K_CHECK: usize = K_AUTO + 1;
+const K_EDIT: usize = K_AUTO + 2;
+const K_QUIT: usize = K_AUTO + 3;
+const K_UPD: usize = K_AUTO + 4;
+const K_DL: usize = K_AUTO + 5;
+const K_PAGE: usize = K_AUTO + 6;
+const K_DONE: usize = K_AUTO + 7;
+/// not a control: the update status line (a dirty-rect key only)
+const K_STATUS: usize = K_AUTO + 8;
+const N_KEYS: usize = K_STATUS;
+/// Scale of a pressed button / switch / slider knob (a spring, `Bump`).
+const PRESS_BTN: f32 = 0.97;
+/// Hover ramp timings (seconds), the sliding segment's follow constant, the switch cross-fade, the status / button fade.
+const HOV_IN: f32 = 0.12;
+const HOV_OUT: f32 = 0.18;
+const SEG_TAU: f32 = 0.06;
+const SLIDE_TAU: f32 = 0.05;
+const SW_T: f32 = 0.17;
+const FADE_T: f32 = 0.15;
+/// Gallery tiles: fade-in time and the delay between neighbours.
+const GAL_FADE: f32 = 0.18;
+const GAL_STAGGER: f32 = 0.02;
+
+fn opt_idx(o: Opt) -> usize {
+    match o {
+        Opt::Appearance => 0,
+        Opt::Dim => 1,
+        Opt::Source => 2,
+        Opt::Accent => 3,
+        Opt::Scope => 4,
+        Opt::Monitor => 5,
+    }
+}
+
+/// The animation key of a hit target of the settings panel (None = nothing animated there).
+pub fn hkey(h: Hit) -> Option<usize> {
+    Some(match h {
+        Hit::Look(i, _) => i.min(K_RESET - 1),
+        Hit::ResetLook => K_RESET,
+        Hit::Opt(o, k) => K_OPT + opt_idx(o) * MON_SEGS + k.min(MON_SEGS - 1),
+        Hit::Autostart => K_AUTO,
+        Hit::CheckStart => K_CHECK,
+        Hit::EditBtn => K_EDIT,
+        Hit::QuitBtn => K_QUIT,
+        Hit::UpdBtn => K_UPD,
+        Hit::UpdInstall => K_DL,
+        Hit::UpdPage => K_PAGE,
+        Hit::Done => K_DONE,
+        _ => return None,
+    })
+}
+
+/// Which kind of status line the update state shows (a change of kind cross-fades; the percent of a download does not).
+fn upd_key(u: &UpdateState) -> u8 {
+    match u {
+        UpdateState::Idle => 0,
+        UpdateState::Checking => 1,
+        UpdateState::Latest => 2,
+        UpdateState::Available { error: Some(_), .. } => 3,
+        UpdateState::Available { .. } => 4,
+        UpdateState::Downloading(_) => 5,
+        UpdateState::Verifying => 6,
+        UpdateState::Failed => 7,
+    }
+}
+
+/// The state the settings controls are drawn from while they move; `Ui::step_sa` (from the host's animation timer) walks it towards the
+/// real values, `Ui::sa_busy` says when it has arrived (then the timer may stop).
+struct SetAnim {
+    /// hover amount per key (hovered or pressed)
+    hov: HoverRamps,
+    /// press spring per key (buttons, switches, slider knobs)
+    prs: Vec<Bump>,
+    /// the handle position of each look slider
+    kp: [Option<f32>; K_RESET],
+    /// the sliding pill of each segmented control, in segments
+    seg: [Option<f32>; 6],
+    /// the autostart / check-on-start switches, 0..1 linear
+    sw: [Option<f32>; 2],
+    /// a slider press: the slider and the pointer x (canvas px) it started at; `snapped` once the pointer left that spot (1:1 from then on)
+    drag: Option<(usize, i32)>,
+    snapped: bool,
+    /// the status line: kind being shown, the line before a change and the progress of the cross-fade (1 = settled), the line last shown
+    st_key: u8,
+    st_prev: Option<(String, Color)>,
+    st_t: f32,
+    st_last: (String, Color),
+    /// presence of the "Release page" / "Update now" buttons
+    btns: f32,
+}
+
+impl SetAnim {
+    fn new() -> SetAnim {
+        SetAnim {
+            hov: HoverRamps::new(N_KEYS),
+            prs: vec![Bump::default(); N_KEYS],
+            kp: [None; K_RESET],
+            seg: [None; 6],
+            sw: [None; 2],
+            drag: None,
+            snapped: false,
+            st_key: 0,
+            st_prev: None,
+            st_t: 1.0,
+            st_last: (String::new(), FAINT),
+            btns: 0.0,
+        }
+    }
+
+    /// How far a key is pressed, 0..1.
+    fn press(&self, k: usize) -> f32 {
+        self.prs.get(k).map_or(0.0, |b| ((1.0 - b.x) / (1.0 - PRESS_BTN)).clamp(0.0, 1.0))
+    }
+}
+
+impl Ui {
+    /// The settings panel opens: everything is drawn at its real value at once, no glide from stale numbers.
+    pub fn sa_reset(&mut self) {
+        self.sa = SetAnim::new();
+        for i in 0..1 + LOOK.len() {
+            self.sa.kp[i] = Some(self.set_pos(i));
+        }
+        for o in Opt::ALL {
+            self.sa.seg[opt_idx(o)] = Some(self.opt_sel(o) as f32);
+        }
+        self.sa.sw = [Some(f32::from(self.autostart)), Some(f32::from(self.check_start))];
+        self.sa.btns = if matches!(self.update, UpdateState::Available { .. }) { 1.0 } else { 0.0 };
+        self.sa.st_key = upd_key(&self.update);
+        self.sa.st_last = self.upd_line();
+    }
+
+    /// Remember the status line as shown (the line a later change fades from; a download's percent moves without a step).
+    pub fn sa_track(&mut self) {
+        if upd_key(&self.update) == self.sa.st_key {
+            self.sa.st_last = self.upd_line();
+        }
+    }
+
+    /// A press on look slider `i` at canvas px `x`, the value under the pointer `t`: on the handle it follows 1:1 at once, anywhere
+    /// else the handle glides to the spot until the pointer moves (a few px) and then follows 1:1.
+    pub fn sa_drag_start(&mut self, i: usize, x: i32, t: f32) {
+        let tw = self.set_lay().rows.get(i).map_or(1.0, |r| r.track.w);
+        let shown = self.slider_shown(i);
+        self.sa.drag = Some((i, x));
+        self.sa.snapped = (t - shown).abs() * tw <= 12.0;
+    }
+
+    /// The pointer moved with slider `i` pressed.
+    pub fn sa_drag_move(&mut self, i: usize, x: i32) {
+        if let Some((j, x0)) = self.sa.drag {
+            if j == i && (x - x0).abs() as f32 > 4.0 * self.s {
+                self.sa.snapped = true;
+            }
+        }
+    }
+
+    pub fn sa_drag_end(&mut self) {
+        if let (true, Some((i, _))) = (self.sa.snapped, self.sa.drag) {
+            self.sa.kp[i] = Some(self.set_pos(i)); // the handle stays where the drag left it
+        }
+        self.sa.drag = None;
+        self.sa.snapped = false;
+    }
+
+    /// Position of the handle of look slider `i` as drawn.
+    fn slider_shown(&self, i: usize) -> f32 {
+        if self.sa.snapped && self.sa.drag.is_some_and(|d| d.0 == i) {
+            return self.set_pos(i);
+        }
+        self.sa.kp.get(i).copied().flatten().unwrap_or_else(|| self.set_pos(i))
+    }
+
+    /// Where a segmented control's pill is drawn, in segments.
+    fn seg_shown(&self, o: Opt) -> f32 {
+        self.sa.seg[opt_idx(o)].unwrap_or_else(|| self.opt_sel(o) as f32)
+    }
+
+    fn sw_shown(&self, j: usize, on: bool) -> f32 {
+        self.sa.sw[j].unwrap_or(if on { 1.0 } else { 0.0 })
+    }
+
+    /// The status line of the update check: text and colour.
+    fn upd_line(&self) -> (String, Color) {
+        match &self.update {
+            UpdateState::Idle => (format!("{} {}", self.t("Версия", "Version"), env!("CARGO_PKG_VERSION")), FAINT),
+            UpdateState::Checking => (self.t("Проверка…", "Checking…").to_string(), DIM),
+            UpdateState::Latest => (self.t("У вас последняя версия", "You have the latest version").to_string(), Color::rgb8(52, 199, 89)),
+            UpdateState::Available { error: Some(e), .. } => (if self.lang == Lang::Ru { format!("Не удалось обновить: {e}") } else { format!("Update failed: {e}") }, ORANGE),
+            UpdateState::Available { version, .. } => (if self.lang == Lang::Ru { format!("Доступна версия {version}") } else { format!("Version {version} is available") }, TEXT),
+            UpdateState::Downloading(p) => (if self.lang == Lang::Ru { format!("Загрузка обновления… {p}%") } else { format!("Downloading the update… {p}%") }, TEXT),
+            UpdateState::Verifying => (self.t("Проверка контрольной суммы…", "Verifying the checksum…").to_string(), TEXT),
+            UpdateState::Failed => (self.t("Не удалось проверить", "Could not check").to_string(), ORANGE),
+        }
+    }
+
+    /// Hovered key and pressed key of the settings panel.
+    fn sa_keys(&self) -> (Option<usize>, Option<usize>) {
+        (hkey(self.hover), hkey(self.press))
+    }
+
+    /// The panel's controls still have to move (the animation timer keeps running).
+    pub fn sa_busy(&self) -> bool {
+        if !(self.edit && self.settings) {
+            return false;
+        }
+        let (hk, pk) = self.sa_keys();
+        if self.sa.hov.busy(|i| Some(i) == hk || Some(i) == pk) {
+            return true;
+        }
+        if self.sa.prs.iter().enumerate().any(|(i, b)| !(K_OPT..K_AUTO).contains(&i) && !b.at_rest(if Some(i) == pk { PRESS_BTN } else { 1.0 })) {
+            return true;
+        }
+        let n = 1 + LOOK.len();
+        (0..n).any(|i| self.sa.kp[i] != Some(self.set_pos(i)))
+            || Opt::ALL.iter().any(|o| self.sa.seg[opt_idx(*o)] != Some(self.opt_sel(*o) as f32))
+            || [self.autostart, self.check_start].iter().enumerate().any(|(j, on)| self.sa.sw[j] != Some(if *on { 1.0 } else { 0.0 }))
+            || self.sa.btns != if matches!(self.update, UpdateState::Available { .. }) { 1.0 } else { 0.0 }
+            || upd_key(&self.update) != self.sa.st_key
+            || self.sa.st_t < 1.0
+    }
+
+    /// Dirty rectangle (logical) of animation key `k` (generous: the shadow and the overshoot of a pressed button included).
+    fn sa_rect(&self, l: &SetLay, k: usize) -> Option<Rect> {
+        Some(match k {
+            _ if k < K_RESET => l.rows.get(k)?.row.inset_xy(-14.0, -2.0),
+            K_RESET => l.reset.inset(-5.0),
+            _ if k < K_AUTO => l.opts.get(k.checked_sub(K_OPT)? / MON_SEGS)?.seg.inset(-5.0),
+            K_AUTO => l.auto_row.inset(-4.0),
+            K_CHECK => l.check_row.inset(-4.0),
+            K_EDIT => l.edit_btn.inset(-5.0),
+            K_QUIT => l.quit_btn.inset(-5.0),
+            K_UPD => l.upd_btn.inset(-5.0),
+            K_DL => l.upd_dl.inset(-5.0),
+            K_PAGE => l.upd_page.inset(-5.0),
+            K_DONE => l.done.inset(-5.0),
+            K_STATUS => l.upd_status,
+            _ => return None,
+        })
+    }
+
+    /// One step of every moving control of the settings panel (`reduced`: straight to the end values). Returns the canvas px rectangle
+    /// that has to be repainted: the controls that moved, not the whole panel.
+    pub fn step_sa(&mut self, dt: f32, reduced: bool) -> Option<RECT> {
+        if !(self.edit && self.settings) {
+            return None;
+        }
+        let l = self.set_lay();
+        let (hk, pk) = self.sa_keys();
+        let hot = |i: usize| Some(i) == hk || Some(i) == pk;
+        let mut ch: u128 = 0; // bit k = key k changed
+        if reduced {
+            self.sa.hov.snap(hot, |i| ch |= 1 << i);
+        } else {
+            self.sa.hov.step(dt, HOV_IN, HOV_OUT, hot, |i| ch |= 1 << i);
+        }
+        for (i, b) in self.sa.prs.iter_mut().enumerate() {
+            if (K_OPT..K_AUTO).contains(&i) {
+                continue;
+            }
+            let t = if Some(i) == pk { PRESS_BTN } else { 1.0 };
+            if b.at_rest(t) {
+                continue;
+            }
+            if reduced {
+                *b = Bump::resting(t);
+            } else {
+                b.step(dt, t);
+            }
+            ch |= 1 << i;
+        }
+        for i in 0..1 + LOOK.len() {
+            let t = self.set_pos(i);
+            let drag = self.sa.snapped && self.sa.drag.is_some_and(|d| d.0 == i);
+            let new = match self.sa.kp[i] {
+                Some(c) if !reduced && !drag => motion::follow(c, t, dt, SLIDE_TAU, 0.0005),
+                _ => t,
+            };
+            if self.sa.kp[i].is_some_and(|c| c != new) {
+                ch |= 1 << i;
+            }
+            self.sa.kp[i] = Some(new);
+        }
+        for o in Opt::ALL {
+            let (j, t) = (opt_idx(o), self.opt_sel(o) as f32);
+            let new = match self.sa.seg[j] {
+                Some(c) if !reduced => motion::follow(c, t, dt, SEG_TAU, 0.003),
+                _ => t,
+            };
+            if self.sa.seg[j].is_some_and(|c| c != new) {
+                ch |= 1 << (K_OPT + j * MON_SEGS);
+            }
+            self.sa.seg[j] = Some(new);
+        }
+        for (j, on) in [self.autostart, self.check_start].into_iter().enumerate() {
+            let new = match self.sa.sw[j] {
+                Some(c) if !reduced => motion::ramp(c, on, dt, SW_T, SW_T),
+                _ => {
+                    if on {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+            };
+            if self.sa.sw[j].is_some_and(|c| c != new) {
+                ch |= 1 << (K_AUTO + j);
+            }
+            self.sa.sw[j] = Some(new);
+        }
+        let avail = matches!(self.update, UpdateState::Available { .. });
+        let b = if reduced { f32::from(avail) } else { motion::ramp(self.sa.btns, avail, dt, FADE_T, FADE_T) };
+        if b != self.sa.btns {
+            self.sa.btns = b;
+            ch |= (1 << K_DL) | (1 << K_PAGE);
+        }
+        let key = upd_key(&self.update);
+        if key != self.sa.st_key {
+            self.sa.st_key = key;
+            self.sa.st_prev = (!reduced).then(|| self.sa.st_last.clone());
+            self.sa.st_t = if reduced { 1.0 } else { 0.0 };
+            ch |= 1 << K_STATUS;
+        } else if self.sa.st_t < 1.0 {
+            self.sa.st_t = (self.sa.st_t + dt / FADE_T).min(1.0);
+            if self.sa.st_t >= 1.0 {
+                self.sa.st_prev = None;
+            }
+            ch |= 1 << K_STATUS;
+        }
+        self.sa.st_last = self.upd_line();
+        if ch == 0 {
+            return None;
+        }
+        let mut u: Option<Rect> = None;
+        for k in 0..=N_KEYS {
+            if ch >> k & 1 == 1 {
+                if let Some(r) = self.sa_rect(&l, k) {
+                    u = Some(u.map_or(r, |a| {
+                        let (x, y) = (a.x.min(r.x), a.y.min(r.y));
+                        Rect::new(x, y, a.right().max(r.right()) - x, a.bottom().max(r.bottom()) - y)
+                    }));
+                }
+            }
+        }
+        let (s, m) = (self.s, 2);
+        u.map(|r| RECT { left: (r.x * s).floor() as i32 - m, top: (r.y * s).floor() as i32 - m, right: (r.right() * s).ceil() as i32 + m, bottom: (r.bottom() * s).ceil() as i32 + m })
+    }
+
+    // ------------------------------------------------ gallery tiles
+
+    /// The gallery shows another list of previews (group, size chip, search): restart the staggered fade-in. Same list = no restart.
+    pub fn gal_note(&mut self) {
+        use std::hash::{Hash, Hasher};
+        let (defs, _) = self.shown();
+        let (_, size) = self.chips_and_size(&defs);
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        defs.iter().for_each(|d| d.type_id.hash(&mut h));
+        (size as u8).hash(&mut h);
+        let sig = h.finish() | 1;
+        if self.gal_sig != 0 && sig != self.gal_sig {
+            self.gal_fade = 0.0;
+        }
+        self.gal_sig = sig;
+    }
+
+    /// Opacity of the preview tile `k` of the list: 20 ms later per tile (the first ten), 180 ms each.
+    fn tile_alpha(&self, k: usize) -> f32 {
+        motion::smooth((self.gal_fade - GAL_STAGGER * k.min(10) as f32) / GAL_FADE)
+    }
+
+    pub fn gal_busy(&self) -> bool {
+        self.edit && self.gallery && !self.settings && self.gal_fade < GAL_FADE + GAL_STAGGER * 10.0
+    }
+
+    /// One step of the tile fade; the canvas px rectangle of the tile area to repaint. Reduced motion: no fade at all.
+    pub fn step_gal(&mut self, dt: f32, reduced: bool) -> Option<RECT> {
+        if !self.gal_busy() {
+            return None;
+        }
+        self.gal_fade = if reduced { 1.0e3 } else { self.gal_fade + dt };
+        let (g, s) = (self.lay().grid, self.s);
+        Some(RECT { left: (g.x * s).floor() as i32 - 2, top: (g.y * s).floor() as i32 - 2, right: (g.right() * s).ceil() as i32 + 2, bottom: (g.bottom() * s).ceil() as i32 + 2 })
+    }
+
+    // ------------------------------------------------ toast
+
+    /// A toast appears (or its text changes while it is up: no second rise). Reduced motion shows it at once.
+    pub fn toast_show(&mut self, msg: String, reduced: bool) {
+        if self.toast.is_none() || self.toast_out.is_some() {
+            // fresh, or coming back from a fade-out: continue from the opacity it has now
+            self.toast_t = self.toast_out.map_or(0.0, |o| motion::TOAST_IN * (1.0 - o / motion::TOAST_OUT).clamp(0.0, 1.0));
+        }
+        self.toast_out = None;
+        self.toast = Some(msg);
+        let (a, r, _) = motion::toast_look(self.toast_t, None, reduced);
+        (self.toast_a, self.toast_rise) = (a, r);
+    }
+
+    /// Its hold time is over: fade out (reduced motion: drop it on the next step).
+    pub fn toast_fade(&mut self) {
+        if self.toast.is_some() && self.toast_out.is_none() {
+            self.toast_out = Some(0.0);
+        }
+    }
+
+    pub fn toast_busy(&self, reduced: bool) -> bool {
+        self.toast.is_some() && (self.toast_out.is_some() || if reduced { self.toast_a != 1.0 } else { self.toast_t < motion::TOAST_IN })
+    }
+
+    /// One step of the toast: (something to repaint, the toast has just been dropped).
+    pub fn toast_step(&mut self, dt: f32, reduced: bool) -> (bool, bool) {
+        if self.toast.is_none() {
+            return (false, false);
+        }
+        self.toast_t += dt;
+        if let Some(o) = self.toast_out.as_mut() {
+            *o += dt;
+        }
+        let (a, r, done) = motion::toast_look(self.toast_t, self.toast_out, reduced);
+        let changed = a != self.toast_a || r != self.toast_rise;
+        (self.toast_a, self.toast_rise) = (a, r);
+        if done {
+            self.toast = None;
+            self.toast_out = None;
+            self.toast_a = 0.0;
+        }
+        (changed || done, done)
+    }
 }
 
 fn group_colors(id: &str) -> (Color, Color) {
@@ -474,6 +940,15 @@ impl Ui {
             press: Hit::None,
             placeholder: None,
             toast: None,
+            toast_t: 0.0,
+            gal_fade: 1.0e3,
+            gal_sig: 0,
+            toast_out: None,
+            toast_a: 0.0,
+            toast_rise: 0.0,
+            sa: SetAnim::new(),
+            prompt: None,
+            menu: None,
             caret_on: true,
             glass: 0.5,
             live: true,
@@ -1195,7 +1670,10 @@ impl Ui {
         };
         let g = if self.edit && (self.gallery || self.settings) { Some(spec(self.panel_rect(), PANEL_R)) } else { None };
         let t = if self.edit && !self.settings { Some(spec(self.toolbar_rect(), TB_H / 2.0)) } else { None };
-        for (slot, sp) in [(SLOT_GALLERY, g), (SLOT_TOOLBAR, t)] {
+        let pr = self.prompt.as_ref().map(|p| spec(p.lay.panel, PROMPT_R));
+        let mn = self.menu.as_ref().map(|m| spec(m.root.panel, menu::RADIUS));
+        let sb = self.menu.as_ref().and_then(|m| m.sub.as_ref()).map(|(_, l)| spec(l.panel, menu::RADIUS));
+        for (slot, sp) in [(SLOT_GALLERY, g), (SLOT_TOOLBAR, t), (SLOT_PROMPT, pr), (SLOT_MENU, mn), (SLOT_SUB, sb)] {
             if let Err(e) = scene.set_panel(gfx, slot, sp, GlassStyle::frosted()) {
                 eprintln!("mswidgets: panel {slot}: {e}");
             }
@@ -1209,8 +1687,12 @@ impl Ui {
 
     /// Canvas px rectangle the UI occupies (gallery with its shadow margin + strip + toast) for dirty tracking.
     pub fn dirty_rect(&self, scene: &Scene) -> Option<RECT> {
+        let pd = match (self.prompt_dirty(scene), self.menu_dirty(scene)) {
+            (Some(a), Some(b)) => Some(union(a, b)),
+            (a, b) => a.or(b),
+        };
         if !self.edit {
-            return None;
+            return pd;
         }
         let s = self.s;
         let m = scene.margin() + (30.0 * s) as i32;
@@ -1219,7 +1701,246 @@ impl Ui {
         if self.gallery {
             d = union(d, r(self.panel_rect()));
         }
-        Some(clip(d, scene.w, scene.h))
+        let d = clip(d, scene.w, scene.h);
+        Some(pd.map_or(d, |p| union(d, p)))
+    }
+
+    // ------------------------------------------------ the text prompt
+
+    /// Canvas px rectangle of the prompt with its shadow margin and the glide (for dirty tracking).
+    pub fn prompt_dirty(&self, scene: &Scene) -> Option<RECT> {
+        let p = self.prompt.as_ref()?;
+        let s = self.s;
+        let m = scene.margin() + ((30.0 + prompt::RISE) * s) as i32;
+        let r = p.lay.panel;
+        Some(clip(RECT { left: (r.x * s) as i32 - m, top: (r.y * s) as i32 - m, right: (r.right() * s).ceil() as i32 + m, bottom: (r.bottom() * s).ceil() as i32 + m }, scene.w, scene.h))
+    }
+
+    /// Alpha of the veil over the desktop while the prompt / the context menu is up (0 without one).
+    pub fn scrim(&self) -> f32 {
+        self.prompt.as_ref().map_or(0.0, |p| p.scrim()).max(self.menu.as_ref().map_or(0.0, |m| m.scrim()))
+    }
+
+    // ------------------------------------------------ the context menu
+
+    /// Canvas px rectangle of the menu panels with their shadow margin (for dirty tracking).
+    pub fn menu_dirty(&self, scene: &Scene) -> Option<RECT> {
+        let b = self.menu.as_ref()?.bounds();
+        let s = self.s;
+        let m = scene.margin() + (30.0 * s) as i32;
+        Some(clip(RECT { left: (b.x * s) as i32 - m, top: (b.y * s) as i32 - m, right: (b.right() * s).ceil() as i32 + m, bottom: (b.bottom() * s).ceil() as i32 + m }, scene.w, scene.h))
+    }
+
+    /// Show the menu `entries` at `anchor` (logical px on the canvas) inside `work`. Call `sync_panels` after.
+    pub fn open_menu(&mut self, scene: &Scene, gfx: &Gfx, entries: Vec<Entry>, anchor: (f32, f32), work: Rect) {
+        let now = Now::local();
+        let m = scene.with_ui_cx(gfx, mat(1.0, 0.0, 0.0), self.lang, &now, |cx| {
+            let w = |s: &str| cx.measure(s, MENU_FONT, 4096.0).0;
+            MenuPanel::new(entries, anchor, work, &w)
+        });
+        self.menu = Some(m);
+    }
+
+    /// One panel of the menu: the glass layer, then the rows. `alpha` fades the whole panel; it grows from `level.origin` while it fades in.
+    fn draw_menu_level(&self, m: &MenuPanel, lvl: usize, slot: usize, alpha: f32, scene: &Scene, gfx: &Gfx, now: &Now) {
+        let Some(level) = (if lvl == 0 { Some(&m.root) } else { m.sub.as_ref().map(|(_, l)| l) }) else { return };
+        let s = self.s;
+        let k = 0.94 + 0.06 * alpha;
+        let (ox, oy) = (level.origin.0 * s, level.origin.1 * s);
+        let xf = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: ox - k * ox, M32: oy - k * oy };
+        scene.draw_panel(gfx, slot, alpha, Some(xf));
+        let layer = self.push_alpha(gfx, alpha);
+        scene.with_ui_cx(gfx, mul(&mat(s, 0.0, 0.0), &xf), self.lang, now, |cx| {
+            let entries: &[Entry] = if lvl == 0 { &m.entries } else { m.sub.as_ref().and_then(|(i, _)| m.item_at(0, *i)).map_or(&[][..], |it| &it.children[..]) };
+            for (i, e) in entries.iter().enumerate() {
+                let r = level.rows[i];
+                let Entry::Item(it) = e else {
+                    cx.hr(r.inset_xy(PAD_SEP, 0.0));
+                    continue;
+                };
+                if it.enabled && m.hot[lvl] == Some(i) {
+                    let down = m.press == Some((lvl, i));
+                    cx.rrect(r, menu::PILL_R, Color::rgba(1.0, 1.0, 1.0, if down { 0.20 } else { 0.13 }));
+                }
+                let c = if !it.enabled { Color::rgba(1.0, 1.0, 1.0, 0.34) } else if it.destructive { RED } else { TEXT };
+                let tx = r.x + menu::ROW_PAD_X + if level.check { menu::CHECK_W } else { 0.0 };
+                let tr = Rect::new(tx, r.y, r.right() - menu::ROW_PAD_X - tx - if level.arrow { 14.0 } else { 0.0 }, r.h);
+                cx.text(tr, &it.label, MENU_FONT.ellipsis(), c);
+                if it.checked {
+                    cx.icon(Glyph::Check, Rect::new(r.x + menu::ROW_PAD_X - 2.0, r.cy() - 7.0, 14.0, 14.0), c);
+                }
+                if it.has_sub() {
+                    cx.icon(Glyph::ChevR, Rect::new(r.right() - menu::ROW_PAD_X - 8.0, r.cy() - 6.0, 12.0, 12.0), if it.enabled { DIM } else { c });
+                }
+            }
+        });
+        if layer {
+            unsafe { gfx.dc.PopLayer() };
+        }
+    }
+
+    fn draw_menu(&self, m: &MenuPanel, scene: &Scene, gfx: &Gfx, now: &Now) {
+        let a = m.eased();
+        self.draw_menu_level(m, 0, SLOT_MENU, a, scene, gfx, now);
+        if m.sub.is_some() {
+            self.draw_menu_level(m, 1, SLOT_SUB, m.sub_eased(), scene, gfx, now);
+        }
+    }
+
+    /// Run `f` with the text-width closure of the prompt's field: the body font, logical px, trailing spaces count.
+    pub fn with_measure<R>(&self, scene: &Scene, gfx: &Gfx, f: impl FnOnce(prompt::Measure) -> R) -> R {
+        let now = Now::local();
+        scene.with_ui_cx(gfx, mat(1.0, 0.0, 0.0), self.lang, &now, |cx| {
+            let bar = cx.measure("|", Style::BODY, 4096.0).0;
+            let w = |s: &[char]| -> f32 {
+                let t: String = s.iter().collect();
+                cx.measure(&format!("{t}|"), Style::BODY, 4096.0).0 - bar
+            };
+            f(&w)
+        })
+    }
+
+    /// Show the prompt `o` next to `anchor` (logical px on the canvas) inside `work` (the work area, logical px). Call `sync_panels` after.
+    pub fn open_prompt(&mut self, scene: &Scene, gfx: &Gfx, o: &PromptOpts, anchor: (f32, f32), work: Rect) {
+        let tx = input::texts(o.lang, o.multiline, &o.ok_label);
+        let now = Now::local();
+        let (ok_w, cancel_w) = scene.with_ui_cx(gfx, mat(1.0, 0.0, 0.0), o.lang, &now, |cx| {
+            let bw = |s: &str| (cx.measure(s, Style::new(13.0, 600), 4096.0).0 + 36.0).ceil();
+            (bw(&tx.ok), bw(tx.cancel))
+        });
+        let mut p = PromptPanel::new(o, ok_w, cancel_w, anchor, work);
+        self.with_measure(scene, gfx, |w| p.reveal(w));
+        self.prompt = Some(p);
+        self.caret_on = true;
+    }
+
+    /// A key for the prompt (nothing without one).
+    pub fn prompt_key(&mut self, scene: &Scene, gfx: &Gfx, k: Key, m: Mods) -> Act {
+        let Some(mut p) = self.prompt.take() else { return Act::None };
+        let a = self.with_measure(scene, gfx, |w| p.key(k, m, w));
+        self.prompt = Some(p);
+        a
+    }
+
+    /// Mouse for the prompt, logical px: `kind` 0 = move, 1 = left down (`double`: a double click), 2 = left up.
+    pub fn prompt_mouse(&mut self, scene: &Scene, gfx: &Gfx, kind: u8, x: f32, y: f32, m: Mods, double: bool) -> Act {
+        let Some(mut p) = self.prompt.take() else { return Act::None };
+        let a = self.with_measure(scene, gfx, |w| match kind {
+            0 => p.mouse_move(x, y, w),
+            1 => p.mouse_down(x, y, m, double, w),
+            _ => p.mouse_up(x, y),
+        });
+        self.prompt = Some(p);
+        a
+    }
+
+    /// Wheel over the prompt's field; true when the text scrolled.
+    pub fn prompt_wheel(&mut self, scene: &Scene, gfx: &Gfx, notches: f32) -> bool {
+        let Some(mut p) = self.prompt.take() else { return false };
+        let moved = self.with_measure(scene, gfx, |w| p.wheel(notches, w));
+        self.prompt = Some(p);
+        moved
+    }
+
+    fn draw_prompt(&self, p: &PromptPanel, scene: &Scene, gfx: &Gfx, now: &Now) {
+        let a = p.eased();
+        // the panel glides up a few px while it fades in (and back down while it fades out)
+        let xf = Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: (1.0 - a) * prompt::RISE * self.s };
+        let to_canvas = mul(&mat(self.s, 0.0, 0.0), &xf);
+        scene.draw_panel(gfx, SLOT_PROMPT, a, Some(xf));
+        let layer = self.push_alpha(gfx, a);
+        scene.with_ui_cx(gfx, to_canvas, self.lang, now, |cx| {
+            let l = &p.lay;
+            cx.text(l.title, &p.title, Style::new(15.0, 600).ellipsis(), TEXT);
+            // the field: a soft white well, no ring (a white outline + halo looked like a web form); focus = a lighter well and the caret
+            let focus = p.focus == Focus::Field;
+            cx.rrect(l.well, 12.0, Color::rgba(1.0, 1.0, 1.0, if focus { 0.18 } else { 0.11 }));
+            cx.rrect_stroke(l.well, 12.0, 1.0, Color::rgba(1.0, 1.0, 1.0, if focus { 0.10 } else { 0.06 }));
+            self.draw_field(cx, p, focus);
+            cx.text(l.hint, &p.hint, Style::new(11.5, 400).ellipsis(), FAINT);
+            // Cancel = a quiet white layer, Done = the white glass pill of the panels; hover lightens, press darkens, the keyboard ring is white
+            let btn = |r: Rect, label: &str, f: Focus| {
+                let hot = p.hover == Some(f);
+                let down = p.press == Some(f) && hot;
+                if f == Focus::Ok {
+                    done_button(cx, r, label, hot);
+                    if down {
+                        cx.pill(r, Color::rgba(0.0, 0.0, 0.0, 0.14));
+                    }
+                } else {
+                    cx.pill(r, Color::rgba(1.0, 1.0, 1.0, if down { 0.08 } else if hot { 0.20 } else { 0.12 }));
+                    cx.text(r, label, Style::new(13.0, 600).center(), TEXT);
+                }
+                if p.ring && p.focus == f {
+                    cx.rrect_stroke(r.inset(-2.5), r.h / 2.0 + 2.5, 1.5, Color::rgba(1.0, 1.0, 1.0, 0.90));
+                }
+            };
+            btn(l.cancel, &p.cancel, Focus::Cancel);
+            btn(l.ok, &p.ok, Focus::Ok);
+        });
+        if layer {
+            unsafe { gfx.dc.PopLayer() };
+        }
+    }
+
+    /// The text of the prompt: placeholder, wrapped lines, selection highlight, caret.
+    fn draw_field(&self, cx: &Cx, p: &PromptPanel, focus: bool) {
+        let t = p.lay.text;
+        let bar = cx.measure("|", Style::BODY, 4096.0).0;
+        let w = |s: &[char]| -> f32 {
+            let t: String = s.iter().collect();
+            cx.measure(&format!("{t}|"), Style::BODY, 4096.0).0 - bar
+        };
+        let chars = &p.f.chars;
+        let lines = p.lines(&w);
+        let sel = p.f.sel();
+        let hl = Color::rgba(1.0, 1.0, 1.0, 0.30);
+        let (caret_on, line_h) = (focus && self.caret_on && sel.is_none(), prompt::LINE_H);
+        cx.clip(t);
+        if chars.is_empty() {
+            let r = if p.multiline { Rect::new(t.x, t.y, t.w, line_h) } else { t };
+            cx.text(r, &p.placeholder, Style::BODY.ellipsis(), DIM);
+        }
+        if p.multiline {
+            for (i, l) in lines.iter().enumerate() {
+                let y = t.y + i as f32 * line_h - p.scroll;
+                if y + line_h < t.y || y > t.bottom() {
+                    continue;
+                }
+                if let Some((a, b)) = sel {
+                    let (lo, hi) = (a.max(l.start), b.min(l.end));
+                    // a selection that runs over the line break shows a little tail after the line
+                    let tail = if a <= l.end && b > l.end && l.end < chars.len() && chars[l.end] == '\n' { 5.0 } else { 0.0 };
+                    if lo < hi || tail > 0.0 {
+                        let lo = lo.clamp(l.start, l.end);
+                        let hi = hi.clamp(lo, l.end);
+                        let (x0, x1) = (w(&chars[l.start..lo]), w(&chars[l.start..hi]));
+                        cx.rrect(Rect::new(t.x + x0 - 1.0, y + 1.0, x1 - x0 + tail + 2.0, line_h - 2.0), 4.0, hl);
+                    }
+                }
+                let s: String = chars[l.start..l.end].iter().collect();
+                cx.text(Rect::new(t.x, y, 4096.0, line_h), &s, Style::BODY, TEXT);
+            }
+            if caret_on {
+                let (li, x) = p.f.caret_x(&lines, &w);
+                let y = t.y + li as f32 * line_h - p.scroll;
+                cx.line((t.x + x, y + 3.0), (t.x + x, y + line_h - 3.0), 1.3, TEXT);
+            }
+        } else {
+            if let Some((a, b)) = sel {
+                let (x0, x1) = (w(&chars[..a]), w(&chars[..b]));
+                cx.rrect(Rect::new(t.x - p.scroll + x0 - 1.0, t.cy() - 9.0, x1 - x0 + 2.0, 18.0), 4.0, hl);
+            }
+            if !chars.is_empty() {
+                let s: String = chars.iter().collect();
+                cx.text(Rect::new(t.x - p.scroll, t.y, 4096.0, t.h), &s, Style::BODY, TEXT);
+            }
+            if caret_on {
+                let x = t.x - p.scroll + w(&chars[..p.f.caret.min(chars.len())]);
+                cx.line((x, t.cy() - 8.0), (x, t.cy() + 8.0), 1.3, TEXT);
+            }
+        }
+        cx.pop_clip();
     }
 
     // ------------------------------------------------ drawing
@@ -1228,8 +1949,9 @@ impl Ui {
     pub fn draw_pre(&self, gfx: &Gfx, clip_px: RECT) {
         let dc = &gfx.dc;
         unsafe {
-            if self.dim > 0.002 {
-                if let Ok(b) = dc.CreateSolidColorBrush(&col(0.0, 0.0, 0.0, self.dim), None) {
+            let dim = self.dim.max(self.scrim());
+            if dim > 0.002 {
+                if let Ok(b) = dc.CreateSolidColorBrush(&col(0.0, 0.0, 0.0, dim), None) {
                     dc.FillRectangle(&rf(clip_px.left as f32, clip_px.top as f32, clip_px.right as f32, clip_px.bottom as f32), &b);
                 }
             }
@@ -1278,8 +2000,20 @@ impl Ui {
                 self.draw_gallery(scene, gfx, now);
             }
         }
+        if let Some(p) = &self.prompt {
+            if hits(p.lay.panel, 40.0 * s) {
+                self.draw_prompt(p, scene, gfx, now);
+            }
+        }
+        if let Some(m) = &self.menu {
+            if hits(m.bounds(), 40.0 * s) {
+                self.draw_menu(m, scene, gfx, now);
+            }
+        }
         if let Some(t) = &self.toast {
-            scene.with_ui_cx(gfx, base, self.lang, now, |cx| {
+            // rises 8 px while it fades in, fades out in place (`toast_step` moves the numbers)
+            let layer = self.push_alpha(gfx, self.toast_a);
+            scene.with_ui_cx(gfx, mat(s, 0.0, self.toast_rise * s), self.lang, now, |cx| {
                 let (tw, _) = cx.measure(t, Style::new(13.0, 500), 600.0);
                 let r = Rect::new((self.mw - tw - 36.0) / 2.0, self.mh * 0.5 - 18.0, tw + 36.0, 36.0);
                 cx.rrect(r.offset(0.0, 3.0), 18.0, Color::rgba(0.0, 0.0, 0.0, 0.18));
@@ -1287,6 +2021,9 @@ impl Ui {
                 cx.rrect_stroke(r, 18.0, 0.8, Color::rgba(1.0, 1.0, 1.0, 0.18));
                 cx.text(r, t, Style::new(13.0, 500).center(), TEXT);
             });
+            if layer {
+                unsafe { gfx.dc.PopLayer() };
+            }
         }
     }
 
@@ -1314,6 +2051,37 @@ impl Ui {
             }
             cx.text(c, txt, Style::new(11.5, 600).center(), if *on { ON_WHITE } else { TEXT });
         }
+    }
+
+    /// A segmented control of the settings panel: the white pill sits at `pos` (in segments, it slides), the labels darken as it passes
+    /// under them, `hov(i)` is the hover amount of segment i.
+    fn seg_anim(&self, cx: &Cx, r: Rect, labels: &[&str], pad: f32, pos: f32, hov: impl Fn(usize) -> f32) {
+        cx.pill(r, FILL);
+        let n = labels.len().max(1) as f32;
+        let cw = (r.w - 2.0 * pad) / n;
+        let cell = |i: f32| Rect::new(r.x + pad + cw * i, r.y + pad, cw, r.h - 2.0 * pad);
+        let near = |i: usize| (1.0 - (pos - i as f32).abs()).clamp(0.0, 1.0);
+        for i in 0..labels.len() {
+            let h = hov(i) * (1.0 - near(i));
+            if h > 0.001 {
+                cx.pill(cell(i as f32), Color::rgba(1.0, 1.0, 1.0, 0.13 * h));
+            }
+        }
+        let p = cell(pos.clamp(0.0, n - 1.0));
+        cx.pill(p.offset(0.0, 1.0), Color::rgba(0.0, 0.0, 0.0, 0.18));
+        cx.pill(p, Color::rgba(1.0, 1.0, 1.0, 0.92));
+        let st = Style::new(11.5, 600).center();
+        for (i, txt) in labels.iter().enumerate() {
+            cx.text(cell(i as f32), txt, st, TEXT);
+        }
+        // the part of a label the pill is over turns dark with it
+        cx.with_clip_round(p, p.h / 2.0, |cx| {
+            for (i, txt) in labels.iter().enumerate() {
+                if near(i) > 0.0 {
+                    cx.text(cell(i as f32), txt, st, ON_WHITE);
+                }
+            }
+        });
     }
 
     /// Open / close transform of the gallery and the strip: slide up 26 px, scale .97 -> 1 about the bottom-left corner.
@@ -1372,42 +2140,72 @@ impl Ui {
         }
     }
 
-    /// The glass slider of the strip, restyled for the settings rows: track, fill, base-look tick and a knob that grows under the pointer.
-    fn set_slider(&self, cx: &Cx, r: &SliderRow, v: f32, def: f32, hot: bool, down: bool, focus: bool) {
+    /// The glass slider of the strip, restyled for the settings rows: track, fill, base-look tick and a knob that swells under the pointer
+    /// (hover and press are eased, the handle glides to a value set by a click, Reset or the keyboard and follows a drag 1:1).
+    fn set_slider(&self, cx: &Cx, r: &SliderRow, i: usize) {
         let t = r.track;
-        if focus {
+        let (h, p) = (self.sa.hov.get(i), self.sa.press(i));
+        let v = self.slider_shown(i);
+        if self.sfocus == Some(i) {
             cx.rrect(r.row.inset_xy(-8.0, 1.0), 8.0, Color::rgba(1.0, 1.0, 1.0, 0.07));
         }
         cx.pill(t, FILL);
-        cx.pill(Rect::new(t.x, t.y, (t.w * v).max(4.0), t.h), Color::rgba(1.0, 1.0, 1.0, if hot || down { 0.70 } else { 0.55 }));
-        let dx = t.x + t.w * def;
+        cx.pill(Rect::new(t.x, t.y, (t.w * v).max(4.0), t.h), Color::rgba(1.0, 1.0, 1.0, 0.55 + 0.15 * h));
+        let dx = t.x + t.w * self.set_default_pos(i);
         cx.line((dx, t.cy() + 5.0), (dx, t.cy() + 8.0), 1.2, FAINT);
         let kx = t.x + t.w * v;
-        let kr = if down { 9.0 } else if hot { 8.6 } else { 8.0 };
-        if down {
-            cx.circle_stroke((kx, t.cy()), kr + 3.0, 3.0, Color::rgba(1.0, 1.0, 1.0, 0.20));
+        let kr = 8.0 + 0.6 * h + 0.4 * p;
+        if p > 0.01 {
+            cx.circle_stroke((kx, t.cy()), kr + 3.0, 3.0, Color::rgba(1.0, 1.0, 1.0, 0.20 * p));
         }
         cx.circle((kx, t.cy() + 1.5), kr + 1.0, Color::rgba(0.0, 0.0, 0.0, 0.25));
         cx.circle((kx, t.cy()), kr, Color::rgba(1.0, 1.0, 1.0, 0.97));
-        if focus {
+        if self.sfocus == Some(i) {
             cx.circle_stroke((kx, t.cy()), kr + 3.5, 2.0, Color::rgba(1.0, 1.0, 1.0, 0.70));
         }
     }
 
-    /// A label with an on / off switch on the right.
-    fn set_switch(&self, cx: &Cx, row: Rect, sw: Rect, label: &str, on: bool, hot: bool) {
+    /// A label with an on / off switch on the right: the fill cross-fades and the knob glides (`pos` 0..1), and it stretches while pressed.
+    fn set_switch(&self, cx: &Cx, row: Rect, sw: Rect, label: &str, key: usize, pos: f32) {
         cx.text(Rect::new(row.x, row.y, row.w - 52.0, row.h), label, Style::new(12.5, 500).ellipsis(), TEXT);
+        let (h, p, e) = (self.sa.hov.get(key), self.sa.press(key), motion::smooth(pos));
         let sw = sw.centered(40.0, 24.0);
-        cx.pill(sw, if on { Color::rgb8(52, 199, 89) } else if hot { Color::rgba(1.0, 1.0, 1.0, 0.26) } else { FILL });
-        let kx = if on { sw.right() - 12.0 } else { sw.x + 12.0 };
-        cx.circle((kx, sw.cy() + 1.2), 10.0, Color::rgba(0.0, 0.0, 0.0, 0.22));
-        cx.circle((kx, sw.cy()), 9.5, Color::rgba(1.0, 1.0, 1.0, 0.98));
+        cx.pill(sw, FILL.mix(Color::rgba(1.0, 1.0, 1.0, 0.26), h).mix(Color::rgb8(52, 199, 89), e));
+        let (lx, rx) = (sw.x + 12.0, sw.right() - 12.0);
+        let ext = 4.0 * p; // grows towards the middle of the switch
+        let kr = Rect::new(lx + (rx - lx) * e - 9.5 - ext * e, sw.cy() - 9.5, 19.0 + ext, 19.0);
+        cx.rrect(kr.inset(-0.5).offset(0.0, 1.2), 10.0, Color::rgba(0.0, 0.0, 0.0, 0.22));
+        cx.rrect(kr, 9.5, Color::rgba(1.0, 1.0, 1.0, 0.98));
     }
 
-    fn set_button(&self, cx: &Cx, r: Rect, label: &str, hot: bool, down: bool, color: Color) {
-        let a = if down { 0.34 } else if hot { 0.27 } else { 0.18 };
-        cx.pill(r, Color::rgba(1.0, 1.0, 1.0, a));
-        cx.text(r, label, Style::new(12.5, 600).center().ellipsis(), color);
+    /// A button of the settings panel: the white layer lightens on hover and press, the button shrinks to `PRESS_BTN` on a spring.
+    fn set_button(&self, cx: &Cx, r: Rect, label: &str, key: usize, enabled: bool, color: Color) {
+        let h = if enabled { self.sa.hov.get(key) } else { 0.0 };
+        let p = if enabled { self.sa.press(key) } else { 0.0 };
+        let x = if enabled { self.sa.prs.get(key).map_or(1.0, |b| b.x) } else { 1.0 };
+        cx.scaled((r.cx(), r.cy()), x, |cx| {
+            cx.pill(r, Color::rgba(1.0, 1.0, 1.0, 0.18 + 0.09 * h + 0.07 * p));
+            cx.text(r, label, Style::new(12.5, 600).center().ellipsis(), color);
+        });
+    }
+
+    /// The update status line: the old text fades out while the new one fades in when the kind of status changes.
+    fn draw_upd_status(&self, cx: &Cx, r: Rect) {
+        let st = Style::new(12.0, 500).ellipsis();
+        if upd_key(&self.update) != self.sa.st_key {
+            // the change has not been stepped yet: keep the old line for this frame
+            let (m, c) = &self.sa.st_last;
+            return cx.text(r, m, st, *c);
+        }
+        let (msg, color) = self.upd_line();
+        let k = motion::smooth(self.sa.st_t);
+        match &self.sa.st_prev {
+            Some((pm, pc)) if k < 1.0 => {
+                cx.text(r, pm, st, pc.fade(1.0 - k));
+                cx.text(r, &msg, st, color.fade(k));
+            }
+            _ => cx.text(r, &msg, st, color),
+        }
     }
 
     fn draw_settings(&self, scene: &Scene, gfx: &Gfx, now: &Now) {
@@ -1417,8 +2215,6 @@ impl Ui {
         scene.draw_panel(gfx, SLOT_GALLERY, a, Some(xf));
         let layer = self.push_alpha(gfx, a);
         let l = self.set_lay();
-        let (hv, pr) = (self.hover, self.press);
-        let look_at = |h: Hit, i: usize| matches!(h, Hit::Look(j, _) if j == i);
         scene.with_ui_cx(gfx, to_canvas, self.lang, now, |cx| {
             cx.text(l.title, self.t("Настройки", "Settings"), Style::new(15.0, 600), TEXT);
             cx.text(l.look_hdr, &self.t("Вид стекла", "Glass look").to_uppercase(), Style::LABEL.size(11.0), DIM);
@@ -1428,14 +2224,12 @@ impl Ui {
             // look sliders
             let names = [("Стекло", "Glass"), ("Размытие", "Blur"), ("Преломление", "Refraction"), ("Цветная кайма", "Chromatic fringe"), ("Насыщенность", "Saturation"), ("Яркость", "Brightness"), ("Матовость", "Frosting"), ("Блики", "Highlights"), ("Свечение", "Glow"), ("Скругление", "Corner roundness"), ("Размер карточек", "Card size")];
             for (i, r) in l.rows.iter().enumerate() {
-                let (hot, down) = (look_at(hv, i), look_at(pr, i));
                 let (ru, en) = names.get(i).copied().unwrap_or(("", ""));
                 cx.text(r.label, self.t(ru, en), Style::new(12.5, 500).ellipsis(), TEXT);
-                self.set_slider(cx, r, self.set_pos(i), self.set_default_pos(i), hot, down, self.sfocus == Some(i));
-                cx.text(r.value, &self.set_value_text(i), Style::new(11.5, 500).right().mono(), if hot || down { TEXT } else { DIM });
+                self.set_slider(cx, r, i);
+                cx.text(r.value, &self.set_value_text(i), Style::new(11.5, 500).right().mono(), DIM.mix(TEXT, self.sa.hov.get(i)));
             }
-            let hot = hv == Hit::ResetLook;
-            self.set_button(cx, l.reset, self.t("Сбросить вид", "Reset look"), hot, pr == Hit::ResetLook, TEXT);
+            self.set_button(cx, l.reset, self.t("Сбросить вид", "Reset look"), K_RESET, true, TEXT);
 
             // behaviour: segmented controls
             let labels: [(Opt, (&str, &str), [(&str, &str); 3]); 6] = [
@@ -1450,25 +2244,22 @@ impl Ui {
             for o in &l.opts {
                 let Some((_, (ru, en), opts)) = labels.iter().find(|x| x.0 == o.which) else { continue };
                 cx.text(o.label, self.t(ru, en), Style::new(12.5, 500).ellipsis(), TEXT);
-                let sel = self.opt_sel(o.which);
-                let items: Vec<(&str, bool)> = if o.which == Opt::Monitor {
-                    nums.iter().enumerate().map(|(k, n)| (n.as_str(), k == sel)).collect()
+                let items: Vec<&str> = if o.which == Opt::Monitor {
+                    nums.iter().map(|n| n.as_str()).collect()
                 } else {
-                    opts.iter().take(o.which.count()).enumerate().map(|(k, (r, e))| (self.t(r, e), k == sel)).collect()
+                    opts.iter().take(o.which.count()).map(|(r, e)| self.t(r, e)).collect()
                 };
-                let hot = if let Hit::Opt(w, k) = hv { (w == o.which).then_some(k) } else { None };
-                self.seg(cx, o.seg, &items, 2.0, hot);
+                let base = K_OPT + opt_idx(o.which) * MON_SEGS;
+                self.seg_anim(cx, o.seg, &items, 2.0, self.seg_shown(o.which), |k| self.sa.hov.get(base + k.min(MON_SEGS - 1)));
             }
 
             // start with Windows, check for updates on start: label + switch
-            let hot = hv == Hit::Autostart || pr == Hit::Autostart;
-            self.set_switch(cx, l.auto_row, l.auto_sw, self.t("Запускать с Windows", "Start with Windows"), self.autostart, hot);
-            let hot = hv == Hit::CheckStart || pr == Hit::CheckStart;
-            self.set_switch(cx, l.check_row, l.check_sw, self.t("Проверять обновления при запуске", "Check for updates on start"), self.check_start, hot);
+            self.set_switch(cx, l.auto_row, l.auto_sw, self.t("Запускать с Windows", "Start with Windows"), K_AUTO, self.sw_shown(0, self.autostart));
+            self.set_switch(cx, l.check_row, l.check_sw, self.t("Проверять обновления при запуске", "Check for updates on start"), K_CHECK, self.sw_shown(1, self.check_start));
 
             // buttons
-            self.set_button(cx, l.edit_btn, self.t("Изменить виджеты", "Edit widgets"), hv == Hit::EditBtn, pr == Hit::EditBtn, TEXT);
-            self.set_button(cx, l.quit_btn, self.t("Выйти", "Quit"), hv == Hit::QuitBtn, pr == Hit::QuitBtn, Color::rgb8(255, 105, 97));
+            self.set_button(cx, l.edit_btn, self.t("Изменить виджеты", "Edit widgets"), K_EDIT, true, TEXT);
+            self.set_button(cx, l.quit_btn, self.t("Выйти", "Quit"), K_QUIT, true, Color::rgb8(255, 105, 97));
 
             // shortcuts
             let k = Style::new(11.0, 400);
@@ -1491,24 +2282,20 @@ impl Ui {
             // footer
             cx.rect(l.foot, FILL);
             let busy = matches!(self.update, UpdateState::Checking | UpdateState::Downloading(_) | UpdateState::Verifying);
-            self.set_button(cx, l.upd_btn, self.t("Проверить обновления", "Check for updates"), hv == Hit::UpdBtn && !busy, pr == Hit::UpdBtn && !busy, if busy { DIM } else { TEXT });
-            let (msg, color) = match &self.update {
-                UpdateState::Idle => (format!("{} {}", self.t("Версия", "Version"), env!("CARGO_PKG_VERSION")), FAINT),
-                UpdateState::Checking => (self.t("Проверка…", "Checking…").to_string(), DIM),
-                UpdateState::Latest => (self.t("У вас последняя версия", "You have the latest version").to_string(), Color::rgb8(52, 199, 89)),
-                UpdateState::Available { error: Some(e), .. } => (if self.lang == Lang::Ru { format!("Не удалось обновить: {e}") } else { format!("Update failed: {e}") }, ORANGE),
-                UpdateState::Available { version, .. } => (if self.lang == Lang::Ru { format!("Доступна версия {version}") } else { format!("Version {version} is available") }, TEXT),
-                UpdateState::Downloading(p) => (if self.lang == Lang::Ru { format!("Загрузка обновления… {p}%") } else { format!("Downloading the update… {p}%") }, TEXT),
-                UpdateState::Verifying => (self.t("Проверка контрольной суммы…", "Verifying the checksum…").to_string(), TEXT),
-                UpdateState::Failed => (self.t("Не удалось проверить", "Could not check").to_string(), ORANGE),
-            };
-            cx.text(l.upd_status, &msg, Style::new(12.0, 500).ellipsis(), color);
-            if matches!(self.update, UpdateState::Available { .. }) {
-                self.set_button(cx, l.upd_page, self.t("О релизе", "Release page"), hv == Hit::UpdPage, pr == Hit::UpdPage, DIM);
-                self.set_button(cx, l.upd_dl, self.t("Обновить", "Update now"), hv == Hit::UpdInstall, pr == Hit::UpdInstall, TEXT);
+            self.set_button(cx, l.upd_btn, self.t("Проверить обновления", "Check for updates"), K_UPD, !busy, if busy { DIM } else { TEXT });
+            self.draw_upd_status(cx, l.upd_status);
+            // "Release page" / "Update now" fade in with an available update (and out again)
+            let ba = motion::smooth(self.sa.btns);
+            if ba > 0.0 {
+                let layer = self.push_alpha(gfx, ba);
+                self.set_button(cx, l.upd_page, self.t("О релизе", "Release page"), K_PAGE, true, DIM);
+                self.set_button(cx, l.upd_dl, self.t("Обновить", "Update now"), K_DL, true, TEXT);
+                if layer {
+                    unsafe { gfx.dc.PopLayer() };
+                }
             }
-            let hot = hv == Hit::Done || pr == Hit::Done;
-            done_button(cx, l.done, self.t("Готово", "Done"), hot);
+            let (h, x) = (self.sa.hov.get(K_DONE), self.sa.prs.get(K_DONE).map_or(1.0, |b| b.x));
+            cx.scaled((l.done.cx(), l.done.cy()), x, |cx| done_button_k(cx, l.done, self.t("Готово", "Done"), h));
         });
         if layer {
             unsafe { gfx.dc.PopLayer() };
@@ -1601,6 +2388,8 @@ impl Ui {
                 }
                 let Some((def, _)) = self.item(it.k) else { continue };
                 let hot = self.hover == Hit::Item(it.k);
+                // a new list (group, size, search) fades in tile by tile
+                cx.with_opacity(self.tile_alpha(it.k), |cx| {
                 if let Some(pv) = self.pv.get(&(def.type_id, it.size)) {
                     // the preview frame is in physical px at scale s*K: draw it 1:1 in logical space (scale 1/s) at the card origin minus the shadow margin
                     let mg = MARGIN * K;
@@ -1623,6 +2412,7 @@ impl Ui {
                 cx.clip(it.desc);
                 cx.text(it.desc, self.t(def.desc.0, def.desc.1), Style::new(11.5, 400).center().wrap(), DIM);
                 cx.pop_clip();
+                });
             }
             cx.pop_clip();
 
@@ -1918,6 +2708,211 @@ mod tests {
         assert!(!ui.wheel(500.0, 400.0, 1.0));
     }
 
+    /// Steps the settings motion until it stops asking for the timer; returns (steps, repainted rectangles).
+    fn settle(ui: &mut Ui, reduced: bool) -> (usize, Vec<RECT>) {
+        let (mut n, mut rects) = (0, Vec::new());
+        while ui.sa_busy() {
+            rects.extend(ui.step_sa(0.016, reduced));
+            n += 1;
+            assert!(n < 200, "the settings motion never settles");
+        }
+        (n, rects)
+    }
+
+    fn settings_ui() -> Ui {
+        let mut ui = Ui::new(Lang::En, 1.0, 1600.0, 900.0);
+        ui.edit = true;
+        ui.settings = true;
+        ui.sa_reset();
+        ui
+    }
+
+    /// Hover ramps in and out, then nothing is busy; repaints stay inside the control, not the whole panel.
+    #[test]
+    fn settings_hover_ramps_settle_with_narrow_dirty_rects() {
+        let mut ui = settings_ui();
+        assert!(!ui.sa_busy(), "a freshly opened panel is idle");
+        let panel = ui.settings_rect();
+        let quit = ui.set_lay().quit_btn;
+        ui.hover = Hit::QuitBtn;
+        assert!(ui.sa_busy());
+        let (n, rects) = settle(&mut ui, false);
+        assert!((6..=12).contains(&n), "120 ms in: {n}");
+        assert_eq!(ui.sa.hov.get(K_QUIT), 1.0);
+        for r in &rects {
+            assert!(r.right - r.left < 200 && r.bottom - r.top < 80, "only the button repaints: {r:?}");
+            assert!(r.left as f32 >= quit.x - 12.0 && r.right as f32 <= quit.right() + 12.0 && r.right as f32 <= panel.right());
+        }
+        ui.hover = Hit::None;
+        let (n, _) = settle(&mut ui, false);
+        assert!((9..=14).contains(&n), "180 ms out: {n}");
+        assert!(!ui.sa_busy() && ui.step_sa(0.016, false).is_none(), "settled: no timer, no repaint");
+        // pressed: the spring shrinks the button, release lets it go (and it comes to rest exactly)
+        ui.press = Hit::QuitBtn;
+        ui.step_sa(0.016, false);
+        ui.step_sa(0.016, false);
+        assert!(ui.sa.prs[K_QUIT].x < 1.0);
+        ui.press = Hit::None;
+        settle(&mut ui, false);
+        assert_eq!(ui.sa.prs[K_QUIT].x, 1.0);
+    }
+
+    /// The selected-segment pill slides to the new option and the control stops asking for frames once it is there.
+    #[test]
+    fn settings_segment_pill_slides_to_the_option() {
+        let mut ui = settings_ui();
+        assert_eq!(ui.seg_shown(Opt::Appearance), 0.0);
+        ui.appearance = AppearancePref::Auto; // option 2
+        assert!(ui.sa_busy());
+        ui.step_sa(0.016, false);
+        let mid = ui.seg_shown(Opt::Appearance);
+        assert!(mid > 0.0 && mid < 2.0, "in between after one step: {mid}");
+        let (n, _) = settle(&mut ui, false);
+        assert!(n > 5 && n < 80, "{n}");
+        assert_eq!(ui.seg_shown(Opt::Appearance), 2.0);
+        // reduced motion: straight there
+        ui.appearance = AppearancePref::Dark;
+        let (n, _) = settle(&mut ui, true);
+        assert_eq!((n, ui.seg_shown(Opt::Appearance)), (1, 0.0));
+    }
+
+    /// Switch fill and knob glide in ~170 ms; a slider handle glides to a Reset / track click but a drag is 1:1.
+    #[test]
+    fn settings_switch_and_slider_glide_but_drag_is_1_to_1() {
+        let mut ui = settings_ui();
+        ui.autostart = true;
+        let (n, _) = settle(&mut ui, false);
+        assert!((9..=12).contains(&n), "170 ms: {n}");
+        assert_eq!(ui.sw_shown(0, true), 1.0);
+        // glass slider set by Reset / the keyboard: the handle trails the value
+        ui.glass = 0.9;
+        assert_eq!(ui.slider_shown(0), 0.5, "still at the old spot");
+        ui.step_sa(0.016, false);
+        let k = ui.slider_shown(0);
+        assert!(k > 0.5 && k < 0.9, "{k}");
+        settle(&mut ui, false);
+        assert_eq!(ui.slider_shown(0), 0.9);
+        // a click on the track far from the handle glides; moving the pointer makes it 1:1
+        ui.sa_drag_start(0, 100, 0.1);
+        ui.press = Hit::Look(0, 0.1);
+        ui.glass = 0.1;
+        ui.step_sa(0.016, false);
+        assert!(ui.slider_shown(0) > 0.1, "glides to the click");
+        ui.sa_drag_move(0, 101);
+        assert!(ui.slider_shown(0) > 0.1, "a 1 px wobble is not a drag");
+        ui.sa_drag_move(0, 120);
+        assert_eq!(ui.slider_shown(0), 0.1, "dragging: no lag");
+        ui.glass = 0.4;
+        assert_eq!(ui.slider_shown(0), 0.4);
+        ui.sa_drag_end();
+        ui.press = Hit::None;
+        assert_eq!(ui.slider_shown(0), 0.4, "the handle stays where the drag left it");
+        settle(&mut ui, false);
+        // pressed on the handle itself: 1:1 at once
+        ui.sa_drag_start(0, 500, ui.slider_shown(0));
+        assert!(ui.sa.snapped);
+    }
+
+    /// The status line cross-fades when its kind changes (not for every download percent), the update buttons fade in.
+    #[test]
+    fn settings_status_line_crossfades() {
+        let mut ui = settings_ui();
+        ui.update = UpdateState::Checking;
+        assert!(ui.sa_busy());
+        ui.step_sa(0.016, false);
+        assert!(ui.sa.st_t < 1.0 && ui.sa.st_prev.is_some());
+        settle(&mut ui, false);
+        assert!(ui.sa.st_prev.is_none() && ui.sa.st_t == 1.0);
+        ui.update = UpdateState::Downloading(10);
+        settle(&mut ui, false);
+        ui.update = UpdateState::Downloading(11);
+        assert!(!ui.sa_busy(), "a percent is a text change, not a fade");
+        ui.update = UpdateState::Available { version: "9.9.9".into(), url: String::new(), asset: None, error: None };
+        let (_, rects) = settle(&mut ui, false);
+        assert!(!rects.is_empty() && ui.sa.btns == 1.0);
+        ui.update = UpdateState::Latest;
+        settle(&mut ui, false);
+        assert_eq!(ui.sa.btns, 0.0);
+        // reduced motion: no fade at all
+        ui.update = UpdateState::Failed;
+        let (n, _) = settle(&mut ui, true);
+        assert!(n <= 1 && ui.sa.st_t == 1.0 && ui.sa.st_prev.is_none());
+    }
+
+    /// Gallery tiles fade in with a stagger when the list changes, not when the same list is asked for again; reduced motion shows them at once.
+    #[test]
+    fn gallery_tiles_fade_in_on_a_new_list() {
+        let mut ui = Ui::new(Lang::En, 1.0, 1600.0, 900.0);
+        ui.edit = true;
+        ui.gallery = true;
+        ui.gal_note(); // the first list: nothing to fade
+        assert!(!ui.gal_busy() && ui.tile_alpha(0) == 1.0);
+        ui.select_group(1);
+        ui.gal_note();
+        assert!(ui.gal_busy());
+        assert_eq!((ui.tile_alpha(0), ui.tile_alpha(5)), (0.0, 0.0));
+        let mut n = 0;
+        while ui.gal_busy() {
+            let r = ui.step_gal(0.016, false).expect("repaints the tile area");
+            assert!(r.bottom - r.top < 600, "only the grid, not the whole screen");
+            if n == 4 {
+                assert!(ui.tile_alpha(0) > ui.tile_alpha(3) && ui.tile_alpha(3) > ui.tile_alpha(9), "a stagger: the first tile leads");
+            }
+            n += 1;
+            assert!(n < 60);
+        }
+        assert!((20..=28).contains(&n), "380 ms: {n}");
+        assert_eq!(ui.tile_alpha(9), 1.0);
+        ui.gal_note(); // the same list again: no restart
+        assert!(!ui.gal_busy());
+        ui.select_group(0);
+        ui.gal_note();
+        assert!(ui.gal_busy());
+        assert!(ui.step_gal(0.016, true).is_some() && !ui.gal_busy() && ui.tile_alpha(9) == 1.0);
+    }
+
+    /// A toast rises while it fades in, fades out after its hold and is only dropped at the end of the fade; reduced motion is instant.
+    #[test]
+    fn toast_lifetime() {
+        let mut ui = Ui::new(Lang::En, 1.0, 1600.0, 900.0);
+        ui.toast_show("hi".into(), false);
+        assert!(ui.toast_busy(false) && ui.toast_a == 0.0 && ui.toast_rise == motion::TOAST_RISE);
+        let mut n = 0;
+        while ui.toast_busy(false) {
+            let (ch, gone) = ui.toast_step(0.016, false);
+            assert!(ch && !gone);
+            n += 1;
+            assert!(n < 30);
+        }
+        assert!((10..=12).contains(&n), "180 ms: {n}");
+        assert_eq!((ui.toast_a, ui.toast_rise), (1.0, 0.0));
+        assert!(!ui.toast_busy(false), "held: the timer stops");
+        // a new text while it is up does not rise again
+        ui.toast_show("again".into(), false);
+        assert_eq!((ui.toast_a, ui.toast_rise), (1.0, 0.0));
+        ui.toast_fade();
+        assert!(ui.toast_busy(false));
+        let mut n = 0;
+        loop {
+            let (_, gone) = ui.toast_step(0.016, false);
+            n += 1;
+            if gone {
+                break;
+            }
+            assert!(ui.toast.is_some(), "kept until the fade ended");
+            assert!(n < 30);
+        }
+        assert!((13..=15).contains(&n), "220 ms: {n}");
+        assert!(ui.toast.is_none() && !ui.toast_busy(false));
+        // reduced motion: shown at full opacity at once, gone on the first step after the hold
+        ui.toast_show("x".into(), true);
+        assert_eq!((ui.toast_a, ui.toast_rise), (1.0, 0.0));
+        assert!(!ui.toast_busy(true));
+        ui.toast_fade();
+        assert_eq!(ui.toast_step(0.016, true), (true, true));
+        assert!(ui.toast.is_none());
+    }
+
     /// Keyboard on the sliders: focus moves with wrap-around, Left / Right step 1 % (Shift 10 %), Home / End jump, Reset goes to the base look.
     #[test]
     fn slider_keys_move_focus_and_values() {
@@ -1994,6 +2989,143 @@ mod tests {
         ui.st.query.insert_str("zzzzzz_nothing");
         assert!(ui.shown().0.is_empty());
     }
+
+    /// The prompt on a real scene: it opens next to the anchor inside the work area, typing / Enter / Esc / a click outside go through the
+    /// same `Ui` entry points as the host, the frame shows the veil and the panel (and nothing of either without a prompt), and the
+    /// dirty rectangle covers it.
+    #[test]
+    fn prompt_opens_types_and_draws() {
+        use crate::backdrop::{Backdrop, PlainBackdrop};
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        let gfx = Gfx::new(None).unwrap();
+        let bd = PlainBackdrop::new(&gfx, 1000, 700).unwrap();
+        let env = SceneEnv { preview: true, hwnd: 0, lang: Lang::En, utc_off: 0 };
+        let mut scene = Scene::new(&gfx, 1000, 700, 1.0, 0.5, bd.bitmap(), &[], &env).unwrap();
+        let mut ui = Ui::new(Lang::En, 1.0, 1000.0, 700.0);
+        assert!(ui.dirty_rect(&scene).is_none() && ui.scrim() == 0.0);
+        let o = PromptOpts { title: "New reminder".into(), initial: String::new(), multiline: false, placeholder: "Remind me to…".into(), ok_label: String::new(), lang: Lang::En, anchor: None };
+        ui.open_prompt(&scene, &gfx, &o, (500.0, 300.0), Rect::new(0.0, 0.0, 1000.0, 660.0));
+        let lay = ui.prompt.as_ref().unwrap().lay;
+        assert!(lay.panel.contains(500.0, 400.0) && lay.panel.y > 300.0 && lay.panel.right() <= 992.0 && lay.panel.bottom() <= 652.0);
+        assert!(ui.dirty_rect(&scene).is_some_and(|d| d.left < lay.panel.x as i32 && d.right > lay.panel.right() as i32 && d.bottom > lay.panel.bottom() as i32));
+        // opening: the panel is still invisible, fully open it is on the frame together with the veil
+        let draw = |ui: &mut Ui, scene: &mut Scene| -> (u8, u8) {
+            ui.sync_panels(scene, &gfx);
+            let full = RECT { left: 0, top: 0, right: 1000, bottom: 700 };
+            let now = Now::sample();
+            scene.prepare(&gfx, full, &now).unwrap();
+            scene.begin(&gfx, full, Some(bd.bitmap()));
+            ui.draw_pre(&gfx, full);
+            scene.draw_cards(&gfx, full, &now);
+            ui.draw_post(scene, &gfx, &now, full);
+            scene.end(&gfx).unwrap();
+            let mut px = vec![0u8; 1000 * 700 * 4];
+            scene
+                .read_rect(&gfx, full, |y, row| {
+                    let o = y as usize * 4000;
+                    px[o..o + row.len()].copy_from_slice(row);
+                })
+                .unwrap();
+            let a = |x: usize, y: usize| px[(y * 1000 + x) * 4 + 3];
+            (a(5, 5), a(lay.panel.cx() as usize, (lay.panel.y + 4.0) as usize))
+        };
+        let base = draw(&mut ui, &mut scene); // the plain backdrop alone (the panel at 0 % draws nothing)
+        ui.prompt.as_mut().unwrap().t = 1.0;
+        let (veil, panel) = draw(&mut ui, &mut scene);
+        assert!(veil > base.0 && veil < base.0 + 40, "veil alpha {veil} over {}", base.0); // the 12 % veil: what catches the clicks outside the panel
+        assert!(panel > base.1 + 20, "panel alpha {panel} over {}", base.1);
+        // keys: type, Esc cancels, Enter confirms
+        for c in "buy milk".chars() {
+            assert_eq!(ui.prompt_key(&scene, &gfx, Key::Char(c), Mods::default()), Act::Redraw);
+        }
+        assert_eq!(ui.prompt.as_ref().unwrap().f.text(), "buy milk");
+        assert_eq!(ui.prompt_key(&scene, &gfx, Key::Enter, Mods::default()), Act::Done(Some("buy milk".into())));
+        assert_eq!(ui.prompt_key(&scene, &gfx, Key::Esc, Mods::default()), Act::Done(None));
+        // the mouse: a click on the text puts the caret there (measured with the real font), outside the panel cancels
+        let t = ui.prompt.as_ref().unwrap().lay.text;
+        assert_eq!(ui.prompt_mouse(&scene, &gfx, 1, t.x + 120.0, t.cy(), Mods::default(), false), Act::Redraw);
+        assert_eq!(ui.prompt.as_ref().unwrap().f.caret, 8);
+        ui.prompt_mouse(&scene, &gfx, 2, t.x, t.cy(), Mods::default(), false);
+        assert_eq!(ui.prompt_mouse(&scene, &gfx, 1, 3.0, 3.0, Mods::default(), false), Act::Done(None));
+        // closed again: no veil, no panel
+        ui.prompt = None;
+        assert_eq!(draw(&mut ui, &mut scene), base);
+        assert!(ui.dirty_rect(&scene).is_none());
+    }
+
+    /// The context menu on a real scene: it opens at the cursor with the real font widths inside the work area, the frame shows the faint
+    /// veil, the root panel and (after the click on "Size") the submenu panel, and nothing of it once closed; the dirty rectangle covers it.
+    #[test]
+    fn menu_opens_navigates_and_draws() {
+        use crate::backdrop::{Backdrop, PlainBackdrop};
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        let gfx = Gfx::new(None).unwrap();
+        let bd = PlainBackdrop::new(&gfx, 1000, 700).unwrap();
+        let env = SceneEnv { preview: true, hwnd: 0, lang: Lang::En, utc_off: 0 };
+        let mut scene = Scene::new(&gfx, 1000, 700, 1.0, 0.5, bd.bitmap(), &[], &env).unwrap();
+        let mut ui = Ui::new(Lang::En, 1.0, 1000.0, 700.0);
+        assert!(ui.dirty_rect(&scene).is_none() && ui.scrim() == 0.0);
+        let work = Rect::new(0.0, 0.0, 1000.0, 660.0);
+        ui.open_menu(&scene, &gfx, menu::card_menu(Lang::En, false, &Size::ALL, Size::M), (400.0, 300.0), work);
+        let root = ui.menu.as_ref().unwrap().root.clone();
+        assert_eq!((root.panel.x, root.panel.y), (400.0, 300.0));
+        assert!(root.panel.w > 150.0 && root.panel.w < 260.0, "{:?}", root.panel); // measured with the real font, not the 176 px floor of a short list
+        assert!(ui.scrim() > 0.0 && ui.scrim() < 0.05);
+        assert!(ui.dirty_rect(&scene).is_some_and(|d| d.left < 400 && d.right > root.panel.right() as i32 && d.bottom > root.panel.bottom() as i32));
+        let draw = |ui: &mut Ui, scene: &mut Scene| -> (u8, u8, u8) {
+            ui.sync_panels(scene, &gfx);
+            let full = RECT { left: 0, top: 0, right: 1000, bottom: 700 };
+            let now = Now::sample();
+            scene.prepare(&gfx, full, &now).unwrap();
+            scene.begin(&gfx, full, Some(bd.bitmap()));
+            ui.draw_pre(&gfx, full);
+            scene.draw_cards(&gfx, full, &now);
+            ui.draw_post(scene, &gfx, &now, full);
+            scene.end(&gfx).unwrap();
+            let mut px = vec![0u8; 1000 * 700 * 4];
+            scene
+                .read_rect(&gfx, full, |y, row| {
+                    let o = y as usize * 4000;
+                    px[o..o + row.len()].copy_from_slice(row);
+                })
+                .unwrap();
+            let a = |x: usize, y: usize| px[(y * 1000 + x) * 4 + 3];
+            let sub_probe = root.panel.right() as usize + 40;
+            (a(5, 5), a(root.panel.x as usize + 3, root.panel.cy() as usize), a(sub_probe, (root.rows[1].cy()) as usize))
+        };
+        let base = draw(&mut ui, &mut scene); // the veil only: the panel is still at 0 %
+        ui.menu.as_mut().unwrap().t = 1.0;
+        let (veil, panel, sub0) = draw(&mut ui, &mut scene);
+        assert!(sub0 <= veil + 2, "no submenu yet: {sub0}");
+        // a click on "Size" opens the submenu: a second glass panel next to it
+        let r = root.rows[1];
+        {
+            let m = ui.menu.as_mut().unwrap();
+            assert_eq!(m.mouse_down(r.cx(), r.cy()), menu::MAct::Layout);
+            m.sub_t = 1.0;
+        }
+        let (_, _, sub1) = draw(&mut ui, &mut scene);
+        assert!(sub1 > sub0 + 20, "submenu alpha {sub1} over {sub0}");
+        assert_eq!(scene.panels.iter().filter(|p| p.is_some()).count(), 2);
+        // keys and the mouse go through the model: Down walks, Esc closes, a click outside closes, a click on a size picks it
+        let sub = ui.menu.as_ref().unwrap().sub.as_ref().unwrap().1.clone();
+        assert_eq!(ui.menu.as_mut().unwrap().mouse_down(3.0, 3.0), menu::MAct::Close);
+        let m = ui.menu.as_mut().unwrap();
+        m.mouse_down(sub.rows[2].cx(), sub.rows[2].cy());
+        assert_eq!(m.mouse_up(sub.rows[2].cx(), sub.rows[2].cy()), menu::MAct::Pick(menu::CMD_SIZE + 2));
+        assert_eq!(m.key(Key::Esc), menu::MAct::Close);
+        // closed again: no veil, no panels, nothing dirty
+        ui.menu = None;
+        let gone = draw(&mut ui, &mut scene);
+        // the veil is faint but not zero (what catches the clicks outside the panels), the panel is far stronger than the veil
+        assert!(veil > gone.0 && veil < gone.0 + 20, "veil alpha {veil} over {}", gone.0);
+        assert!(panel > gone.1 + 20 && panel > base.1 + 20, "panel alpha {panel} over {}", gone.1);
+        assert!(ui.dirty_rect(&scene).is_none() && scene.panels.iter().all(|p| p.is_none()));
+    }
 }
 
 // ---------------------------------------------------------------- --dump-ui
@@ -2023,7 +3155,7 @@ pub struct DumpArgs {
     pub monitors: Option<(usize, usize)>,
 }
 
-/// `--dump-ui`: compose the host UI of a state (live | edit | gallery | menu) headless into a PNG with the SAME scene / UI code as the live host:
+/// `--dump-ui`: compose the host UI of a state (live | edit | gallery | settings | prompt | prompt-multi | menu) headless into a PNG with the SAME scene / UI code as the live host:
 /// cards at their cells, jiggle at a fixed phase, "−" buttons, the dim, the settings strip, the gallery with its live previews.
 pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
     use crate::backdrop::{Backdrop, FileBackdrop, PlainBackdrop};
@@ -2127,13 +3259,62 @@ pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
     if ui.settings && a.hover.is_some_and(|k| k >= 100) {
         ui.press = ui.hover; // --hover 100+k: control k pressed
     }
+    if ui.settings {
+        // the hover / press look is drawn from the eased state: let it settle (a still render shows the end of the motion)
+        ui.sa_reset();
+        for _ in 0..40 {
+            ui.step_sa(0.03, false);
+        }
+        // `MSW_SA_MS=n`: a motion still instead: Appearance -> Auto, autostart off, Glass -> 90 % set `n` ms ago
+        if let Some(ms) = std::env::var("MSW_SA_MS").ok().and_then(|v| v.parse::<u32>().ok()) {
+            ui.appearance = AppearancePref::Auto;
+            ui.autostart = false;
+            ui.glass = 0.9;
+            for _ in 0..ms / 16 {
+                ui.step_sa(0.016, false);
+            }
+        }
+    }
     if edit && !ui.settings {
         for i in 0..scene.len() {
             scene.set_xf(i, Xf { rot: jiggle(i, 0.13), ..Xf::ID });
         }
     }
-    if a.state == "menu" && !scene.cards.is_empty() {
-        eprintln!("mswidgets: the context menu is a native popup (TrackPopupMenu): nothing to draw in --dump-ui, showing the desk");
+    if a.state.starts_with("menu") {
+        // `--state menu|menu-size|menu-one [--hover n]`: the context menu of the first card, opened on it (`menu-size`: with the Size submenu
+        // open, `menu-one`: a widget with one size, so "Size" is greyed); `--hover n` highlights root row n (submenu row n for `menu-size`)
+        let (anchor, sizes, cur) = match scene.cards.first() {
+            Some(c) => (((c.x as f32 + c.w as f32 * 0.5) / s, (c.y as f32 + c.h as f32 * 0.45) / s), registry::global().get(&c.type_id).map_or(Size::ALL.to_vec(), |d| d.sizes.to_vec()), c.size),
+            None => ((lw * 0.4, lh * 0.4), Size::ALL.to_vec(), Size::M),
+        };
+        let sizes = if a.state == "menu-one" { vec![cur] } else { sizes };
+        ui.open_menu(&scene, &gfx, menu::card_menu(env.lang, false, &sizes, cur), anchor, Rect::new(0.0, 0.0, lw, lh));
+        if let Some(m) = ui.menu.as_mut() {
+            (m.t, m.sub_t) = (1.0, 1.0);
+            if a.state == "menu-size" {
+                m.open_sub(1, false);
+                m.sub_t = 1.0;
+                m.hot[1] = Some(a.hover.unwrap_or(1));
+            } else {
+                m.hot[0] = Some(a.hover.unwrap_or(0));
+            }
+        }
+    }
+    if a.state.starts_with("prompt") {
+        // `--state prompt|prompt-multi [--search text] [--hover 1]`: the text prompt over the desk (`--search` = the text in the field, `--hover 1`
+        // selects its last word, else the caret sits at the end; no text = the empty field with its placeholder)
+        let multi = a.state == "prompt-multi";
+        let text = a.search.clone().unwrap_or_default();
+        let (title, hint) = if multi { (("Новая заметка", "New note"), ("Текст заметки…", "Write a note…")) } else { (("Новое напоминание", "New reminder"), ("Что напомнить?", "Remind me to…")) };
+        let o = PromptOpts { title: env.lang.pick(title.0, title.1).into(), initial: text.clone(), multiline: multi, placeholder: env.lang.pick(hint.0, hint.1).into(), ok_label: String::new(), lang: env.lang, anchor: None };
+        ui.open_prompt(&scene, &gfx, &o, (lw / 2.0, lh * 0.42), Rect::new(0.0, 0.0, lw, lh));
+        ui.st.focus = false;
+        if let Some(p) = ui.prompt.as_mut() {
+            p.t = 1.0;
+            if let (Some(1), Some(i)) = (a.hover, text.rfind(' ')) {
+                p.f.anchor = text[..=i].chars().count();
+            }
+        }
     }
     ui.sync_previews(&gfx, &now);
     ui.sync_panels(&mut scene, &gfx);

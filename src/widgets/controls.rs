@@ -8,6 +8,10 @@
 //!  * Drag a slider or turn the wheel over the card (2 % a notch; over the brightness row it changes brightness).
 //! All system calls run in `cx.spawn` workers; writes are coalesced (one in flight, the newest value follows). Preview = fixed sample.
 //! Preview-only settings (to check the other looks): `radios` (default true), `bri` (default true), `muted`, `armed` ("restart" | "shutdown").
+//! Motion: the slider knob / percent follow the real value on an exponential approach (the real `set_volume` is never delayed), the knob
+//! swells under the pointer, button plates ease in / out on hover and press, and a button whose look changes (a toggle, the armed
+//! "Click again") cross-fades: `draw` leaves it out for ~170 ms and `overlay` paints the old and the new look. `Tick::Fps(60)` only while
+//! something moves.
 use crate::registry::{Registry, WidgetDef};
 use crate::widget::*;
 use std::time::Instant;
@@ -105,6 +109,50 @@ impl Arm {
     }
     fn remaining(&self, now_ms: u64) -> u64 {
         ARM_MS.saturating_sub(now_ms.saturating_sub(self.at))
+    }
+}
+
+/// How one button looks, kept so that a change can cross-fade: fill, icon / text colour, glyph, the mute slash, the armed pill.
+#[derive(Clone, Copy, PartialEq)]
+struct BtnLook {
+    fill: Color,
+    ink: Color,
+    glyph: Glyph,
+    slash: bool,
+    armed: bool,
+}
+/// A change of look in flight (button id, the look it left, since when).
+struct Trans {
+    id: u8,
+    from: BtnLook,
+    t0: Instant,
+}
+const TRANS_T: f32 = 0.17;
+
+/// Eased slider values: the percent and the knob radius of the volume (0) and brightness (1) rows.
+#[derive(Default)]
+struct Mo {
+    /// the values were set to the real ones once (the first snapshot does not glide up from 0)
+    init: bool,
+    since: Option<Instant>,
+    shown: [f32; 2],
+    rad: [f32; 2],
+}
+impl Mo {
+    /// One step towards `goal` / `rad`; `fast` = being dragged (a short lag), `snap` = no motion (not ready yet, reduced motion). True while moving.
+    fn step(&mut self, dt: f32, snap: bool, goal: [f32; 2], rad: [f32; 2], fast: [bool; 2]) -> bool {
+        for i in 0..2 {
+            if snap {
+                (self.shown[i], self.rad[i]) = (goal[i], rad[i]);
+            } else {
+                self.shown[i] = crate::motion::follow(self.shown[i], goal[i], dt, if fast[i] { 0.03 } else { 0.06 }, 0.05);
+                self.rad[i] = crate::motion::follow(self.rad[i], rad[i], dt, 0.05, 0.01);
+            }
+        }
+        self.moving(goal, rad)
+    }
+    fn moving(&self, goal: [f32; 2], rad: [f32; 2]) -> bool {
+        self.shown != goal || self.rad != rad
     }
 }
 
@@ -437,6 +485,13 @@ struct Controls {
     arm: Arm,
     /// armed button as last drawn (a change re-records `draw`)
     arm_shown: Option<u8>,
+    /// hover / press amounts per cell (0 volume, 1 brightness, 2 + button id), eased in `overlay`
+    hv: HoverAnim,
+    pr: HoverAnim,
+    mo: Mo,
+    /// the look each button had when last seen, and the changes still cross-fading
+    prev: Vec<(u8, BtnLook)>,
+    trans: Vec<Trans>,
 }
 
 impl Default for Controls {
@@ -469,6 +524,11 @@ impl Default for Controls {
             touched: now - Duration::from_secs(60),
             arm: Arm::default(),
             arm_shown: None,
+            hv: HoverAnim::new(10),
+            pr: HoverAnim::timed(10, 0.08, 0.2),
+            mo: Mo::default(),
+            prev: Vec::new(),
+            trans: Vec::new(),
         }
     }
 }
@@ -682,51 +742,135 @@ impl Controls {
         cx.pill(Self::track(row), WHITE.alpha(0.27));
     }
 
-    /// animated part: fill, knob and the percent
-    fn slider_live(&self, cx: &Cx, row: Rect, v: u32, active: bool, dim: bool) {
+    /// animated part: fill, knob and the percent; `v` is the eased percent, `r` the eased knob radius
+    fn slider_live(&self, cx: &Cx, row: Rect, v: f32, r: f32, dim: bool) {
         let t = Self::track(row);
-        let k = v as f32 / 100.0;
+        let k = v / 100.0;
         let x = t.x + 4.0 + (t.w - 8.0) * k;
         let fill = Rect::new(t.x, t.y, (x - t.x + 2.0).max(t.h), t.h);
         cx.pill(fill, if dim { TEXT.alpha(0.45) } else { TEXT.alpha(0.92) });
-        let r = if active { 9.5 } else { 8.0 };
         cx.circle((x, t.cy()), r + 0.8, BLACK.alpha(0.16));
         cx.circle((x, t.cy()), r, WHITE);
-        cx.text(Rect::new(row.right() - 38.0, row.y, 38.0, row.h), &format!("{v}%"), Style::new(12.0, 500).mono().right(), if dim { FAINT } else { DIM });
+        cx.text(Rect::new(row.right() - 38.0, row.y, 38.0, row.h), &format!("{}%", v.round() as u32), Style::new(12.0, 500).mono().right(), if dim { FAINT } else { DIM });
     }
 
-    fn draw_item(&self, cx: &Cx, it: &Item, ru: bool) {
-        let (fill, ink) = self.look(it.btn);
-        let armed = self.arm_shown == Some(btn_id(it.btn));
+    /// The look of a button right now.
+    fn cur_look(&self, b: Btn) -> BtnLook {
+        let (fill, ink) = self.look(b);
+        let armed = self.arm_shown == Some(btn_id(b));
+        let pill = matches!(b, Btn::Restart | Btn::Shutdown);
+        BtnLook { fill: if pill && armed { RED_D } else { fill }, ink: if pill && armed { WHITE } else { ink }, glyph: self.glyph(b), slash: b == Btn::Mute && self.muted, armed }
+    }
+
+    /// One button (fill, glyph, and for tiles / pills the text inside) in look `l` at opacity `k`.
+    fn paint_item(cx: &Cx, it: &Item, l: &BtnLook, k: f32, ru: bool) {
+        let (fill, ink) = (l.fill.fade(k), l.ink.fade(k));
         match it.look {
             Look::Round => {
                 cx.circle(it.shape.center(), it.shape.w / 2.0, fill);
                 let d = it.shape.w * 0.46;
-                self.draw_glyph(cx, it.btn, it.shape.centered(d, d), ink);
-                cx.text(it.label, Self::label(cx, it.btn), Style::new(10.5, 500).center().ellipsis(), DIM);
+                Self::draw_glyph(cx, l, it.shape.centered(d, d), ink);
             }
             Look::Tile => {
                 cx.rrect(it.shape, 20.0, fill);
-                self.draw_glyph(cx, it.btn, Rect::new(it.shape.cx() - 12.0, it.shape.y + 11.0, 24.0, 24.0), ink);
-                cx.text(it.label, Self::label(cx, it.btn), Style::new(9.5, 500).center().ellipsis(), if fill == FILL { DIM } else { ink });
+                Self::draw_glyph(cx, l, Rect::new(it.shape.cx() - 12.0, it.shape.y + 11.0, 24.0, 24.0), ink);
+                cx.text(it.label, Self::label(cx, it.btn), Style::new(9.5, 500).center().ellipsis(), (if l.fill == FILL { DIM } else { l.ink }).fade(k));
             }
             Look::Pill => {
-                cx.pill(it.shape, if armed { RED_D } else { FILL });
-                let text = if armed { if ru { "Нажмите ещё раз" } else { "Click again" } } else { Self::label(cx, it.btn) };
+                cx.pill(it.shape, fill);
+                let text = if l.armed { if ru { "Нажмите ещё раз" } else { "Click again" } } else { Self::label(cx, it.btn) };
                 let st = Style::new(13.0, 600);
                 let tw = cx.measure(text, st, 0.0).0.min(it.shape.w - 50.0);
                 let x0 = it.shape.cx() - (tw + 24.0) / 2.0;
-                self.draw_glyph(cx, it.btn, Rect::new(x0, it.shape.cy() - 8.0, 16.0, 16.0), if armed { WHITE } else { TEXT });
-                cx.text(Rect::new(x0 + 24.0, it.shape.y, tw + 4.0, it.shape.h), text, st.ellipsis(), if armed { WHITE } else { TEXT });
+                Self::draw_glyph(cx, l, Rect::new(x0, it.shape.cy() - 8.0, 16.0, 16.0), ink);
+                cx.text(Rect::new(x0 + 24.0, it.shape.y, tw + 4.0, it.shape.h), text, st.ellipsis(), ink);
             }
         }
     }
 
-    fn draw_glyph(&self, cx: &Cx, b: Btn, r: Rect, c: Color) {
-        cx.icon(self.glyph(b), r, c);
-        if b == Btn::Mute && self.muted {
+    fn draw_item(&self, cx: &Cx, it: &Item, ru: bool) {
+        // a button that is cross-fading is painted by `overlay` meanwhile (its label outside the shape stays here)
+        if !self.trans.iter().any(|t| t.id == btn_id(it.btn)) {
+            Self::paint_item(cx, it, &self.cur_look(it.btn), 1.0, ru);
+        }
+        if it.look == Look::Round {
+            cx.text(it.label, Self::label(cx, it.btn), Style::new(10.5, 500).center().ellipsis(), DIM);
+        }
+    }
+
+    fn draw_glyph(cx: &Cx, l: &BtnLook, r: Rect, c: Color) {
+        cx.icon(l.glyph, r, c);
+        if l.slash {
             let s = r.w / 24.0;
             cx.line((r.x + 3.0 * s, r.bottom() - 3.0 * s), (r.right() - 3.0 * s, r.y + 3.0 * s), 1.8, c);
+        }
+    }
+
+    /// The cell of a hit target in `hv` / `pr`.
+    fn cell(h: Option<Hit>) -> Option<usize> {
+        match h? {
+            Hit::Vol => Some(0),
+            Hit::Bri => Some(1),
+            Hit::Btn(b) => Some(2 + btn_id(b) as usize),
+        }
+    }
+
+    /// Slider values being shown: (goal percent, goal knob radius, being dragged) of volume and brightness.
+    fn mo_goals(&self) -> ([f32; 2], [f32; 2], [bool; 2]) {
+        let act = |h: Hit| self.drag == Some(h) || self.hot == Some(h);
+        let (v, b) = (self.vol as f32, self.bri.map_or(0.0, |b| b as f32));
+        ([v, b], [if act(Hit::Vol) { 9.5 } else { 8.0 }, if act(Hit::Bri) { 9.5 } else { 8.0 }], [self.drag == Some(Hit::Vol), self.drag == Some(Hit::Bri)])
+    }
+
+    /// Start the slider motion when the values it shows are off their goals (a mouse event or a poll moved them).
+    fn mo_arm(&mut self, cx: &Cx) {
+        let (goal, rad, _) = self.mo_goals();
+        if !self.mo.init && self.ready() {
+            self.mo.init = true;
+            (self.mo.shown, self.mo.rad) = (goal, rad);
+        }
+        if self.mo.since.is_none() && self.mo.moving(goal, rad) && self.ready() {
+            self.mo.since = Some(Instant::now());
+            cx.waker().wake(); // mouse events do not call `tick`: poke it so the schedule starts now
+        }
+    }
+
+    /// Advance the slider motion by the time since the last step; true while it still moves.
+    fn mo_step(&mut self, cx: &Cx) -> bool {
+        let Some(t0) = self.mo.since else { return false };
+        let now = Instant::now();
+        let dt = now.saturating_duration_since(t0).as_secs_f32().min(0.05);
+        let (goal, rad, fast) = self.mo_goals();
+        let snap = !self.ready() || reduced_motion();
+        if self.mo.step(dt, snap, goal, rad, fast) {
+            self.mo.since = Some(now);
+            return true;
+        }
+        self.mo.since = None;
+        cx.request_frame(); // the last position
+        false
+    }
+
+    /// Register a change of any button's look as a cross-fade (not before the first snapshot, not in previews, not with reduced motion).
+    fn note_looks(&mut self, cx: &Cx) {
+        if cx.preview {
+            return;
+        }
+        let lay = self.lay(cx.size);
+        for it in &lay.items {
+            let (id, cur) = (btn_id(it.btn), self.cur_look(it.btn));
+            match self.prev.iter().position(|p| p.0 == id) {
+                None => self.prev.push((id, cur)),
+                Some(k) if self.prev[k].1 != cur => {
+                    let from = std::mem::replace(&mut self.prev[k].1, cur);
+                    if self.ready() && !reduced_motion() {
+                        self.trans.retain(|t| t.id != id);
+                        self.trans.push(Trans { id, from, t0: Instant::now() });
+                        cx.waker().wake();
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -759,21 +903,29 @@ impl Widget for Controls {
             return Ok(());
         }
         let lay = self.lay(cx.size);
+        // eased percent / knob (the real values are in `vol` / `bri`; a preview has no motion, it shows them as they are)
+        let (shown, rad) = if cx.preview { (self.mo_goals().0, [8.0; 2]) } else { (self.mo.shown, self.mo.rad) };
         if let Some(r) = lay.vol {
-            self.slider_live(cx, r, self.vol, self.drag == Some(Hit::Vol) || self.hot == Some(Hit::Vol), self.muted);
+            self.slider_live(cx, r, shown[0], rad[0], self.muted);
         }
-        if let (Some(r), Some(b)) = (lay.bri, self.bri) {
-            self.slider_live(cx, r, b, self.drag == Some(Hit::Bri) || self.hot == Some(Hit::Bri), false);
+        if let (Some(r), Some(_)) = (lay.bri, self.bri) {
+            self.slider_live(cx, r, shown[1], rad[1], false);
+        }
+        // buttons that changed look: the old one fades out while the new one fades in
+        let ru = cx.lang == Lang::Ru;
+        for t in &self.trans {
+            let Some(it) = lay.items.iter().find(|i| btn_id(i.btn) == t.id) else { continue };
+            let p = (t.t0.elapsed().as_secs_f32() / TRANS_T).clamp(0.0, 1.0);
+            Self::paint_item(cx, it, &t.from, 1.0 - p, ru);
+            Self::paint_item(cx, it, &self.cur_look(it.btn), p, ru);
         }
         for it in &lay.items {
-            let h = Hit::Btn(it.btn);
-            let k = if self.hot == Some(h) && self.down == Some(h) {
-                0.30
-            } else if self.hot == Some(h) {
-                0.14
-            } else {
+            let cell = 2 + btn_id(it.btn) as usize;
+            let h = self.hv.get(cell);
+            let k = 0.14 * h + 0.16 * self.pr.get(cell).min(h);
+            if k <= 0.0 {
                 continue;
-            };
+            }
             let (fill, _) = self.look(it.btn);
             let c = if fill == TEXT { BLACK.alpha(k * 0.6) } else { WHITE.alpha(k) };
             match it.look {
@@ -886,7 +1038,18 @@ impl Widget for Controls {
             self.arm_shown = live;
             self.ver += 1;
         }
-        if live.is_some() {
+        // motion: 60 fps only while a slider value, a hover / press plate or a cross-fade is moving
+        self.note_looks(cx);
+        let before = self.trans.len();
+        self.trans.retain(|t| t.t0.elapsed().as_secs_f32() < TRANS_T);
+        if self.trans.len() != before {
+            self.ver += 1; // the static layer takes the finished buttons back
+        }
+        self.mo_arm(cx);
+        let (a, b, c) = (self.hv.step(cx), self.pr.step(cx), self.mo_step(cx));
+        if a || b || c || !self.trans.is_empty() {
+            Tick::Fps(60)
+        } else if live.is_some() {
             Tick::Every(Duration::from_millis(self.arm.remaining(now).clamp(100, 1000)))
         } else {
             Tick::Every(Duration::from_secs(2))
@@ -970,6 +1133,11 @@ impl Widget for Controls {
             }
             _ => {}
         }
+        // eased hover / press plates, the sliders' glide, a toggle's cross-fade
+        changed |= self.hv.set(Self::cell(self.hot), cx);
+        changed |= self.pr.set(Self::cell(self.down), cx);
+        self.note_looks(cx);
+        self.mo_arm(cx);
         changed
     }
 
@@ -981,6 +1149,38 @@ impl Widget for Controls {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slider_motion_glides_settles_and_snaps() {
+        let mut m = Mo::default();
+        let (goal, rad) = ([64.0, 72.0], [8.0, 8.0]);
+        assert!(m.moving(goal, rad), "at 0 with goals 64 / 72");
+        assert!(!m.step(0.016, true, goal, rad, [false; 2]), "snap = no motion (reduced / first snapshot)");
+        assert_eq!((m.shown, m.rad), (goal, rad));
+        // the volume moves to 20: the shown value trails, the real one is not involved
+        let goal = [20.0, 72.0];
+        assert!(m.step(0.016, false, goal, rad, [false; 2]));
+        assert!(m.shown[0] < 64.0 && m.shown[0] > 20.0 && m.shown[1] == 72.0);
+        let mut n = 0;
+        while m.step(0.016, false, goal, rad, [false; 2]) {
+            n += 1;
+            assert!(n < 100, "never settles");
+        }
+        assert!((15..40).contains(&n), "tau 60 ms: {n}");
+        assert_eq!(m.shown[0], 20.0);
+        assert!(!m.moving(goal, rad), "settled: the card may sleep");
+        // a dragged slider follows with a shorter lag and the knob swells
+        let a = Mo::default();
+        let (mut slow, mut fast) = (a, Mo::default());
+        slow.shown[0] = 0.0;
+        fast.shown[0] = 0.0;
+        slow.step(0.016, false, [100.0, 0.0], [8.0; 2], [false; 2]);
+        fast.step(0.016, false, [100.0, 0.0], [8.0; 2], [true, false]);
+        assert!(fast.shown[0] > slow.shown[0]);
+        let mut k = Mo { rad: [8.0, 8.0], ..Mo::default() };
+        k.step(0.05, false, [0.0; 2], [9.5, 8.0], [false; 2]);
+        assert!(k.rad[0] > 8.0 && k.rad[0] < 9.5);
+    }
 
     #[test]
     fn slider_maths() {

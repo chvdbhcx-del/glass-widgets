@@ -38,6 +38,10 @@ const CAP: usize = 20;
 const MAX_BYTES: usize = 4096;
 const CF_UNICODETEXT: u32 = 13;
 const CLEAR_SLOT: usize = 100;
+/// The "Copied" flash: total time, fade-in and fade-out (seconds).
+const FLASH_T: f32 = 1.3;
+const FLASH_IN: f32 = 0.12;
+const FLASH_OUT: f32 = 0.22;
 
 // ================================================================ pure logic (unit-tested)
 
@@ -396,10 +400,15 @@ fn set_clipboard(text: &str) {
 struct Clip {
     started: bool,
     rows: Vec<Row>,
-    hot: Option<usize>,
-    /// (when, row) of the last copy-back flash
+    /// row under the pointer (or `CLEAR_SLOT`) and its eased hover amount
+    hv: HoverAnim,
+    /// (when, row) of the last copy-back flash; it fades in, holds and fades out over `FLASH_T`
     flash: Option<(Instant, usize)>,
     flash_job: Option<Pending<()>>,
+    /// the flash is in its fade-out (`flash_job` ran down): keep painting until it is gone
+    flash_fade: bool,
+    /// reduced motion when the flash started: no fades
+    flash_still: bool,
     ver: u64,
 }
 
@@ -496,20 +505,31 @@ impl Widget for Clip {
     fn overlay(&mut self, cx: &mut Cx) -> Result<()> {
         let size = cx.size;
         let (n, _, _) = layout(size);
-        let hot = self.hot.or(if cx.preview { cx.cfg_f64("preview_hot").map(|v| v as usize) } else { None });
-        match hot {
-            Some(CLEAR_SLOT) if size == Size::L && !self.rows.is_empty() => cx.pill(Rect::new(274.0, 13.0, 74.0, 24.0), WHITE.alpha(0.16)),
-            Some(i) if i < self.rows.len().min(n) => cx.rrect(row_rect(size, i).inset_xy(-6.0, 1.0), 9.0, WHITE.alpha(0.11)),
-            _ => {}
+        // the row (or the "Clear" button) under the pointer and the one it just left, easing in / out
+        let pre = if cx.preview { cx.cfg_f64("preview_hot").map(|v| v as usize) } else { None };
+        let amount = |slot: usize| if pre == Some(slot) { 1.0 } else { self.hv.get(slot) };
+        if size == Size::L && !self.rows.is_empty() {
+            let k = amount(CLEAR_SLOT);
+            if k > 0.0 {
+                cx.pill(Rect::new(274.0, 13.0, 74.0, 24.0), WHITE.alpha(0.16 * k));
+            }
+        }
+        for i in 0..self.rows.len().min(n) {
+            let k = amount(i);
+            if k > 0.0 {
+                cx.rrect(row_rect(size, i).inset_xy(-6.0, 1.0), 9.0, WHITE.alpha(0.11 * k));
+            }
         }
         let flash = self.flash.map(|(_, i)| i).or(if cx.preview { cx.cfg_f64("preview_flash").map(|v| v as usize) } else { None });
         if let Some(i) = flash.filter(|&i| i < self.rows.len().min(n)) {
+            let e = self.flash.map_or(1.0, |(t0, _)| t0.elapsed().as_secs_f32());
+            let a = if self.flash_still { 1.0 } else { crate::motion::smooth(e / FLASH_IN).min(crate::motion::smooth((FLASH_T - e) / FLASH_OUT)) };
             let r = row_rect(size, i);
             let pill = Rect::new(cx.w / 2.0 - 62.0, r.cy() - 14.0, 124.0, 28.0);
-            cx.pill(pill.inset(-1.0), WHITE.alpha(0.22));
-            cx.pill(pill, Color::rgba(0.07, 0.07, 0.09, 0.82));
-            cx.icon(Glyph::CheckCircle, Rect::new(pill.x + 10.0, pill.cy() - 8.0, 16.0, 16.0), GREEN);
-            cx.text(Rect::new(pill.x + 30.0, pill.y, pill.w - 36.0, pill.h), cx.t("Скопировано", "Copied"), Style::new(12.5, 600).ellipsis(), TEXT);
+            cx.pill(pill.inset(-1.0), WHITE.alpha(0.22 * a));
+            cx.pill(pill, Color::rgba(0.07, 0.07, 0.09, 0.82 * a));
+            cx.icon(Glyph::CheckCircle, Rect::new(pill.x + 10.0, pill.cy() - 8.0, 16.0, 16.0), GREEN.fade(a));
+            cx.text(Rect::new(pill.x + 30.0, pill.y, pill.w - 36.0, pill.h), cx.t("Скопировано", "Copied"), Style::new(12.5, 600).ellipsis(), TEXT.fade(a));
         }
         Ok(())
     }
@@ -535,11 +555,28 @@ impl Widget for Clip {
             return Tick::Never;
         }
         if poll(&mut self.flash_job).is_some() {
+            if self.flash_still {
+                self.flash = None; // reduced motion: gone at once
+                cx.request_frame(); // repaint the card without the flash
+            } else {
+                self.flash_fade = true; // the fade-out runs until FLASH_T
+            }
+        }
+        if self.flash_fade && self.flash.is_none_or(|(t0, _)| t0.elapsed().as_secs_f32() >= FLASH_T) {
             self.flash = None;
-            cx.request_frame(); // repaint the card without the flash
+            self.flash_fade = false;
+            cx.request_frame();
         }
         self.refresh(cx.lang == Lang::Ru);
-        if self.rows.is_empty() { Tick::Never } else { Tick::Poll(Duration::from_secs(30)) } // ages are re-formatted twice a minute
+        // 60 fps only while a row highlight eases or the flash fades in / out; otherwise the data schedule
+        let moving = self.hv.step(cx) || (!self.flash_still && self.flash.is_some_and(|(t0, _)| self.flash_fade || t0.elapsed().as_secs_f32() < FLASH_IN));
+        if moving {
+            Tick::Fps(60)
+        } else if self.rows.is_empty() {
+            Tick::Never
+        } else {
+            Tick::Poll(Duration::from_secs(30)) // ages are re-formatted twice a minute
+        }
     }
 
     fn mouse(&mut self, ev: &MouseEv, cx: &mut Cx) -> bool {
@@ -553,8 +590,7 @@ impl Widget for Clip {
         } else {
             (0..shown).find(|&i| row_rect(size, i).contains(ev.x, ev.y))
         };
-        let mut changed = slot != self.hot;
-        self.hot = slot;
+        let mut changed = self.hv.set(slot, cx);
         let ru = cx.lang == Lang::Ru;
         match slot {
             Some(CLEAR_SLOT) if ev.clicked(clear_rect()) => {
@@ -573,7 +609,11 @@ impl Widget for Clip {
                 }
                 cx.spawn(move || set_clipboard(&text));
                 self.flash = Some((Instant::now(), i));
-                self.flash_job = Some(cx.spawn(|| std::thread::sleep(std::time::Duration::from_millis(1300))));
+                self.flash_still = reduced_motion();
+                self.flash_fade = false;
+                // wakes `tick` once the fade-out starts (and right away, which starts the fade-in)
+                self.flash_job = Some(cx.spawn(|| std::thread::sleep(std::time::Duration::from_millis(((FLASH_T - FLASH_OUT) * 1000.0) as u64))));
+                cx.waker().wake();
                 self.refresh(ru);
                 changed = true;
             }

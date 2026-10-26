@@ -480,7 +480,8 @@ impl Weather {
                 self.hour_col(cx, c, cx.t("Сейчас", "Now"), true, k, wx.day, &fmt_t(wx.temp, f), ys, icon);
             } else {
                 let (k, _, _) = wmo(h.code, h.day);
-                self.hour_col(cx, c, &h.hh.to_string(), false, k, h.day, &fmt_t(h.temp, f), ys, icon);
+                // "02:00", not a bare "2": a number alone reads as a day of the month
+                self.hour_col(cx, c, &format!("{:02}:00", h.hh), false, k, h.day, &fmt_t(h.temp, f), ys, icon);
             }
         }
     }
@@ -566,7 +567,7 @@ impl Widget for Weather {
             Size::S => self.left_block(cx, wx, days.first(), 16.0, 138.0, f),
             Size::M => {
                 self.left_block(cx, wx, days.first(), 16.0, 140.0, f);
-                self.hours_row(cx, wx, hours, Rect::new(168.0, 16.0, 172.0, 138.0), 5, f, (49.0, 81.0, 101.0), 22.0); // one tight block (as in L), centred on the card
+                self.hours_row(cx, wx, hours, Rect::new(140.0, 16.0, 200.0, 138.0), 5, f, (49.0, 81.0, 101.0), 22.0); // one tight block (as in L) against the right padding edge; 40 px columns keep "Сейчас" and "02:00" apart
             }
             Size::L => {
                 self.city_row(cx, Rect::new(16.0, 16.0, 324.0, 18.0));

@@ -9,7 +9,7 @@
 //!  * `Glass::draw`      the STATIC layer: shadow, chromatic lens (3 displacement passes recombined with PLUS) -> blur -> colour matrix,
 //!                       tint, adaptive dark veil / milky light veil, inner glow, sheen, a thin uniform base rim.
 //!  * `Glass::draw_hi`   the DYNAMIC highlights over the finished card (a handful of gradient strokes, no layer, no allocation):
-//!                       the specular rim that follows the virtual light, a soft counter-glow, the pointer glint, the materialise sweep.
+//!                       the specular rim that follows the virtual light, a soft counter-glow, the hover spot + pointer glint, the materialise sweep.
 //!
 //! Every tunable constant lives in `GlassParams` (JSON override: `--glass-params file.json` or `%APPDATA%\macshell\glass.json`);
 //! the defaults were fitted against the Apple reference screenshots by `mswidgets --calib` (see NATIVE.md, "Glass calibration").
@@ -96,6 +96,9 @@ glass_params! {
     /// pointer glint strength and radius
     glint: 0.9, 0.0, 1.0;
     glint_r: 46.0, 16.0, 90.0;
+    /// soft light spot under the pointer of a hovered card: peak alpha on dark glass (x1.6 on light glass) and radius
+    hover_spot: 0.10, 0.0, 0.3;
+    hover_spot_r: 78.0, 30.0, 160.0;
     /// virtual light direction, CSS degrees (315 = from the upper left)
     light_angle: 315.0, 0.0, 360.0;
     /// light appearance: milky white veil alpha, tint multiplier, rim multiplier, shadow multiplier, lens brightness multiplier
@@ -315,12 +318,14 @@ pub struct Hi {
     pub glint: Option<(f32, f32, f32)>,
     /// materialise sweep: (contour point x, y in card px, strength 0..1)
     pub sweep: Option<(f32, f32, f32)>,
+    /// hover light spot: (pointer x, y in card px, strength 0..1)
+    pub spot: Option<(f32, f32, f32)>,
     /// overall opacity
     pub alpha: f32,
 }
 impl Default for Hi {
     fn default() -> Self {
-        Hi { angle: 315.0, k: 0.0, glint: None, sweep: None, alpha: 1.0 }
+        Hi { angle: 315.0, k: 0.0, glint: None, sweep: None, spot: None, alpha: 1.0 }
     }
 }
 
@@ -390,6 +395,55 @@ pub fn tl_corner_u(w: f32, h: f32, r: f32) -> f32 {
     let arc = std::f32::consts::FRAC_PI_2 * r;
     // the TL arc is the last piece: it ends at the contour start
     1.0 - arc / 2.0 / total
+}
+
+/// Fraction `u` of a point ON the contour (the inverse of `contour_point`, e.g. for the result of `nearest_contour`).
+pub fn contour_u(w: f32, h: f32, r: f32, (x, y): (f32, f32)) -> f32 {
+    use std::f32::consts::FRAC_PI_2 as Q;
+    let r = r.min(w / 2.0).min(h / 2.0);
+    let (sw, sh, arc) = (w - 2.0 * r, h - 2.0 * r, Q * r);
+    // the outward normal from the inner rectangle tells the piece: straight edges have an axis-aligned one
+    let (cx, cy) = (x.clamp(r, w - r), y.clamp(r, h - r));
+    let (dx, dy) = (x - cx, y - cy);
+    let e = 1e-3; // px: straight-edge points come out of contour_point / nearest_contour exactly axis-aligned
+    // piece starts: top edge, TR arc, right edge, BR arc, bottom edge, BL arc, left edge, TL arc
+    let b_right = sw + arc;
+    let b_bottom = b_right + sh + arc;
+    let b_left = b_bottom + sw + arc;
+    let a = dx.atan2(-dy).rem_euclid(std::f32::consts::TAU); // clockwise from "up"
+    let d = if dx.abs() <= e && dy.abs() <= e {
+        // no rounding (r = 0) or a corner point: the side it lies on
+        if y <= e {
+            x
+        } else if x >= w - e {
+            b_right + y
+        } else if y >= h - e {
+            b_bottom + (w - x)
+        } else {
+            b_left + (h - y)
+        }
+    } else if dx.abs() <= e {
+        if dy < 0.0 {
+            cx - r
+        } else {
+            b_bottom + (w - r - cx)
+        }
+    } else if dy.abs() <= e {
+        if dx > 0.0 {
+            b_right + (cy - r)
+        } else {
+            b_left + (h - r - cy)
+        }
+    } else if dx > 0.0 && dy < 0.0 {
+        sw + a * r
+    } else if dx > 0.0 {
+        b_right + sh + (a - Q) * r
+    } else if dy > 0.0 {
+        b_bottom + sw + (a - 2.0 * Q) * r
+    } else {
+        b_left + sh + (a - 3.0 * Q) * r
+    };
+    (d / contour_len(w, h, r)).rem_euclid(1.0)
 }
 
 /// Nearest contour point to the pointer (px, py) in card px, and the signed distance of the pointer to the contour (< 0 inside).
@@ -538,6 +592,8 @@ pub struct Glass {
     lit: ID2D1LinearGradientBrush,
     spot: ID2D1RadialGradientBrush,
     sweep: ID2D1RadialGradientBrush,
+    /// the hover light spot (a wide, soft white fall-off)
+    lamp: ID2D1RadialGradientBrush,
 }
 
 unsafe fn white_stops(gfx: &Gfx, stops: &[(f32, f32)]) -> Result<ID2D1GradientStopCollection1> {
@@ -704,6 +760,11 @@ impl Glass {
             };
             let spot = radial(p.glint_r * s)?;
             let sweep = radial(p.glint_r * 1.4 * s)?;
+            let lamp = {
+                let coll = white_stops(gfx, &[(0.0, 1.0), (0.3, 0.62), (0.65, 0.2), (1.0, 0.0)])?;
+                let rad = p.hover_spot_r * s;
+                dc.CreateRadialGradientBrush(&D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES { center: pt(0.0, 0.0), gradientOriginOffset: pt(0.0, 0.0), radiusX: rad, radiusY: rad }, None, &coll)?
+            };
 
             Ok(Glass {
                 s,
@@ -745,6 +806,7 @@ impl Glass {
                 lit,
                 spot,
                 sweep,
+                lamp,
             })
         }
     }
@@ -834,6 +896,15 @@ impl Glass {
                 let w = w_logical * s;
                 (rr(w / 2.0, w / 2.0, wf - w, hf - w, (self.r - w / 2.0).max(0.0)), w)
             };
+            // hover light spot under the pointer: a soft white fall-off filled into the card shape (clipped by the geometry itself)
+            if let Some((x, y, t)) = hi.spot {
+                let a = t * p.hover_spot * lerp(1.0, 1.6, k) * al;
+                if a > 0.002 {
+                    self.lamp.SetCenter(pt(x, y));
+                    self.lamp.SetOpacity(a);
+                    dc.FillRoundedRectangle(&rr(0.0, 0.0, wf, hf, self.r), &self.lamp);
+                }
+            }
             // soft inner bands first (wide -> narrow), then the thin hard rim
             if p.spec_glow > 0.0 {
                 for (wk, ok) in [(1.0, 0.2), (0.8, 0.2), (0.62, 0.2), (0.46, 0.2), (0.3, 0.2), (0.17, 0.2)] {
@@ -975,6 +1046,14 @@ mod tests {
         }
         let (x, y) = contour_point(w, h, r, tl_corner_u(w, h, r));
         assert!(x < r && y < r, "TL corner arc: {x},{y}");
+        // contour_u inverts contour_point all the way round (also without rounding)
+        for (w, h, r) in [(w, h, r), (170.0, 170.0, 85.0), (120.0, 80.0, 0.0)] {
+            for i in 0..400 {
+                let u = (i as f32 + 0.3) / 400.0;
+                let back = contour_u(w, h, r, contour_point(w, h, r, u));
+                assert!(crate::motion::wrap_dist(u, back).abs() < 1e-4, "{w}x{h} r{r}: u={u} -> {back}");
+            }
+        }
     }
 
     #[test]

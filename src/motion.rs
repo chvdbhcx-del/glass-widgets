@@ -1,5 +1,5 @@
 //! Pure (no GPU, no clock) state machines behind the Liquid Glass motion: the inertial light, the materialise timeline,
-//! the backdrop-driven light / dark appearance with hysteresis, the pointer glint and the neighbour-merge distance logic.
+//! the backdrop-driven light / dark appearance with hysteresis, the pointer glint / hover / press response and the neighbour-merge distance logic.
 //! Everything takes explicit `dt` / `t` so it is unit-testable and the headless renderer can show any phase.
 
 // ---------------------------------------------------------------- light
@@ -69,12 +69,200 @@ pub fn glint_target(d_px: f32, scale: f32) -> f32 {
 
 /// Exponential approach (fade in / out of the glint, ~120 ms time constant).
 pub fn approach(v: f32, target: f32, dt: f32, tau: f32) -> f32 {
-    let k = 1.0 - (-dt / tau).exp();
-    let n = v + (target - v) * k;
-    if (n - target).abs() < 0.004 {
+    follow(v, target, dt, tau, 0.004)
+}
+
+/// Exponential approach with time constant `tau` that snaps onto `target` once within `eps` (so an animation really ends).
+pub fn follow(v: f32, target: f32, dt: f32, tau: f32, eps: f32) -> f32 {
+    let n = v + (target - v) * (1.0 - (-dt / tau).exp());
+    if (n - target).abs() < eps {
         target
     } else {
         n
+    }
+}
+
+/// `follow` for a value that wraps at 1 (a contour fraction): it goes the short way round, so a glint whose nearest contour
+/// point jumps across the card slides along the rim instead of teleporting.
+pub fn follow_wrap(u: f32, target: f32, dt: f32, tau: f32, eps: f32) -> f32 {
+    let d = wrap_dist(u, target);
+    if d.abs() < eps {
+        return target.rem_euclid(1.0);
+    }
+    (u + d * (1.0 - (-dt / tau).exp())).rem_euclid(1.0)
+}
+
+/// Signed shortest distance from `u` to `target` on a circle of circumference 1 (-0.5..0.5).
+pub fn wrap_dist(u: f32, target: f32) -> f32 {
+    (target - u + 0.5).rem_euclid(1.0) - 0.5
+}
+
+// ---------------------------------------------------------------- pointer hover
+
+/// Hover eases in this long after the pointer enters a card, out this long after it leaves (seconds).
+pub const HOVER_IN: f32 = 0.18;
+pub const HOVER_OUT: f32 = 0.25;
+/// The press response: in fast, out a bit slower (seconds).
+pub const PRESS_IN: f32 = 0.08;
+pub const PRESS_OUT: f32 = 0.2;
+/// Rim glint strength anywhere inside a hovered card (1 on the contour).
+pub const RIM_FLOOR: f32 = 0.5;
+/// Card scale while hovered / pressed.
+pub const HOVER_SCALE: f32 = 1.012;
+pub const PRESS_SCALE: f32 = 0.985;
+
+/// Linear progress 0..1 towards `on`, taking `t_in` seconds up and `t_out` down (read it through `smooth`).
+pub fn ramp(v: f32, on: bool, dt: f32, t_in: f32, t_out: f32) -> f32 {
+    if on {
+        (v + dt / t_in).min(1.0)
+    } else {
+        (v - dt / t_out).max(0.0)
+    }
+}
+
+/// Smoothstep easing of a 0..1 progress.
+pub fn smooth(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Rim glint strength for a pointer at signed distance `d` px from the contour (< 0 inside) of a hovered card: never below
+/// `RIM_FLOOR` inside, 1 on the contour; outside the 62 px approach fall-off of `glint_target`.
+pub fn hover_rim(d_px: f32, scale: f32) -> f32 {
+    let g = glint_target(d_px, scale);
+    if d_px < 0.0 {
+        RIM_FLOOR + (1.0 - RIM_FLOOR) * g
+    } else {
+        g
+    }
+}
+
+/// Where the card scale springs to: pressed, hovered or at rest.
+pub fn bump_target(hover: bool, press: bool) -> f32 {
+    if press {
+        PRESS_SCALE
+    } else if hover {
+        HOVER_SCALE
+    } else {
+        1.0
+    }
+}
+
+/// The card scale spring of hover / press: a soft overshoot on hover and release (zeta ~0.6), critically damped into a press.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bump {
+    pub x: f32,
+    v: f32,
+}
+impl Default for Bump {
+    fn default() -> Self {
+        Bump { x: 1.0, v: 0.0 }
+    }
+}
+impl Bump {
+    const K: f32 = 580.0; // omega ~ 24 rad/s
+
+    /// At rest on scale `x` (headless renders of a hover / press state).
+    pub fn resting(x: f32) -> Bump {
+        Bump { x, v: 0.0 }
+    }
+
+    pub fn at_rest(&self, target: f32) -> bool {
+        self.x == target && self.v == 0.0
+    }
+
+    /// One semi-implicit Euler step towards `target`; true when at rest on it.
+    pub fn step(&mut self, dt: f32, target: f32) -> bool {
+        // pressing: no overshoot (a press must not bounce); everything else: zeta 0.6
+        let zeta2 = if target < self.x && target < 1.0 { 2.0 } else { 1.2 };
+        let c = zeta2 * Self::K.sqrt();
+        let h = dt / 4.0;
+        for _ in 0..4 {
+            self.v += (Self::K * (target - self.x) - c * self.v) * h;
+            self.x += self.v * h;
+        }
+        let done = (target - self.x).abs() < 3e-4 && self.v.abs() < 6e-3;
+        if done {
+            self.x = target;
+            self.v = 0.0;
+        }
+        done
+    }
+}
+
+// ---------------------------------------------------------------- hover ramps / toast
+
+/// Hover ramps of a row of cells (buttons, segments, list rows, calendar days): one linear 0..1 progress per cell, read eased
+/// through `get`. Nothing is stored for time: `busy` says whether any cell is still on its way, so the owner asks for frames
+/// (a timer, `request_frame`) only while it is, and a settled set costs nothing.
+#[derive(Clone, Debug, Default)]
+pub struct HoverRamps {
+    v: Vec<f32>,
+}
+impl HoverRamps {
+    pub fn new(n: usize) -> HoverRamps {
+        HoverRamps { v: vec![0.0; n] }
+    }
+
+    /// Make room for at least `n` cells (a list that grows).
+    pub fn ensure(&mut self, n: usize) {
+        if self.v.len() < n {
+            self.v.resize(n, 0.0);
+        }
+    }
+
+    /// Eased progress of cell `i` (0 when unknown).
+    pub fn get(&self, i: usize) -> f32 {
+        smooth(self.v.get(i).copied().unwrap_or(0.0))
+    }
+
+    /// True while some cell has not reached the end `hot` asks for.
+    pub fn busy(&self, hot: impl Fn(usize) -> bool) -> bool {
+        self.v.iter().enumerate().any(|(i, &v)| v != if hot(i) { 1.0 } else { 0.0 })
+    }
+
+    /// One step: hot cells ramp up in `t_in` seconds, the others down in `t_out`; `changed(i)` is called for every cell that moved.
+    pub fn step(&mut self, dt: f32, t_in: f32, t_out: f32, hot: impl Fn(usize) -> bool, mut changed: impl FnMut(usize)) {
+        for (i, v) in self.v.iter_mut().enumerate() {
+            let n = ramp(*v, hot(i), dt, t_in, t_out);
+            if n != *v {
+                *v = n;
+                changed(i);
+            }
+        }
+    }
+
+    /// Reduced motion / first show: every cell jumps to its end at once.
+    pub fn snap(&mut self, hot: impl Fn(usize) -> bool, mut changed: impl FnMut(usize)) {
+        for (i, v) in self.v.iter_mut().enumerate() {
+            let n = if hot(i) { 1.0 } else { 0.0 };
+            if n != *v {
+                *v = n;
+                changed(i);
+            }
+        }
+    }
+}
+
+/// Toast timings (seconds) and the rise in logical px, the same 8 px as the prompt's glide.
+pub const TOAST_IN: f32 = 0.18;
+pub const TOAST_OUT: f32 = 0.22;
+pub const TOAST_RISE: f32 = 8.0;
+
+/// How a toast looks `t_in` seconds after it appeared, `t_out` seconds into its fade-out (None = still held):
+/// (opacity, rise in logical px still to climb, done = fully gone and may be dropped). Reduced motion: no rise, no fade.
+pub fn toast_look(t_in: f32, t_out: Option<f32>, reduced: bool) -> (f32, f32, bool) {
+    if reduced {
+        return (1.0, 0.0, t_out.is_some());
+    }
+    let p = (t_in / TOAST_IN).clamp(0.0, 1.0);
+    let e = 1.0 - (1.0 - p).powi(3); // ease-out cubic
+    match t_out {
+        None => (e, (1.0 - e) * TOAST_RISE, false),
+        Some(o) => {
+            let q = (o / TOAST_OUT).clamp(0.0, 1.0);
+            (e * (1.0 - q), 0.0, q >= 1.0)
+        }
     }
 }
 
@@ -340,6 +528,97 @@ mod tests {
     }
 
     #[test]
+    fn hover_eases_in_and_out_and_holds() {
+        // in: 180 ms, out: 250 ms, then it stays put (no timeout while the pointer rests)
+        let (mut h, mut t) = (0.0, 0.0);
+        while h < 1.0 {
+            h = ramp(h, true, 0.016, HOVER_IN, HOVER_OUT);
+            t += 0.016;
+        }
+        assert!((0.17..0.2).contains(&t), "in {t}");
+        for _ in 0..500 {
+            h = ramp(h, true, 0.016, HOVER_IN, HOVER_OUT);
+        }
+        assert_eq!(h, 1.0);
+        t = 0.0;
+        while h > 0.0 {
+            h = ramp(h, false, 0.016, HOVER_IN, HOVER_OUT);
+            t += 0.016;
+        }
+        assert!((0.24..0.27).contains(&t), "out {t}");
+        assert_eq!((smooth(0.0), smooth(1.0), smooth(0.5)), (0.0, 1.0, 0.5));
+        assert!(smooth(0.1) < 0.1 && smooth(0.9) > 0.9);
+    }
+
+    #[test]
+    fn hover_rim_has_a_floor_inside() {
+        assert!((hover_rim(0.0, 1.0) - 1.0).abs() < 1e-5);
+        // the middle of a card (85 px from every edge) keeps the floor, at 2x too
+        assert_eq!(hover_rim(-85.0, 1.0), RIM_FLOOR);
+        assert_eq!(hover_rim(-170.0, 2.0), RIM_FLOOR);
+        // it rises monotonically towards the edge
+        let mut last = 0.0;
+        for d in (0..=80).rev() {
+            let v = hover_rim(-(d as f32), 1.0);
+            assert!(v >= last && v >= RIM_FLOOR, "{d}: {v}");
+            last = v;
+        }
+        // outside: the approach fall-off, gone at 62 px
+        assert!(hover_rim(30.0, 1.0) < 0.8 && hover_rim(30.0, 1.0) > 0.2);
+        assert_eq!(hover_rim(70.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn follow_snaps_and_wraps_the_short_way() {
+        let mut v = 0.0;
+        let mut n = 0;
+        while v != 100.0 {
+            v = follow(v, 100.0, 0.016, 0.07, 0.25);
+            n += 1;
+            assert!(n < 60, "never snaps");
+        }
+        assert!(n > 5);
+        assert!((wrap_dist(0.95, 0.05) - 0.1).abs() < 1e-5 && (wrap_dist(0.05, 0.95) + 0.1).abs() < 1e-5);
+        // 0.95 -> 0.05 goes forward through 0 (0.97, 0.99 ...), not back through 0.5
+        let u = follow_wrap(0.95, 0.05, 0.016, 0.08, 1e-4);
+        assert!(u > 0.95 || u < 0.05, "{u}");
+        let mut u = 0.95;
+        for _ in 0..100 {
+            u = follow_wrap(u, 0.05, 0.016, 0.08, 5e-4);
+        }
+        assert_eq!(u, 0.05);
+    }
+
+    #[test]
+    fn bump_springs_with_a_small_overshoot_and_settles() {
+        let mut b = Bump::default();
+        assert!(b.at_rest(bump_target(false, false)));
+        // hover: up to 1.012 with a soft overshoot, at rest within 0.5 s
+        let (mut t, mut max) = (0.0f32, 0.0f32);
+        while !b.step(0.016, bump_target(true, false)) {
+            t += 0.016;
+            max = max.max(b.x);
+            assert!(t < 0.6, "hover never settles");
+        }
+        assert!(max > HOVER_SCALE && max < HOVER_SCALE + 0.004, "hover overshoot {max}");
+        // press: down to 0.985 without bouncing below it
+        let mut min = 2.0f32;
+        while !b.step(0.016, bump_target(true, true)) {
+            min = min.min(b.x);
+        }
+        assert!(min >= PRESS_SCALE - 1e-4, "press undershoot {min}");
+        // release: springs back past the hover scale once, then rests
+        let (mut t, mut max) = (0.0f32, 0.0f32);
+        while !b.step(0.016, bump_target(true, false)) {
+            t += 0.016;
+            max = max.max(b.x);
+            assert!(t < 0.7, "release never settles");
+        }
+        assert!(max > HOVER_SCALE + 0.001 && max < HOVER_SCALE + 0.006, "release overshoot {max}");
+        assert!(b.at_rest(HOVER_SCALE));
+    }
+
+    #[test]
     fn materialize_in_condenses_and_out_dissolves() {
         let s0 = materialize(0.0, false, false);
         assert!((s0.scale - 0.92).abs() < 1e-3 && s0.alpha == 0.0 && (s0.blur - 1.0).abs() < 1e-5 && !s0.finished);
@@ -412,6 +691,54 @@ mod tests {
         }
         assert!((0.24..0.28).contains(&t), "{t}");
         assert_eq!(look_step(1.0, 0.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn hover_ramps_settle_and_stop_asking_for_frames() {
+        let mut r = HoverRamps::new(3);
+        let hot = |i: usize| i == 1;
+        assert!(r.busy(hot), "a hovered cell has to ramp up");
+        assert!(!r.busy(|_| false), "nothing hot and nothing lit: idle");
+        let (mut n, mut moved) = (0, 0);
+        while r.busy(hot) {
+            r.step(0.016, 0.12, 0.18, hot, |i| {
+                assert_eq!(i, 1);
+                moved += 1;
+            });
+            n += 1;
+            assert!(n < 20, "never settles");
+        }
+        assert!((7..=9).contains(&n), "120 ms in at 16 ms steps: {n}");
+        assert_eq!((r.get(1), r.get(0)), (1.0, 0.0));
+        // leaving ramps back out in 180 ms and then the set is idle again
+        let mut m = 0;
+        while r.busy(|_| false) {
+            r.step(0.016, 0.12, 0.18, |_| false, |_| {});
+            m += 1;
+            assert!(m < 30);
+        }
+        assert!((11..=13).contains(&m), "{m}");
+        assert!(moved > 0 && !r.busy(|_| false));
+        // reduced motion: snap
+        r.snap(|i| i == 2, |_| {});
+        assert_eq!((r.get(2), r.get(1)), (1.0, 0.0));
+        assert!(!r.busy(|i| i == 2));
+    }
+
+    #[test]
+    fn toast_rises_fades_and_ends() {
+        let (a0, r0, d0) = toast_look(0.0, None, false);
+        assert!(a0 == 0.0 && (r0 - TOAST_RISE).abs() < 1e-6 && !d0);
+        let (a, r, _) = toast_look(TOAST_IN / 2.0, None, false);
+        assert!(a > 0.8 && r < TOAST_RISE / 2.0, "ease-out: most of the move is early ({a}, {r})");
+        assert_eq!(toast_look(1.0, None, false), (1.0, 0.0, false));
+        let (a, _, d) = toast_look(1.0, Some(TOAST_OUT / 2.0), false);
+        assert!(a > 0.4 && a < 0.6 && !d);
+        let (a, _, d) = toast_look(1.0, Some(TOAST_OUT), false);
+        assert!(a == 0.0 && d, "the toast is only dropped once the fade ended");
+        // reduced motion: shown at once, gone at once
+        assert_eq!(toast_look(0.0, None, true), (1.0, 0.0, false));
+        assert!(toast_look(1.0, Some(0.0), true).2);
     }
 
     #[test]

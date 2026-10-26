@@ -1,8 +1,10 @@
 //! mswidgets - native (no WebView) Direct2D renderer for the macshell desktop widgets. See native/NATIVE.md.
 //!   mswidgets --dump out.png --backdrop bd.png --cards "clock:s@0,0;calendar:m@1,0" [--scale 1] [--w W --h H] [--time "2026-10-24 10:08:35"]
 //!   mswidgets --sheet out.png --backdrop bd.png [--only clock,calendar] [--scale 1] [--time "..."]    contact sheet: every widget x every size
-//!   mswidgets --dump-ui out.png [--backdrop bd.png] --state live|edit|gallery|settings|menu [--look '{"blur":9}'] [--update-state idle|checking|latest|available|update-failed|downloading|verifying|failed] [--size WxH] [--search txt] [--group id] [--psize s|m|l] [--hover n] [--monitors count,selected] [--dim] [--scale S] [--cards ...]
+//!   mswidgets --dump-ui out.png [--backdrop bd.png] --state live|edit|gallery|settings|prompt|prompt-multi|menu|menu-size|menu-one [--look '{"blur":9}'] [--update-state idle|checking|latest|available|update-failed|downloading|verifying|failed] [--size WxH] [--search txt] [--group id] [--psize s|m|l] [--hover n] [--monitors count,selected] [--dim] [--scale S] [--cards ...]
 //!                                                                     the host UI (edit mode, gallery with live previews) rendered headless
+//!                                                                     (prompt: the on-canvas text prompt, --search = its text, --hover 1 selects the last word)
+//!                                                                     (menu: the card context menu over the first card; menu-size has the Size submenu open, menu-one is a single-size widget; --hover n = highlighted row)
 //!   mswidgets [--backdrop-fps 30] [--scale S] [--no-config] [--no-hotkeys]   live mode (Ctrl+Alt+Q quits, Ctrl+Alt+W edits; a second instance exits silently)
 //!   mswidgets --bench SECONDS [--backdrop-fps N]                    live mode that prints stats and exits
 //!   mswidgets --selftest-dupl                                       desktop-duplication self test (no window)
@@ -25,9 +27,11 @@ mod icons;
 mod input;
 mod layout;
 mod liquid;
+mod menu;
 mod monitors;
 mod motion;
 mod net;
+mod prompt;
 mod registry;
 mod sha256;
 mod sys;

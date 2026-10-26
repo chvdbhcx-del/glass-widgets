@@ -524,7 +524,7 @@ impl Widget for Sysmon {
                 for i in 0..n {
                     let cap = match i {
                         0 => "CPU".to_string(),
-                        1 => cx.t("ОЗУ", "RAM").to_string(),
+                        1 => "RAM".to_string(),
                         _ => "GPU".to_string(),
                     };
                     let (_, _, r) = s_ring(i, n);
@@ -537,7 +537,7 @@ impl Widget for Sysmon {
                     let r = m_row(i, n);
                     let label = match i {
                         0 => "CPU".to_string(),
-                        1 => cx.t("ОЗУ", "RAM").to_string(),
+                        1 => "RAM".to_string(),
                         _ => "GPU".to_string(),
                     };
                     cx.text(Rect::new(r.x, r.y, 40.0, 14.0), &label, Style::CAPTION.weight(600), DIM);
@@ -548,7 +548,7 @@ impl Widget for Sysmon {
                 for s in l_layout(self.ngpu) {
                     let (glyph, label) = match s.kind {
                         Kind::Cpu => (Glyph::Cpu, "CPU".to_string()),
-                        Kind::Ram => (Glyph::Ram, cx.t("ОЗУ", "RAM").to_uppercase()),
+                        Kind::Ram => (Glyph::Ram, "RAM".to_string()),
                         Kind::Gpu(i) => (Glyph::Gpu, gpu_label(i, self.ngpu)),
                     };
                     cx.icon(glyph, Rect::new(s.head.x, s.head.y + 2.0, 16.0, 16.0), DIM);
@@ -582,7 +582,13 @@ impl Widget for Sysmon {
                     let stroke = if n == 3 { 5.0 } else { 6.0 };
                     let col = v.map_or(FAINT, load_color);
                     cx.ring(c, d / 2.0 - stroke / 2.0, stroke, v.unwrap_or(0.0) / 100.0, col);
-                    cx.text(Rect::new(c.0 - 22.0, c.1 - 10.0, 44.0, 20.0), &pct_text(*v), Style::new(if n == 3 { 11.5 } else { 14.0 }, 600).mono().center(), TEXT);
+                    // a bare figure (no "%": the ring says it) that stays inside the ring: step the size down until it fits the clear width
+                    let (clear, label, mut sz) = (d - 2.0 * stroke - 3.0, pct_text(*v).trim_end_matches('%').to_string(), if n == 3 { 11.5 } else { 14.0 });
+                    let st = |sz: f32| Style::new(sz, 600).mono().center();
+                    while sz > 10.0 && cx.measure(&label, st(sz), 200.0).0 > clear {
+                        sz -= 0.5;
+                    }
+                    cx.text(Rect::new(c.0 - 22.0, c.1 - 10.0, 44.0, 20.0), &label, st(sz), TEXT);
                 }
             }
             Size::M => {

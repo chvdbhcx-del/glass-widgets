@@ -14,9 +14,12 @@ use crate::cards::*;
 use crate::gfx::*;
 use crate::grid;
 use crate::layout;
+use crate::input;
 use crate::monitors;
 use crate::motion::{self, MatState};
+use crate::prompt::{Act, Key, Mods};
 use crate::layout::{AccentMode, AccentScope};
+use crate::menu::{self, MAct, CMD_DELETE, CMD_EDIT, CMD_SIZE};
 use crate::tray::{self, TrayCmd};
 use crate::ui::{self, Hit, SAct, SKey, Ui};
 use crate::update::{self, UpdateState};
@@ -40,6 +43,8 @@ const WM_MOUSELEAVE: u32 = 0x02A3; // Win32_UI_Controls in the windows crate; no
 const WM_DPICHANGED: u32 = 0x02E0;
 /// posted by the mouse handler: run the context menu of card `wparam` at screen point `lparam` (outside of the App borrow)
 const WM_MENU: u32 = WM_APP + 3;
+/// posted by `input::prompt_ex` (a worker thread): a text prompt waits in `input::take_request` to be shown on the canvas
+const WM_PROMPT: u32 = WM_APP + 21;
 /// posted by the "Save current layout as..." prompt thread when the user typed a name (the name waits in `PROFILE_NAME`)
 const WM_PROFILE_NAME: u32 = WM_APP + 20;
 /// the longest layout name
@@ -56,6 +61,10 @@ const T_CFG: usize = 8;
 const T_SHRINK: usize = 9;
 const T_TOAST: usize = 10;
 const T_REPLACE: usize = 11;
+/// the prompt: 16 ms while it fades in / out, 500 ms (the caret blink) while it waits for the user
+const T_PROMPT: usize = 12;
+/// the context menu: 16 ms while it fades or waits to open a submenu, off otherwise
+const T_MENU: usize = 13;
 /// throttled apply of the look sliders (settings panel)
 const T_LOOK: usize = 40;
 /// commits a look slider moved from the keyboard / wheel once the burst of key repeats is over
@@ -264,6 +273,24 @@ struct App {
     t0: Instant,
     cpu0: u64,
     cpu_mark: Option<(Instant, u64)>,
+    /// the text prompt on the canvas (`ui.prompt` is its state): where the answer goes (a dropped sender = a cancel), who had the foreground,
+    /// whether the layer ever got it, when it opened, the timer period, the veil last drawn, a pending UTF-16 high surrogate, the last click
+    prompt_reply: Option<std::sync::mpsc::Sender<input::Reply>>,
+    prompt_fg: HWND,
+    prompt_was_fg: bool,
+    prompt_t0: Instant,
+    prompt_period: u32,
+    prompt_last: Instant,
+    prompt_scrim: f32,
+    prompt_hi: Option<u16>,
+    prompt_click: Option<(Instant, i32, i32)>,
+    /// the context menu on the canvas (`ui.menu` is its state): the card it belongs to, the timer period, the last tick and the canvas
+    /// rectangle it was last drawn in. The foreground hand-off fields of the prompt (`prompt_fg`, `prompt_was_fg`, `prompt_t0`) serve it too:
+    /// the two are never up together.
+    menu_uid: usize,
+    menu_period: u32,
+    menu_last: Instant,
+    menu_shown: Option<RECT>,
 }
 
 thread_local! { static APP: RefCell<Option<App>> = const { RefCell::new(None) }; }
@@ -291,11 +318,7 @@ pub fn run(o: Opts) -> i32 {
 }
 
 fn reduced_motion() -> bool {
-    unsafe {
-        let mut on = BOOL(1);
-        let ok = SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut BOOL as *mut std::ffi::c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).is_ok();
-        ok && !on.as_bool()
-    }
+    crate::widget::reduced_motion()
 }
 
 struct Monitor {
@@ -438,7 +461,12 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     let s = o.scale.unwrap_or(mon.scale);
     let settings = layout::read_settings();
     // the accent colour is needed before the first card is recorded
-    let (accent_rgb, accent_key) = resolve_accent(if o.no_config { AccentMode::Blue } else { settings.accent });
+    // with the live glass source the accent is what is on the screen, not what the wallpaper file says: start with the last live colour
+    let (accent_rgb, accent_key) = if !o.no_config && settings.live && settings.accent == AccentMode::Wallpaper {
+        (crate::accent::load_cache(), None)
+    } else {
+        resolve_accent(if o.no_config { AccentMode::Blue } else { settings.accent })
+    };
     crate::widget::set_accent(accent_rgb);
     crate::widget::set_tint(!o.no_config && settings.accent_scope == AccentScope::All);
     // the look: defaults -> glass.json (the process-wide base) -> `widgetsLook` of config.json; its `card_k` scales the cards (not the host UI)
@@ -594,6 +622,19 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         t0: Instant::now(),
         cpu0: cpu_time_100ns(),
         cpu_mark: None,
+        prompt_reply: None,
+        prompt_fg: HWND::default(),
+        prompt_was_fg: false,
+        prompt_t0: Instant::now(),
+        prompt_period: 0,
+        prompt_last: Instant::now(),
+        prompt_scrim: 0.0,
+        prompt_hi: None,
+        prompt_click: None,
+        menu_uid: 0,
+        menu_period: 0,
+        menu_last: Instant::now(),
+        menu_shown: None,
     };
     // First frame is drawn BEFORE the capture thread exists (probe staging and layers get created while the GPU is quiet: the very first
     // luminance probe racing the first full-texture copy of the duplication thread used to wedge the start). Then the capture starts,
@@ -639,6 +680,9 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         SetTimer(hwnd, T_BENCH, sec * 1000, None);
     }
     APP.with(|a| *a.borrow_mut() = Some(app));
+    if o.bench.is_none() {
+        input::set_host(Some((hwnd.0 as isize, WM_PROMPT))); // from now on `prompt_text` shows its panel on our canvas
+    }
     APP.with(|a| {
         if let Some(app) = a.borrow_mut().as_mut() {
             app.update_tick_timer();
@@ -706,18 +750,52 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(|app| app.profile_named());
             LRESULT(0)
         }
+        WM_PROMPT => {
+            let ran = std::cell::Cell::new(false);
+            with_app(|app| {
+                ran.set(true);
+                app.on_prompt_request();
+            });
+            if !ran.get() {
+                // the App is busy (re-entrancy): the worker shows the Win32 popup instead of waiting for ever
+                if let Some(r) = input::take_request() {
+                    let _ = r.reply.send(input::Reply::Fallback);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT => {
+            let over = APP.with(|a| a.try_borrow().ok().is_some_and(|g| g.as_ref().is_some_and(|app| app.prompt_field_under_cursor())));
+            if over {
+                if let Ok(c) = LoadCursorW(None, IDC_IBEAM) {
+                    SetCursor(c);
+                    return LRESULT(1);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_MENU => {
-            // the popup menu is modal: it must run without the App borrowed, the result is applied afterwards
+            // the menu is drawn on the canvas; only when it cannot be (`MSWIDGETS_NATIVE_MENU=1`, the prompt / settings are up) the native popup
+            // runs, which is modal: it must run without the App borrowed, the result is applied afterwards
             let req = APP.with(|a| a.try_borrow_mut().ok().and_then(|mut g| g.as_mut().and_then(|app| app.menu_request(wp.0, lp.0))));
             if let Some(req) = req {
-                let cmd = run_menu(hwnd, &req);
-                with_app(|app| app.menu_result(&req, cmd));
+                let shown = std::cell::Cell::new(false);
+                with_app(|app| {
+                    shown.set(app.show_menu(&req));
+                    if !shown.get() {
+                        app.in_menu = true;
+                    }
+                });
+                if !shown.get() {
+                    let cmd = run_menu(hwnd, &req);
+                    with_app(|app| app.menu_result(&req, cmd));
+                }
             }
             LRESULT(0)
         }
         WM_MOUSEACTIVATE => {
             // the layer never takes the foreground by a click, except while editing (the search box needs the keyboard)
-            if APP.with(|a| a.try_borrow().ok().is_some_and(|g| g.as_ref().is_some_and(|app| app.ui.edit))) {
+            if APP.with(|a| a.try_borrow().ok().is_some_and(|g| g.as_ref().is_some_and(|app| app.ui.edit || app.ui.prompt.is_some() || app.ui.menu.is_some()))) {
                 DefWindowProcW(hwnd, msg, wp, lp)
             } else {
                 LRESULT(MA_NOACTIVATE as isize)
@@ -747,6 +825,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_DESTROY => {
+            input::set_host(None);
             tray::remove(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
@@ -776,11 +855,7 @@ fn with_app(f: impl FnOnce(&mut App)) {
     });
 }
 
-// ---------------------------------------------------------------- context menu (native popup)
-
-const CMD_EDIT: usize = 1;
-const CMD_SIZE: usize = 10; // + 0 / 1 / 2 for S / M / L
-const CMD_DELETE: usize = 20;
+// ---------------------------------------------------------------- context menu (native popup, the fallback of the canvas menu)
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -877,6 +952,7 @@ impl App {
 
     unsafe fn on_msg(&mut self, msg: u32, id: usize) {
         match (msg, id) {
+            (WM_HOTKEY, 2 | 3) if self.ui.prompt.is_some() => {} // the prompt is modal: no edit mode / settings behind it
             (WM_HOTKEY, 2) => {
                 if self.editing {
                     self.leave_edit();
@@ -912,6 +988,8 @@ impl App {
             (_, T_GUARD) => self.guard(),
             (_, T_ANIM) => self.anim_step(),
             (_, T_UI) => self.ui_timer(),
+            (_, T_PROMPT) => self.prompt_tick(),
+            (_, T_MENU) => self.menu_tick(),
             (_, T_CFG) => {
                 self.poll_config();
                 self.refresh_accent(false); // a new wallpaper
@@ -929,10 +1007,9 @@ impl App {
             }
             (_, T_TOAST) => {
                 let _ = KillTimer(self.hwnd, T_TOAST);
-                self.ui.toast = None;
-                let d = self.toast_rect();
-                self.frame(d);
-                self.fit_window(); // the toast needed the whole monitor in live mode
+                // fade out first: the toast (and the monitor-wide canvas it needs in live mode) goes when the fade ended (`anim_step`)
+                self.ui.toast_fade();
+                self.arm_anim();
             }
             (_, T_REPLACE) => {
                 let _ = KillTimer(self.hwnd, T_REPLACE);
@@ -983,6 +1060,9 @@ impl App {
         let px = |r: Rect| RECT { left: (r.x * s) as i32, top: (r.y * s) as i32, right: (r.right() * s).ceil() as i32, bottom: (r.bottom() * s).ceil() as i32 };
         let g = (self.ui.edit && (self.ui.gallery || self.ui.settings)).then(|| px(self.ui.panel_rect()));
         let t = (self.ui.edit && !self.ui.settings).then(|| px(self.ui.toolbar_rect()));
+        let pr = self.ui.prompt.as_ref().map(|p| px(p.lay.panel));
+        let mn = self.ui.menu.as_ref().map(|m| px(m.bounds()));
+        let g = [g, pr, mn].into_iter().flatten().reduce(union);
         if let Some(b) = &self.backdrop {
             b.set_regions(&region_list(&self.card_rects(), g, t));
         }
@@ -990,7 +1070,7 @@ impl App {
 
     /// Window = whole monitor while editing / dragging / settling, else the card bounding box.
     fn want_full(&self) -> bool {
-        self.ui.edit || self.drag.is_some() || !self.springs.is_empty() || self.in_menu
+        self.ui.edit || self.drag.is_some() || !self.springs.is_empty() || self.in_menu || self.ui.prompt.is_some() || self.ui.menu.is_some()
     }
 
     unsafe fn desired_window(&self) -> RECT {
@@ -1081,6 +1161,24 @@ impl App {
                 }
             }
         }
+        if mask & (BIT_GALLERY | BIT_TOOLBAR) != 0 && self.ui.prompt.is_some() {
+            if let Err(e) = self.scene.render_panel(&self.gfx, ui::SLOT_PROMPT) {
+                eprintln!("mswidgets: prompt panel: {e}");
+            }
+            if let Some(u) = self.ui.prompt_dirty(&self.scene) {
+                add(&mut dirty, u);
+            }
+        }
+        if mask & (BIT_GALLERY | BIT_TOOLBAR) != 0 && self.ui.menu.is_some() {
+            for slot in [ui::SLOT_MENU, ui::SLOT_SUB] {
+                if let Err(e) = self.scene.render_panel(&self.gfx, slot) {
+                    eprintln!("mswidgets: menu panel: {e}");
+                }
+            }
+            if let Some(u) = self.ui.menu_dirty(&self.scene) {
+                add(&mut dirty, u);
+            }
+        }
         self.last_day = now.day_key();
         self.st.backdrop_batches += 1;
         if let Some(d) = dirty {
@@ -1101,11 +1199,11 @@ impl App {
             return;
         }
         self.scene.begin(&self.gfx, d, None);
-        if self.ui.dim > 0.002 || self.ui.placeholder.is_some() {
+        if self.ui.dim > 0.002 || self.ui.placeholder.is_some() || self.ui.scrim() > 0.002 {
             self.ui.draw_pre(&self.gfx, d);
         }
         self.scene.draw_cards(&self.gfx, d, &now);
-        if self.ui.edit || self.ui.toast.is_some() {
+        if self.ui.edit || self.ui.toast.is_some() || self.ui.prompt.is_some() || self.ui.menu.is_some() {
             self.ui.draw_post(&self.scene, &self.gfx, &now, d);
         }
         if let Err(e) = self.scene.end(&self.gfx) {
@@ -1113,6 +1211,11 @@ impl App {
             return;
         }
         self.present(d);
+        // whatever changed the settings panel or the toast may have left something to glide: wake the animation timer
+        if self.ui.settings || self.ui.toast.is_some() {
+            self.ui.sa_track();
+            self.arm_anim();
+        }
     }
 
     /// Copy `d` (canvas px, inside the window) of the frame into the DIB and push it to the layered window.
@@ -1286,8 +1389,11 @@ impl App {
             self.frame(r);
         }
         if self.scene.take_fx_wake() {
-            // the pointer glint moved / faded: the animation timer paints it, then stops again
-            self.last_anim = Instant::now();
+            // hover / press / glint moved: the animation timer paints it, then stops again. Only a stopped timer restarts its clock:
+            // resetting it on every mouse move would shrink each step's dt and slow the easing down while the pointer moves
+            if self.anim_period == 0 {
+                self.last_anim = Instant::now();
+            }
             self.arm_anim();
         }
         changed
@@ -1344,6 +1450,12 @@ impl App {
             if TrackMouseEvent(&mut t).is_ok() {
                 self.tracking = true;
             }
+        }
+        if self.ui.menu.is_some() {
+            return self.menu_mouse(msg, x, y);
+        }
+        if self.ui.prompt.is_some() {
+            return self.prompt_mouse(msg, wp, x, y);
         }
         if self.ui.edit {
             return self.edit_mouse(msg, wp, x, y);
@@ -1441,6 +1553,11 @@ impl App {
         }
         let old = self.ui.hover;
         self.ui.hover = h;
+        // the settings panel eases its hover looks in and out: the animation timer repaints just the control
+        if self.ui.settings && (ui::hkey(old).is_some() || ui::hkey(h).is_some()) {
+            self.arm_anim();
+            return;
+        }
         // only hovers that change how something looks need a frame
         let looks = |h: Hit| matches!(h, Hit::Minus(_) | Hit::Group(_) | Hit::Item(_) | Hit::Done | Hit::SettingsBtn | Hit::Look(..) | Hit::Opt(..) | Hit::Autostart | Hit::CheckStart | Hit::UpdBtn | Hit::UpdInstall | Hit::UpdPage | Hit::ResetLook | Hit::EditBtn | Hit::QuitBtn);
         if looks(old) || looks(h) {
@@ -1483,6 +1600,7 @@ impl App {
                         return;
                     }
                     Press::Ui(Hit::Look(i, _)) => {
+                        self.ui.sa_drag_move(i, x); // far from where it was pressed: the handle follows 1:1
                         let t = self.ui.set_value_at(i, x);
                         self.set_look_slider(i, t);
                         return;
@@ -1539,7 +1657,9 @@ impl App {
                     }
                     Hit::Look(i, t) => {
                         self.press = Press::Ui(hit);
+                        self.ui.sa_drag_start(i, x, t);
                         self.set_look_slider(i, t);
+                        self.arm_anim(); // the knob swells, the handle glides to a click on the track
                     }
                     Hit::Panel => {
                         // an empty part of the panel is a handle: drag the whole panel
@@ -1549,6 +1669,11 @@ impl App {
                     }
                     Hit::None if self.ui.settings => self.press = Press::Ui(Hit::None), // a click outside the panel closes it on release
                     Hit::None => self.ui.st.focus = false,
+                    _ if self.ui.settings && ui::hkey(hit).is_some() => {
+                        // a button / segment / switch of the settings panel: the press spring repaints it
+                        self.press = Press::Ui(hit);
+                        self.arm_anim();
+                    }
                     _ => {
                         self.press = Press::Ui(hit);
                         if let Some(d) = self.hover_dirty(hit) {
@@ -1560,6 +1685,7 @@ impl App {
             WM_LBUTTONUP => {
                 let press = std::mem::replace(&mut self.press, Press::None);
                 self.ui.press = Hit::None;
+                self.ui.sa_drag_end();
                 let _ = ReleaseCapture();
                 match press {
                     Press::Drag => self.end_drag(),
@@ -1588,6 +1714,8 @@ impl App {
                         };
                         if same {
                             self.ui_click(h);
+                        } else if self.ui.settings && ui::hkey(h).is_some() {
+                            self.arm_anim(); // released elsewhere: the press spring lets go
                         } else if let Some(d) = self.hover_dirty(h) {
                             self.frame(d);
                         }
@@ -1595,6 +1723,9 @@ impl App {
                     _ => {}
                 }
                 self.set_hover(hit);
+                if self.ui.settings {
+                    self.arm_anim(); // the press spring of whatever was held
+                }
             }
             WM_RBUTTONUP => {
                 if let Hit::Card(i) | Hit::Minus(i) = hit {
@@ -1674,10 +1805,14 @@ impl App {
     unsafe fn gallery_changed(&mut self) {
         let now = Now::local();
         self.ui.sync_previews(&self.gfx, &now);
+        if !self.reduced {
+            self.ui.gal_note();
+        }
         self.arm_ui_timer();
         if let Some(d) = self.hover_dirty(Hit::Panel) {
             self.frame(d);
         }
+        self.arm_anim(); // the tiles fade in
     }
 
     // ------------------------------------------------ keyboard (edit mode: the search box, the sliders)
@@ -1782,6 +1917,12 @@ impl App {
     }
 
     unsafe fn on_key(&mut self, msg: u32, wp: usize) {
+        if self.ui.menu.is_some() {
+            return self.menu_key(msg, wp);
+        }
+        if self.ui.prompt.is_some() {
+            return self.prompt_key(msg, wp);
+        }
         if !self.ui.edit {
             return;
         }
@@ -2067,7 +2208,6 @@ impl App {
         let c = &self.scene.cards[i];
         let def = crate::registry::global().get(&c.type_id)?;
         let (x, y) = unpack(lp);
-        self.in_menu = true;
         Some(MenuReq { uid, x, y, sizes: def.sizes.to_vec(), cur: c.size, editing: self.ui.edit, lang: self.ui.lang })
     }
 
@@ -2107,6 +2247,9 @@ impl App {
             || self.ui.away > 0.0
             || self.jig_amp > 0.0 && !(self.ui.edit && !self.ui.settings && self.editing && !self.reduced)
             || self.jig_amp < 1.0 && self.ui.edit && !self.ui.settings && self.editing && !self.reduced
+            || self.ui.sa_busy()
+            || self.ui.gal_busy()
+            || self.ui.toast_busy(self.reduced)
     }
 
     /// One timer drives every animation: 16 ms while something moves, 33 ms for the jiggle of a resting edit mode, off otherwise.
@@ -2119,6 +2262,9 @@ impl App {
             0
         };
         if period != self.anim_period {
+            if self.anim_period == 0 {
+                self.last_anim = Instant::now(); // the first step of a fresh run is one period long, not the whole idle time
+            }
             self.anim_period = period;
             if period == 0 {
                 let _ = KillTimer(self.hwnd, T_ANIM);
@@ -2295,9 +2441,24 @@ impl App {
         if let Some(r) = self.scene.step_fx(&self.gfx, dt, &now0) {
             add(&mut dirty, r);
         }
+        // the settings controls (hover, sliding segment, switches, handles) repaint only the controls that moved
+        if let Some(r) = self.ui.step_sa(dt, self.reduced) {
+            add(&mut dirty, r);
+        }
+        if let Some(r) = self.ui.step_gal(dt, self.reduced) {
+            add(&mut dirty, r);
+        }
+        // toast: rise / fade; dropped once the fade-out ended
+        let (toast_ch, toast_gone) = self.ui.toast_step(dt, self.reduced);
+        if toast_ch {
+            add(&mut dirty, self.toast_rect());
+        }
 
         if let Some(d) = dirty {
             self.frame(d);
+        }
+        if toast_gone {
+            self.fit_window(); // the toast needed the whole monitor in live mode
         }
         // finished?
         if !self.editing && self.ui.edit && self.gal_t <= 0.0 && self.dim_t <= 0.0 && self.drag.is_none() {
@@ -2366,6 +2527,7 @@ impl App {
     /// Entry point of the settings panel (tray menu, Ctrl+Alt+G, the strip's button): from the live desk the layer becomes interactive
     /// exactly as for edit mode (activatable, raised, click-through off); inside edit mode the panel replaces the gallery.
     unsafe fn open_settings(&mut self) {
+        self.abort_menu();
         if self.ui.settings {
             return;
         }
@@ -2397,6 +2559,7 @@ impl App {
         self.ui.accent_scope = self.settings.accent_scope;
         self.ui.autostart = crate::autostart::enabled();
         self.ui.check_start = self.settings.check_updates;
+        self.ui.sa_reset(); // the panel opens showing the real values, nothing glides from stale ones
     }
 
     /// Swap the open panel in place (gallery <-> settings) inside the running edit mode; the new panel fades in.
@@ -2439,6 +2602,7 @@ impl App {
     }
 
     unsafe fn enter_edit_as(&mut self, settings: bool) {
+        self.abort_menu(); // the menu belongs to the desk as it was
         if self.editing || self.ui.edit || !self.visible {
             return;
         }
@@ -2491,6 +2655,7 @@ impl App {
 
     /// Esc / "Готово" / hotkey / menu: start the closing animation; `finish_leave_edit` runs when it is over.
     unsafe fn leave_edit(&mut self) {
+        self.abort_menu();
         if !self.editing {
             return;
         }
@@ -2579,12 +2744,12 @@ impl App {
     }
 
     unsafe fn show_toast(&mut self, msg: String) {
-        self.ui.toast = Some(msg);
+        self.ui.toast_show(msg, self.reduced);
         SetTimer(self.hwnd, T_TOAST, 2000, None);
         let r = self.desired_window();
         self.set_window(r); // live mode: the layer only covers the cards, the toast sits mid-screen
         let d = self.toast_rect();
-        self.frame(d);
+        self.frame(d); // arms the animation timer for the rise
     }
 
     // ------------------------------------------------ settings
@@ -2880,6 +3045,8 @@ impl App {
 
     /// Re-create the backdrop and every GPU object of the scene (settings / monitor / DPI change); widget instances stay.
     unsafe fn rebuild(&mut self, keep_layout: bool) {
+        self.abort_prompt(); // new geometry: the prompt is cancelled
+        self.abort_menu(); // ... and the menu is closed
         let mon = monitor();
         let (mw, mh) = (mon.rect.right - mon.rect.left, mon.rect.bottom - mon.rect.top);
         let s = if keep_layout && same_rect(&mon.rect, &self.mon) { self.s } else { mon.scale };
@@ -3158,6 +3325,32 @@ impl App {
 
     /// Fullscreen guard (500 ms): hide while a fullscreen app is in front, pause the capture, re-stack on show.
     unsafe fn guard(&mut self) {
+        // the menu closes when its card is gone (removed by a layout reload, a profile switch...)
+        if self.ui.menu.as_ref().is_some_and(|m| !m.closing) && self.scene.index_of_uid(self.menu_uid).is_none() {
+            self.abort_menu();
+        }
+        // the prompt / the menu end when another window takes the foreground (a click elsewhere); a layer that never got the keyboard is asked again
+        let prompt_up = self.ui.prompt.as_ref().is_some_and(|p| !p.closing);
+        if prompt_up || self.ui.menu.as_ref().is_some_and(|m| !m.closing) {
+            let fg = GetForegroundWindow();
+            let mut cls = [0u16; 64];
+            let n = GetClassNameW(fg, &mut cls);
+            let popup = String::from_utf16_lossy(&cls[..n.max(0) as usize]) == "#32768";
+            if fg == self.hwnd {
+                self.prompt_was_fg = true;
+            } else if self.prompt_was_fg {
+                if !fg.0.is_null() && !popup && self.prompt_t0.elapsed() > Duration::from_millis(1000) {
+                    if prompt_up {
+                        self.end_prompt(None);
+                    } else {
+                        self.close_menu();
+                    }
+                }
+            } else if self.prompt_t0.elapsed() < Duration::from_millis(2000) {
+                force_foreground(self.hwnd);
+                let _ = SetFocus(self.hwnd);
+            }
+        }
         // edit mode ends when another window takes the foreground (alt-tab, a click on another app)
         if self.editing && self.ui.edit && !self.in_menu && self.drag.is_none() {
             let fg = GetForegroundWindow();
@@ -3182,6 +3375,8 @@ impl App {
         }
         let fs = self.user_hidden || foreground_is_fullscreen(self.hwnd, &self.mon);
         if fs && self.visible {
+            self.abort_prompt();
+            self.abort_menu();
             let _ = ShowWindow(self.hwnd, SW_HIDE);
             self.visible = false;
             if let Some(b) = &self.backdrop {
@@ -3194,7 +3389,7 @@ impl App {
             self.redraw(all, false);
         } else if self.visible {
             self.guard_n += 1;
-            if self.guard_n % 8 == 0 && !self.ui.edit {
+            if self.guard_n % 8 == 0 && !self.ui.edit && self.ui.prompt.is_none() && self.ui.menu.is_none() {
                 place_above_desktop(self.hwnd); // explorer restarts / shell re-stacks
             }
         }
@@ -3281,8 +3476,11 @@ impl App {
             let key = crate::accent::wallpaper_key();
             // what is on the screen: the captured desktop (a dynamic / slideshow wallpaper included); the wallpaper file only without a capture
             let live = if self.settings.live && (force || self.accent_last.elapsed() >= Duration::from_secs(8)) {
-                self.accent_last = Instant::now();
-                self.scene.backdrop_colors(&self.gfx).ok().map(|px| crate::accent::pick(&px))
+                // the throttle starts only when a capture really existed: a failed read is retried at the next poll
+                self.scene.backdrop_colors(&self.gfx).ok().map(|px| {
+                    self.accent_last = Instant::now();
+                    crate::accent::pick_or_neutral(&px)
+                })
             } else {
                 None
             };
@@ -3312,6 +3510,11 @@ impl App {
             None
         };
         self.accent_cur = rgb;
+        if self.settings.live {
+            if let Some(c) = rgb {
+                crate::accent::save_cache(c); // the next start begins with this colour instead of the wallpaper file's
+            }
+        }
         if crate::widget::set_accent(rgb) {
             self.scene.invalidate_all();
             let now = self.now();
@@ -3398,6 +3601,507 @@ impl App {
             }
             Err(e) => self.notify(format!("{}: {e}", self.ui.lang.pick("Макет не удалён", "Layout not deleted"))),
         }
+    }
+}
+
+// ---------------------------------------------------------------- the text prompt on the canvas
+
+/// Put `s` on the clipboard as CF_UNICODETEXT (CR LF line breaks).
+fn set_clipboard_text(hwnd: HWND, s: &str) {
+    use windows::Win32::System::DataExchange::{EmptyClipboard, SetClipboardData};
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    let t = s.replace("\r\n", "\n").replace('\n', "\r\n");
+    let w: Vec<u16> = t.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        if OpenClipboard(hwnd).is_err() {
+            return;
+        }
+        let _ = EmptyClipboard();
+        if let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, w.len() * 2) {
+            let p = GlobalLock(h) as *mut u16;
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
+                let _ = GlobalUnlock(h);
+                let _ = SetClipboardData(13, HANDLE(h.0)); // the clipboard owns the memory now
+            }
+        }
+        let _ = CloseClipboard();
+    }
+}
+
+impl App {
+    /// A widget thread asked for a text prompt (`input::prompt_ex`): show it on the canvas, next to the cursor. Refused (the worker runs the
+    /// Win32 popup) while the layer is hidden or a card is being dragged.
+    unsafe fn on_prompt_request(&mut self) {
+        let Some(req) = input::take_request() else { return };
+        self.abort_menu(); // a prompt and a menu are never up together
+        if self.ui.prompt.is_some() {
+            self.finish_prompt(); // the previous one is still fading out
+        }
+        if !self.visible || self.drag.is_some() {
+            let _ = req.reply.send(input::Reply::Fallback);
+            return;
+        }
+        let now = self.now();
+        self.leave(&now);
+        let s = self.s;
+        let work = Rect::new((self.work.left - self.mon.left) as f32 / s, (self.work.top - self.mon.top) as f32 / s, (self.work.right - self.work.left) as f32 / s, (self.work.bottom - self.work.top) as f32 / s);
+        // the cursor (screen px) on this canvas in logical px; from another monitor the panel opens in the upper middle of the work area
+        let (ax, ay) = req.anchor;
+        let on = ax >= self.mon.left && ax < self.mon.right && ay >= self.mon.top && ay < self.mon.bottom;
+        let anchor = if on { ((ax - self.mon.left) as f32 / s, (ay - self.mon.top) as f32 / s) } else { (work.cx(), work.y + work.h * 0.35) };
+        // the keyboard: the layer becomes activatable and takes the foreground (as in edit mode); remember who had it
+        self.modal_begin();
+        self.boost_capture();
+        self.reduced = reduced_motion();
+        self.ui.open_prompt(&self.scene, &self.gfx, &req.opts, anchor, work);
+        self.prompt_reply = Some(req.reply);
+        (self.prompt_was_fg, self.prompt_t0, self.prompt_last, self.prompt_scrim, self.prompt_hi, self.prompt_click) = (false, Instant::now(), Instant::now(), 0.0, None, None);
+        let full = RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h };
+        self.set_window(full); // live mode: the layer covers the whole monitor, like for the toast
+        self.ui.sync_panels(&mut self.scene, &self.gfx);
+        self.sync_regions();
+        force_foreground(self.hwnd);
+        let _ = SetFocus(self.hwnd);
+        self.prompt_period = 16;
+        SetTimer(self.hwnd, T_PROMPT, 16, None);
+        self.prompt_tick();
+    }
+
+    /// Open / close animation (16 ms), then the caret blink (500 ms); the veil over the desktop fades in 4 steps (each one a full frame).
+    unsafe fn prompt_tick(&mut self) {
+        let t = Instant::now();
+        let dt = t.saturating_duration_since(self.prompt_last).as_secs_f32().clamp(0.0, 0.1);
+        self.prompt_last = t;
+        let reduced = self.reduced;
+        let Some(p) = self.ui.prompt.as_mut() else {
+            let _ = KillTimer(self.hwnd, T_PROMPT);
+            self.prompt_period = 0;
+            return;
+        };
+        let closing = p.closing;
+        let busy = if reduced {
+            p.t = if closing { 0.0 } else { 1.0 };
+            false
+        } else {
+            p.step(dt)
+        };
+        let scrim = p.scrim();
+        let mut d = self.ui.prompt_dirty(&self.scene);
+        if (scrim - self.prompt_scrim).abs() > 1e-4 {
+            self.prompt_scrim = scrim;
+            d = Some(RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h });
+        }
+        if closing && !busy {
+            return self.finish_prompt();
+        }
+        let period = if busy { 16 } else { 500 };
+        if period != self.prompt_period {
+            self.prompt_period = period;
+            SetTimer(self.hwnd, T_PROMPT, period, None);
+            self.ui.caret_on = true;
+        } else if !busy {
+            self.ui.caret_on = !self.ui.caret_on;
+        }
+        if let Some(d) = d {
+            self.frame(d);
+        }
+    }
+
+    /// The user answered (or cancelled): the worker gets the answer at once, the panel fades out.
+    unsafe fn end_prompt(&mut self, answer: Option<String>) {
+        if let Some(tx) = self.prompt_reply.take() {
+            let _ = tx.send(input::Reply::Answer(answer));
+        }
+        let Some(p) = self.ui.prompt.as_mut() else { return };
+        if p.closing {
+            return;
+        }
+        (p.closing, p.selecting, p.hover, p.press) = (true, false, None, None);
+        let _ = ReleaseCapture();
+        self.prompt_last = Instant::now();
+        self.prompt_period = 16;
+        SetTimer(self.hwnd, T_PROMPT, 16, None);
+        self.prompt_tick();
+    }
+
+    /// The panel is gone: no veil, the layer goes back to click-through under the app windows and the foreground to whoever had it.
+    unsafe fn finish_prompt(&mut self) {
+        self.prompt_reply = None; // a prompt that was never answered counts as a cancel (the worker sees the dropped channel)
+        let _ = KillTimer(self.hwnd, T_PROMPT);
+        self.prompt_period = 0;
+        if self.ui.prompt.take().is_none() {
+            return;
+        }
+        self.prompt_scrim = 0.0;
+        self.ui.sync_panels(&mut self.scene, &self.gfx);
+        self.sync_regions();
+        let full = RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h };
+        self.frame(full);
+        self.modal_end();
+    }
+
+    /// The keyboard hand-off of a modal (prompt, menu) on the live desk: remember who has the foreground, the layer becomes activatable,
+    /// stops being click-through and is raised (as in edit mode, which already has all of that).
+    unsafe fn modal_begin(&mut self) {
+        let fg = GetForegroundWindow();
+        if fg != self.hwnd {
+            self.prompt_fg = fg;
+        }
+        if !self.ui.edit {
+            let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, ex & !(WS_EX_NOACTIVATE.0 as isize) & !(WS_EX_TRANSPARENT.0 as isize));
+            self.interactive = true;
+            let _ = SetWindowPos(self.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+
+    /// The modal is gone: the layer goes back to click-through under the app windows, the foreground to whoever had it, the window to the cards.
+    unsafe fn modal_end(&mut self) {
+        if !self.ui.edit {
+            let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE.0 as isize | WS_EX_TRANSPARENT.0 as isize);
+            self.interactive = false;
+            if GetForegroundWindow() == self.hwnd && !self.prompt_fg.0.is_null() && IsWindow(self.prompt_fg).as_bool() {
+                let _ = SetForegroundWindow(self.prompt_fg);
+            }
+            place_above_desktop(self.hwnd);
+            self.fit_window();
+            let w = self.win;
+            self.frame(w);
+        }
+    }
+
+    /// Teardown (fullscreen guard, monitor change): answer "cancelled" and drop the panel at once, no animation.
+    unsafe fn abort_prompt(&mut self) {
+        if let Some(tx) = self.prompt_reply.take() {
+            let _ = tx.send(input::Reply::Answer(None));
+        }
+        if self.ui.prompt.is_some() {
+            self.finish_prompt();
+        }
+    }
+
+    unsafe fn redraw_prompt(&mut self) {
+        self.ui.caret_on = true;
+        if let Some(d) = self.ui.prompt_dirty(&self.scene) {
+            self.frame(d);
+        }
+    }
+
+    unsafe fn apply_act(&mut self, a: Act) {
+        match a {
+            Act::None => {}
+            Act::Redraw => self.redraw_prompt(),
+            Act::Clip(t) => {
+                set_clipboard_text(self.hwnd, &t);
+                self.redraw_prompt();
+            }
+            Act::Done(r) => self.end_prompt(r),
+        }
+    }
+
+    fn prompt_field_under_cursor(&self) -> bool {
+        let Some(p) = self.ui.prompt.as_ref().filter(|p| !p.closing) else { return false };
+        let mut c = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut c).is_err() {
+                return false;
+            }
+        }
+        p.hit((c.x - self.mon.left) as f32 / self.s, (c.y - self.mon.top) as f32 / self.s) == crate::prompt::PHit::Field
+    }
+
+    /// Mouse while the prompt is up: nothing behind it is reachable; a click outside the panel cancels.
+    unsafe fn prompt_mouse(&mut self, msg: u32, wp: WPARAM, x: i32, y: i32) {
+        if self.ui.prompt.as_ref().is_some_and(|p| p.closing) {
+            return;
+        }
+        let (lx, ly) = (x as f32 / self.s, y as f32 / self.s);
+        let m = Mods { ctrl: GetKeyState(VK_CONTROL.0 as i32) < 0, shift: GetKeyState(VK_SHIFT.0 as i32) < 0 };
+        let act = match msg {
+            WM_MOUSEMOVE => self.ui.prompt_mouse(&self.scene, &self.gfx, 0, lx, ly, m, false),
+            WM_LBUTTONDOWN => {
+                let t = Instant::now();
+                let dbl = self.prompt_click.is_some_and(|(t0, x0, y0)| t.duration_since(t0).as_millis() as u32 <= GetDoubleClickTime() && (x - x0).abs() <= 4 && (y - y0).abs() <= 4);
+                self.prompt_click = if dbl { None } else { Some((t, x, y)) };
+                SetCapture(self.hwnd);
+                self.ui.prompt_mouse(&self.scene, &self.gfx, 1, lx, ly, m, dbl)
+            }
+            WM_LBUTTONUP => {
+                let _ = ReleaseCapture();
+                self.ui.prompt_mouse(&self.scene, &self.gfx, 2, lx, ly, m, false)
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((wp.0 >> 16) as u16 as i16) as f32 / 120.0;
+                if self.ui.prompt_wheel(&self.scene, &self.gfx, delta) {
+                    Act::Redraw
+                } else {
+                    Act::None
+                }
+            }
+            _ => Act::None,
+        };
+        self.apply_act(act);
+    }
+
+    /// Keys while the prompt is up (the layer is the foreground window, so WM_KEYDOWN / WM_CHAR arrive here).
+    unsafe fn prompt_key(&mut self, msg: u32, wp: usize) {
+        if self.ui.prompt.as_ref().is_some_and(|p| p.closing) {
+            return;
+        }
+        let m = Mods { ctrl: GetKeyState(VK_CONTROL.0 as i32) < 0, shift: GetKeyState(VK_SHIFT.0 as i32) < 0 };
+        let key = match msg {
+            WM_SYSKEYDOWN => return, // Alt+Tab and friends belong to Windows
+            WM_KEYDOWN => match VIRTUAL_KEY(wp as u16) {
+                VK_ESCAPE => Key::Esc,
+                VK_RETURN => Key::Enter,
+                VK_TAB => Key::Tab,
+                VK_BACK => Key::Back,
+                VK_DELETE => Key::Delete,
+                VK_LEFT => Key::Left,
+                VK_RIGHT => Key::Right,
+                VK_UP => Key::Up,
+                VK_DOWN => Key::Down,
+                VK_HOME => Key::Home,
+                VK_END => Key::End,
+                VK_A if m.ctrl => Key::SelectAll,
+                VK_C if m.ctrl => Key::Copy,
+                VK_X if m.ctrl => Key::Cut,
+                VK_V if m.ctrl => match clipboard_text(self.hwnd) {
+                    Some(t) => Key::Paste(t),
+                    None => return,
+                },
+                VK_SPACE if self.ui.prompt.as_ref().is_some_and(|p| p.focus != crate::prompt::Focus::Field) => Key::Char(' '),
+                _ => return,
+            },
+            WM_CHAR => {
+                // UTF-16 units: a high surrogate waits for its low one (emoji)
+                let u = wp as u32;
+                let c = match u {
+                    0xD800..=0xDBFF => {
+                        self.prompt_hi = Some(u as u16);
+                        return;
+                    }
+                    0xDC00..=0xDFFF => {
+                        let Some(hi) = self.prompt_hi.take() else { return };
+                        match char::decode_utf16([hi, u as u16]).next() {
+                            Some(Ok(c)) => c,
+                            _ => return,
+                        }
+                    }
+                    _ => {
+                        self.prompt_hi = None;
+                        let Some(c) = char::from_u32(u) else { return };
+                        c
+                    }
+                };
+                if c.is_control() || (c == ' ' && self.ui.prompt.as_ref().is_some_and(|p| p.focus != crate::prompt::Focus::Field)) {
+                    return; // control codes come as key presses; the space on a button was handled at WM_KEYDOWN
+                }
+                Key::Char(c)
+            }
+            _ => return,
+        };
+        let act = self.ui.prompt_key(&self.scene, &self.gfx, key, m);
+        self.apply_act(act);
+    }
+}
+
+// ---------------------------------------------------------------- the card context menu on the canvas
+
+impl App {
+    /// Show the menu of a card on the canvas at the cursor (glass panels, see menu.rs). False = it cannot be shown now and the caller runs
+    /// the native popup instead: `MSWIDGETS_NATIVE_MENU=1`, the layer is hidden, a card is dragged, the prompt or the settings panel is up.
+    unsafe fn show_menu(&mut self, req: &MenuReq) -> bool {
+        if std::env::var_os("MSWIDGETS_NATIVE_MENU").is_some() || !self.visible || self.drag.is_some() || self.ui.prompt.is_some() || self.ui.settings {
+            return false;
+        }
+        self.abort_menu(); // the previous one, if any
+        let now = self.now();
+        self.leave(&now);
+        let s = self.s;
+        let work = Rect::new((self.work.left - self.mon.left) as f32 / s, (self.work.top - self.mon.top) as f32 / s, (self.work.right - self.work.left) as f32 / s, (self.work.bottom - self.work.top) as f32 / s);
+        // the cursor (screen px) on this canvas in logical px
+        let on = req.x >= self.mon.left && req.x < self.mon.right && req.y >= self.mon.top && req.y < self.mon.bottom;
+        let anchor = if on { ((req.x - self.mon.left) as f32 / s, (req.y - self.mon.top) as f32 / s) } else { (work.cx(), work.cy()) };
+        // the keyboard (Esc, arrows): the same hand-off as the prompt; a native menu needed the foreground too
+        self.modal_begin();
+        self.boost_capture();
+        self.reduced = reduced_motion();
+        self.ui.open_menu(&self.scene, &self.gfx, menu::card_menu(req.lang, req.editing, &req.sizes, req.cur), anchor, work);
+        self.menu_uid = req.uid;
+        (self.prompt_was_fg, self.prompt_t0, self.menu_last, self.menu_shown) = (false, Instant::now(), Instant::now(), None);
+        let full = RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h };
+        self.set_window(full); // live mode: the layer covers the whole monitor, so a click outside lands on it (the faint veil makes it opaque to hits)
+        self.ui.sync_panels(&mut self.scene, &self.gfx);
+        self.sync_regions();
+        force_foreground(self.hwnd);
+        let _ = SetFocus(self.hwnd);
+        self.menu_shown = self.ui.menu_dirty(&self.scene);
+        self.frame(full);
+        self.menu_period = 16;
+        SetTimer(self.hwnd, T_MENU, 16, None);
+        true
+    }
+
+    /// Open / close animation and the hover delay of the submenu (16 ms while something moves, no timer otherwise).
+    unsafe fn menu_tick(&mut self) {
+        let t = Instant::now();
+        let dt = t.saturating_duration_since(self.menu_last).as_secs_f32().clamp(0.0, 0.1);
+        self.menu_last = t;
+        let reduced = self.reduced;
+        let Some(m) = self.ui.menu.as_mut() else {
+            let _ = KillTimer(self.hwnd, T_MENU);
+            self.menu_period = 0;
+            return;
+        };
+        let closing = m.closing;
+        let (busy, layout) = m.step(dt, reduced);
+        if closing && !busy {
+            return self.finish_menu();
+        }
+        if layout {
+            self.ui.sync_panels(&mut self.scene, &self.gfx);
+            self.sync_regions();
+        }
+        if !busy {
+            let _ = KillTimer(self.hwnd, T_MENU);
+            self.menu_period = 0;
+        }
+        self.menu_frame();
+    }
+
+    /// Compose the menu's rectangle: where it is now and where it was drawn last (a closed submenu leaves its place).
+    unsafe fn menu_frame(&mut self) {
+        let now = self.ui.menu_dirty(&self.scene);
+        let d = match (now, self.menu_shown) {
+            (Some(a), Some(b)) => Some(union(a, b)),
+            (a, b) => a.or(b),
+        };
+        self.menu_shown = now;
+        if let Some(d) = d {
+            self.frame(d);
+        }
+    }
+
+    /// Start the timer when it is off (a hover that waits for its delay needs it).
+    unsafe fn menu_kick(&mut self) {
+        if self.menu_period == 0 {
+            self.menu_last = Instant::now();
+            self.menu_period = 16;
+            SetTimer(self.hwnd, T_MENU, 16, None);
+        }
+    }
+
+    unsafe fn menu_act(&mut self, act: MAct) {
+        match act {
+            MAct::None => {}
+            MAct::Redraw | MAct::Layout => {
+                if act == MAct::Layout {
+                    self.ui.sync_panels(&mut self.scene, &self.gfx);
+                    self.sync_regions();
+                }
+                self.menu_frame();
+                self.menu_kick();
+            }
+            MAct::Close => self.close_menu(),
+            MAct::Pick(id) => self.pick_menu(id),
+        }
+    }
+
+    /// The choice: "Edit widgets…" switches the mode (the menu is dropped at once, edit mode takes the foreground itself), the others fade the
+    /// menu out while they run.
+    unsafe fn pick_menu(&mut self, id: usize) {
+        let uid = self.menu_uid;
+        if id == CMD_EDIT {
+            self.abort_menu();
+            if !self.ui.edit && !self.prompt_fg.0.is_null() && GetForegroundWindow() == self.hwnd {
+                self.prev_fg = self.prompt_fg; // the foreground has not moved back yet: edit mode must return it to the same window
+            }
+            if self.editing {
+                self.leave_edit();
+            } else {
+                self.enter_edit();
+            }
+            return;
+        }
+        self.close_menu();
+        match id {
+            c if (CMD_SIZE..CMD_SIZE + 3).contains(&c) => self.change_size(uid, Size::ALL[c - CMD_SIZE]),
+            CMD_DELETE => self.remove_card(uid),
+            _ => {}
+        }
+    }
+
+    /// Fade the menu out (Esc, a click outside, a choice, another window in front).
+    unsafe fn close_menu(&mut self) {
+        let Some(m) = self.ui.menu.as_mut() else { return };
+        if m.closing {
+            return;
+        }
+        (m.closing, m.press) = (true, None);
+        self.menu_last = Instant::now();
+        self.menu_period = 16;
+        SetTimer(self.hwnd, T_MENU, 16, None);
+        self.menu_tick();
+    }
+
+    /// The menu is gone: no veil, the layer goes back to click-through under the app windows and the foreground to whoever had it.
+    unsafe fn finish_menu(&mut self) {
+        let _ = KillTimer(self.hwnd, T_MENU);
+        self.menu_period = 0;
+        if self.ui.menu.take().is_none() {
+            return;
+        }
+        self.menu_shown = None;
+        self.ui.sync_panels(&mut self.scene, &self.gfx);
+        self.sync_regions();
+        let full = RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h };
+        self.frame(full);
+        self.modal_end();
+    }
+
+    /// Teardown (edit mode toggle, fullscreen guard, monitor change, the card is gone): drop the menu at once, no animation.
+    unsafe fn abort_menu(&mut self) {
+        if self.ui.menu.is_some() {
+            self.finish_menu();
+        }
+    }
+
+    /// Mouse while the menu is up (monitor px): nothing behind it is reachable; a click outside the panels closes it.
+    unsafe fn menu_mouse(&mut self, msg: u32, x: i32, y: i32) {
+        let Some(m) = self.ui.menu.as_mut().filter(|m| !m.closing) else { return };
+        let (lx, ly) = (x as f32 / self.s, y as f32 / self.s);
+        let act = match msg {
+            WM_MOUSEMOVE => m.mouse_move(lx, ly),
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN => m.mouse_down(lx, ly),
+            WM_LBUTTONUP | WM_RBUTTONUP => m.mouse_up(lx, ly),
+            _ => MAct::None, // the wheel does nothing
+        };
+        self.menu_act(act);
+    }
+
+    /// Keys while the menu is up (the layer is the foreground window, so WM_KEYDOWN arrives here).
+    unsafe fn menu_key(&mut self, msg: u32, wp: usize) {
+        if msg != WM_KEYDOWN {
+            return;
+        }
+        let Some(m) = self.ui.menu.as_mut().filter(|m| !m.closing) else { return };
+        let key = match VIRTUAL_KEY(wp as u16) {
+            VK_ESCAPE => Key::Esc,
+            VK_RETURN => Key::Enter,
+            VK_SPACE => Key::Char(' '),
+            VK_UP => Key::Up,
+            VK_DOWN => Key::Down,
+            VK_LEFT => Key::Left,
+            VK_RIGHT => Key::Right,
+            VK_HOME => Key::Home,
+            VK_END => Key::End,
+            _ => return,
+        };
+        let act = m.key(key);
+        self.menu_act(act);
     }
 }
 
