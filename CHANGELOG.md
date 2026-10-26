@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.11] - 2026-10-26
+
+### Fixed
+- The widgets used about half a core and about 5 MB more memory every minute (1.2 GB after three hours). The Quick Actions poll ("every 2 s") had no time gate: each finished job woke the card, which started the next one at once, about 480 short-lived threads a second (audio endpoint, radios, a monitor brightness read over DDC/CI), and the NVIDIA driver keeps a small object for every thread it has seen. The poll now starts at most once per 1.9 s, so the radios are read about every 10 s and the brightness every 2 minutes. Idle CPU with a video wallpaper: about 50 % -> about 8 % of one core, memory stays flat.
+- A prompt thread that panicked left the text prompt "busy" for good; the GDI capture fallback leaked a bitmap when it stopped.
+
+### Changed
+- The desk sleeps while nobody can see it: the session is locked or on the secure desktop (UAC), the monitors are off, the PC suspends, or other windows cover every card completely (a card that is even partly visible keeps everything running; opening the editor, the menu or a prompt wakes it within 100 ms). The capture and the live glass stop, and everything resumes at once on unlock / wake. `MSWIDGETS_NO_AUTOPAUSE=1` turns the new reasons off.
+- Capture: the Windows capture session gets a minimum update interval that matches the look rate, so the compositor no longer delivers frames at the video's rate while only 15 a second are used; the capture threads wait on a parked timeout instead of 25 ms naps (stop and boost are immediate).
+- `accent.txt` is rewritten only when the colour changed (it was rewritten every 8-10 s).
+
 ## [0.5.10] - 2026-10-26
 
 ### Changed

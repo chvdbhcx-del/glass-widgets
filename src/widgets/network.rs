@@ -256,7 +256,7 @@ impl Widget for Network {
                 }));
             }
         }
-        Tick::Every(Duration::from_secs(1))
+        Tick::Every(Duration::from_secs(1)) // the speeds live in `overlay`: see sysmon, `Poll` would lose them on the next recompose
     }
 }
 

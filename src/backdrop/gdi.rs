@@ -62,6 +62,7 @@ impl GdiBackdrop {
 impl Drop for GdiBackdrop {
     fn drop(&mut self) {
         self.shared.stop.store(true, Relaxed);
+        self.shared.wake();
         if let Some(t) = self.th.lock().ok().and_then(|mut g| g.take()) {
             let _ = t.join();
         }
@@ -89,6 +90,7 @@ impl Backdrop for GdiBackdrop {
     }
     fn set_paused(&self, p: bool) {
         self.shared.paused.store(p, Relaxed);
+        self.shared.wake();
     }
     fn set_hwnd(&self, h: HWND) {
         self.shared.hwnd.store(h.0 as isize, Relaxed);
@@ -98,12 +100,14 @@ impl Backdrop for GdiBackdrop {
             *g = pad_regions(r, self.margin, self.size.0, self.size.1);
         }
         self.shared.regions_ver.fetch_add(1, Relaxed);
+        self.shared.wake();
     }
     fn stats(&self) -> (u64, u64) {
         (self.shared.acquired.load(Relaxed), self.shared.copied.load(Relaxed))
     }
     fn boost(&self) {
         self.shared.boost.fetch_add(1, Relaxed);
+        self.shared.wake();
     }
     fn rate_hz(&self) -> u32 {
         self.shared.rate.load(Relaxed)
@@ -119,6 +123,7 @@ unsafe fn gdi_loop(c: GdiCap) {
     let mut ver = 0u64;
     let mut prev: Vec<Vec<u8>> = Vec::new();
     let (mut dib, mut bits, mut cw, mut ch) = (HBITMAP::default(), std::ptr::null_mut::<u8>(), 0i32, 0i32);
+    let mut stock = HGDIOBJ::default(); // the bitmap `mem` had before our DIB: a selected bitmap cannot be deleted
     let mut buf: Vec<u8> = Vec::new();
     let mut pace = Pace::new(c.rate);
     let mut boost = sh.boost.load(Relaxed);
@@ -127,7 +132,7 @@ unsafe fn gdi_loop(c: GdiCap) {
         if sh.paused.load(Relaxed) {
             prev.iter_mut().for_each(|p| p.clear());
             pace.snap();
-            std::thread::sleep(Duration::from_millis(100));
+            sh.pause_wait();
             continue;
         }
         let v = sh.regions_ver.load(Relaxed);
@@ -141,7 +146,9 @@ unsafe fn gdi_loop(c: GdiCap) {
         let (mw, mh) = regions.iter().fold((0, 0), |(w, h), r| (w.max(r.right - r.left), h.max(r.bottom - r.top)));
         if mw > cw || mh > ch {
             if !dib.is_invalid() {
+                SelectObject(mem, stock);
                 let _ = DeleteObject(dib);
+                dib = HBITMAP::default();
             }
             let (nw, nh) = (mw.max(cw), mh.max(ch));
             let bmi = BITMAPINFO {
@@ -155,7 +162,10 @@ unsafe fn gdi_loop(c: GdiCap) {
                     bits = p as *mut u8;
                     cw = nw;
                     ch = nh;
-                    SelectObject(mem, dib);
+                    let was = SelectObject(mem, dib);
+                    if stock.is_invalid() {
+                        stock = was;
+                    }
                 }
                 Err(_) => {
                     std::thread::sleep(Duration::from_millis(200));
@@ -205,6 +215,10 @@ unsafe fn gdi_loop(c: GdiCap) {
         if let Some(rest) = period.checked_sub(t0.elapsed()) {
             sh.nap(rest, boost, ver);
         }
+    }
+    if !dib.is_invalid() {
+        SelectObject(mem, stock);
+        let _ = DeleteObject(dib);
     }
     let _ = DeleteDC(mem);
     ReleaseDC(None, screen);

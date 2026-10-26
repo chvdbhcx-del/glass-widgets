@@ -160,6 +160,8 @@ struct Shared {
     boost: AtomicU64,
     /// the capture thread's current rate (Hz), for the stats
     rate: AtomicU32,
+    /// the capture thread, so `wake` can end its nap / pause wait at once
+    thread: Mutex<Option<std::thread::Thread>>,
 }
 
 impl Shared {
@@ -175,19 +177,43 @@ impl Shared {
             copied: AtomicU64::new(0),
             boost: AtomicU64::new(0),
             rate: AtomicU32::new(0),
+            thread: Mutex::new(None),
         })
     }
 
-    /// Sleep `d` in short slices: ends early on stop, a host boost (vs `boost`) or moved regions (vs `ver`), so a 2 fps nap neither delays
-    /// shutdown nor the snap back to full rate.
+    /// Called by the capture thread before it parks (it may be any of the capture loops).
+    fn register(&self) {
+        if let Ok(mut g) = self.thread.lock() {
+            *g = Some(std::thread::current());
+        }
+    }
+
+    /// End the capture thread's nap / pause wait now (stop, boost, moved regions, resume). A wake before the park is not lost: it leaves a token.
+    fn wake(&self) {
+        if let Some(t) = self.thread.lock().ok().and_then(|g| g.clone()) {
+            t.unpark();
+        }
+    }
+
+    /// Park for `d`: ends early on stop, a host boost (vs `boost`) or moved regions (vs `ver`) - the host calls `wake` for each - so a 2 fps nap
+    /// neither delays shutdown nor the snap back to full rate.
     fn nap(&self, d: Duration, boost: u64, ver: u64) {
+        self.register();
         let end = Instant::now() + d;
         loop {
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() || self.stop.load(Relaxed) || self.boost.load(Relaxed) != boost || self.regions_ver.load(Relaxed) != ver {
                 return;
             }
-            std::thread::sleep(left.min(Duration::from_millis(25)));
+            std::thread::park_timeout(left);
+        }
+    }
+
+    /// The paused loop's wait: until `resume` (set_paused(false) wakes it), stop, or half a second.
+    fn pause_wait(&self) {
+        self.register();
+        if self.paused.load(Relaxed) && !self.stop.load(Relaxed) {
+            std::thread::park_timeout(Duration::from_millis(500));
         }
     }
 }

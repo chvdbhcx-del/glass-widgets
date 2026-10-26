@@ -1,7 +1,7 @@
 //! System monitor: S three ring gauges (CPU / RAM / GPU); M three rows with a 60-sample sparkline; L three graphs + GPU details
 //! (temperature, VRAM bar, power) and the RAM used/total line. Up to 2 NVIDIA GPUs through NVML (loaded dynamically, no NVIDIA = no GPU rows).
 //!
-//! Sampling happens on a worker thread once per second (`Tick::Every(1 s)` only while the card is visible): CPU from `GetSystemTimes`
+//! Sampling happens on a worker thread once per second (`Tick::Every(1 s)` only while the card is visible; the values are painted in `overlay`, which `Poll` would not repaint after a recompose): CPU from `GetSystemTimes`
 //! deltas, RAM from `GlobalMemoryStatusEx`, GPUs from `nvml.dll`. Static labels live in `draw`; everything that changes (values, rings,
 //! graphs) is painted in `overlay`, so the glass layer is never re-rendered by a sample.
 //! Previews use deterministic sample data and do no I/O; `cfg.sample_gpus` (0..2) and `cfg.sample_hot` (bool) only affect previews.
@@ -684,7 +684,7 @@ impl Widget for Sysmon {
                 }));
             }
         }
-        Tick::Every(Duration::from_secs(1))
+        Tick::Every(Duration::from_secs(1)) // the values live in `overlay`: it is repainted on every recompose (video wallpaper), `Poll` would paint it once and lose it
     }
 
     fn version(&self) -> u64 {

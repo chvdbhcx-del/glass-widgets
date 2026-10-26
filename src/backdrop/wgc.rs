@@ -7,6 +7,7 @@
 //! shrinks the frame by 8x, the small level is read back and hashed per card region. While nothing changes the capture thread backs off
 //! 15 -> 8 -> 4 -> 2 fps (`pace.rs`); any change, a card move or a host `boost()` snaps it back to full rate.
 use super::*;
+use windows::Foundation::TimeSpan;
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
@@ -33,8 +34,8 @@ struct WgcCap {
     rate: Rate,
     sampler: Option<Sampler>,
     shared: Arc<Shared>,
-    /// keeps the capture session (and its device) alive
-    _session: windows::Graphics::Capture::GraphicsCaptureSession,
+    /// keeps the capture session (and its device) alive; the loop sets its minimum update interval
+    session: windows::Graphics::Capture::GraphicsCaptureSession,
     _dev: ID3D11Device,
 }
 
@@ -96,7 +97,7 @@ impl WgcBackdrop {
                 rate: if rate.auto { Rate { fps: rate.fps.clamp(1, 15), auto: true } } else { Rate { fps: rate.fps.clamp(1, 30), auto: false } },
                 sampler,
                 shared: shared.clone(),
-                _session: session,
+                session,
                 _dev: cap_dev,
             });
             Ok(WgcBackdrop { bmp, shared, pending: Mutex::new(Some(cap)), th: Mutex::new(None), margin, size: (w as i32, h as i32) })
@@ -107,6 +108,7 @@ impl WgcBackdrop {
 impl Drop for WgcBackdrop {
     fn drop(&mut self) {
         self.shared.stop.store(true, Relaxed);
+        self.shared.wake();
         if let Some(t) = self.th.lock().ok().and_then(|mut g| g.take()) {
             let _ = t.join();
         }
@@ -134,6 +136,7 @@ impl Backdrop for WgcBackdrop {
     }
     fn set_paused(&self, p: bool) {
         self.shared.paused.store(p, Relaxed);
+        self.shared.wake();
     }
     fn set_hwnd(&self, h: HWND) {
         self.shared.hwnd.store(h.0 as isize, Relaxed);
@@ -143,12 +146,14 @@ impl Backdrop for WgcBackdrop {
             *g = pad_regions(r, self.margin, self.size.0, self.size.1);
         }
         self.shared.regions_ver.fetch_add(1, Relaxed);
+        self.shared.wake();
     }
     fn stats(&self) -> (u64, u64) {
         (self.shared.acquired.load(Relaxed), self.shared.copied.load(Relaxed))
     }
     fn boost(&self) {
         self.shared.boost.fetch_add(1, Relaxed);
+        self.shared.wake();
     }
     fn rate_hz(&self) -> u32 {
         self.shared.rate.load(Relaxed)
@@ -168,6 +173,12 @@ fn crop(org: (i32, i32), size: (i32, i32), content: (i32, i32)) -> Option<([i32;
 /// The monitor origin inside the captured desktop window.
 fn origin_in_window(mon: &RECT, window: &RECT) -> (i32, i32) {
     (mon.left - window.left, mon.top - window.top)
+}
+
+/// What to ask DWM for: at most one frame per ~3/4 of the look period (the loop looks once per period and keeps only the newest frame, so
+/// a 30 / 60 Hz video is no longer delivered, copied and closed at its own rate; the margin keeps a fresh frame ready at every look).
+fn min_update_interval(period: Duration) -> TimeSpan {
+    TimeSpan { Duration: (period.as_micros() * 10 * 3 / 4) as i64 } // 100 ns ticks
 }
 
 /// Mip level read back for change detection: 1/8 of the frame in each direction (a 4K monitor gives a 480x270 read).
@@ -298,6 +309,13 @@ mod tests {
     }
 
     #[test]
+    fn dwm_interval_is_a_bit_shorter_than_the_look_period() {
+        // 15 fps look period 66 666 us -> 49 999 us in 100 ns ticks; the 2 fps floor -> 375 ms
+        assert_eq!(min_update_interval(Duration::from_micros(66_666)).Duration, 499_995);
+        assert_eq!(min_update_interval(Duration::from_millis(500)).Duration, 3_750_000);
+    }
+
+    #[test]
     fn region_hash_clips_to_the_level() {
         let dims = (level_size(1920), level_size(1080));
         assert_eq!(dims, (240, 135));
@@ -350,6 +368,7 @@ unsafe fn wgc_loop(c: WgcCap) {
     let mut ver = 0u64;
     let mut pace = Pace::new(c.rate);
     let mut boost = sh.boost.load(Relaxed);
+    let mut asked = TimeSpan::default(); // the minimum update interval DWM was last told (older Windows builds refuse it: then it stays unset)
     let (mut px, mut prev): (Vec<u8>, Vec<u64>) = (Vec::new(), Vec::new());
     while !sh.stop.load(Relaxed) {
         let t0 = Instant::now();
@@ -366,7 +385,14 @@ unsafe fn wgc_loop(c: WgcCap) {
             }
             prev.clear(); // the first look after the pause counts as a change
             pace.snap();
-            std::thread::sleep(Duration::from_millis(100));
+            // DWM keeps filling the frame pool at the source rate (a video wallpaper): ask for 2 fps while nobody looks; the first look after
+            // the pause sets the real pace again (`asked` differs then)
+            let slow = TimeSpan { Duration: 5_000_000 };
+            if asked.Duration != slow.Duration {
+                asked = slow;
+                let _ = c.session.SetMinUpdateInterval(slow);
+            }
+            sh.pause_wait();
             continue;
         }
         let v = sh.regions_ver.load(Relaxed);
@@ -382,6 +408,12 @@ unsafe fn wgc_loop(c: WgcCap) {
         if bst != boost {
             boost = bst;
             pace.snap();
+        }
+        // a frame delivered at the new pace must be there for this look (after a snap back to full rate)
+        let want = min_update_interval(pace.interval());
+        if want.Duration != asked.Duration {
+            asked = want;
+            let _ = c.session.SetMinUpdateInterval(want);
         }
         let mut changed = false;
         if let Some(f) = latest {
@@ -414,6 +446,11 @@ unsafe fn wgc_loop(c: WgcCap) {
         }
         let period = pace.observe(changed, Instant::now());
         sh.rate.store(pace.fps(), Relaxed);
+        let want = min_update_interval(period);
+        if want.Duration != asked.Duration {
+            asked = want;
+            let _ = c.session.SetMinUpdateInterval(want);
+        }
         if let Some(rest) = period.checked_sub(t0.elapsed()) {
             sh.nap(rest, boost, ver);
         }

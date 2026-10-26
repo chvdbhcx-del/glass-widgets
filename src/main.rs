@@ -14,6 +14,7 @@
 // the widget API (widget.rs, sys.rs, tz.rs, icons.rs) is a public surface for widget files that do not exist yet: unused items are expected
 #![allow(dead_code, unused_imports)]
 mod accent;
+mod autopause;
 mod autostart;
 mod backdrop;
 mod calib;

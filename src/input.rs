@@ -101,12 +101,18 @@ pub fn prompt_ex(o: PromptOpts) -> Option<String> {
     if BUSY.swap(true, Ordering::SeqCst) {
         return None;
     }
-    let r = match via_host(&o) {
+    let _busy = BusyGuard; // clears BUSY even when the prompt code panics
+    match via_host(&o) {
         Some(answer) => answer,
         None => unsafe { run(o) },
-    };
-    BUSY.store(false, Ordering::SeqCst);
-    r
+    }
+}
+
+struct BusyGuard;
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        BUSY.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Ask the host to show the prompt on its canvas and wait for the answer. None = no host / it cannot show it: use the popup.

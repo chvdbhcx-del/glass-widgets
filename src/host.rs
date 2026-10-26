@@ -4,11 +4,14 @@
 //!
 //! Idle behaviour: the UI thread sits in GetMessage (kernel wait, same as MsgWaitForMultipleObjects with no handles).
 //! Wake-ups: WM_BACKDROP (only when the wallpaper pixels behind a card changed, <= --backdrop-fps), a widget schedule timer ONLY
-//! while something animates, a 100 ms cursor poll (16 ms near a card), a 500 ms fullscreen guard, a 2 s config.json poll and a 30 s day
+//! while something animates, a 100 ms cursor poll (16 ms near a card), a 500 ms fullscreen / idle-pause guard, a 2 s config.json poll and a 30 s day
 //! check. Edit mode adds a 33 ms jiggle timer (16 ms while a card moves) and a 200 ms gallery timer; none of them runs outside edit mode.
+//! The capture, the backdrop redraws and the widget schedule sleep while the layer is hidden, the session is locked, the monitors are off or every
+//! card is covered by other windows (autopause.rs); the first wake-up repaints everything.
 //!
 //! Coordinates: the scene canvas is the monitor (card px = monitor px); the layered window only covers `win`, the bounding box of the
 //! cards, and grows to the whole monitor while a card is dragged / settling and in edit mode.
+use crate::autopause::{self, Pause};
 use crate::backdrop::*;
 use crate::cards::*;
 use crate::gfx::*;
@@ -33,6 +36,9 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Power::RegisterPowerSettingNotification;
+use windows::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
+use windows::Win32::System::StationsAndDesktops::{CloseDesktop, OpenInputDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS};
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcess, GetCurrentThreadId, GetProcessTimes};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForSystem, GetDpiForWindow, MDT_EFFECTIVE_DPI};
@@ -224,6 +230,16 @@ struct App {
     visible: bool,
     /// hidden from the tray menu ("Hide Widgets"): the guard keeps the layer hidden until it is shown again
     user_hidden: bool,
+    /// why the capture and the backdrop / tick driven redraws sleep (asleep while any reason is set), see autopause.rs
+    pause: Pause,
+    /// `MSWIDGETS_NO_AUTOPAUSE=1`: only the fullscreen / hidden reason is used
+    autopause_off: bool,
+    /// the input desktop could be opened at start (else the secure-desktop poll would pause for ever, it stays off)
+    secure_poll: bool,
+    /// when the occlusion test last ran
+    last_occ: Instant,
+    /// cards whose background job finished while asleep: they pick the result up on waking
+    missed_jobs: Vec<usize>,
     first_present: bool,
     last_lum: Instant,
     last_day: u32,
@@ -584,6 +600,11 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         near: false,
         visible: false,
         user_hidden: false,
+        pause: Pause::default(),
+        autopause_off: std::env::var_os("MSWIDGETS_NO_AUTOPAUSE").is_some_and(|v| v == "1"),
+        secure_poll: input_desktop_open(),
+        last_occ: Instant::now(),
+        missed_jobs: Vec::new(),
         first_present: true,
         last_lum: Instant::now() - Duration::from_secs(1),
         last_day: 0,
@@ -672,6 +693,13 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     if !tray::add(hwnd) {
         eprintln!("mswidgets: tray icon could not be added (the settings stay reachable with Ctrl+Alt+W)");
     }
+    if !app.autopause_off {
+        // session lock / switch away and the monitors' power state wake us through window messages (the guard re-reads them as insurance)
+        let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+        if let Err(e) = RegisterPowerSettingNotification(HANDLE(hwnd.0), &autopause::GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_WINDOW_HANDLE) {
+            eprintln!("mswidgets: display power notification refused ({e}); the monitors' sleep will not pause the widgets");
+        }
+    }
     SetTimer(hwnd, T_HIT, 100, None);
     SetTimer(hwnd, T_GUARD, 500, None);
     SetTimer(hwnd, T_DAY, 30_000, None);
@@ -734,6 +762,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER | WM_BACKDROP | WM_HOTKEY | WM_WIDGET | update::WM_UPDATE | update::WM_UPDATE_DL | WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
             with_app(|app| app.on_msg(msg, wp.0));
             LRESULT(0)
+        }
+        autopause::WM_WTSSESSION_CHANGE => {
+            if let Some(away) = autopause::session_event(wp.0) {
+                autopause::raise(autopause::LOCKED, away);
+                with_app(|app| app.sync_pause());
+            }
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            if wp.0 == autopause::PBT_POWERSETTINGCHANGE && lp.0 != 0 {
+                // POWERBROADCAST_SETTING { GUID PowerSetting; u32 DataLength; u8 Data[] }
+                let p = lp.0 as *const u8;
+                if std::ptr::read_unaligned(p as *const windows::core::GUID) == autopause::GUID_CONSOLE_DISPLAY_STATE && std::ptr::read_unaligned(p.add(16) as *const u32) >= 4 {
+                    autopause::raise(autopause::DISPLAY_OFF, autopause::display_off(std::ptr::read_unaligned(p.add(20) as *const u32)));
+                    with_app(|app| app.sync_pause());
+                }
+            } else if let Some(suspend) = autopause::suspend_event(wp.0) {
+                autopause::raise(autopause::SUSPEND, suspend);
+                with_app(|app| app.sync_pause());
+            }
+            LRESULT(1) // TRUE: the request is granted
         }
         WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_MOUSELEAVE | WM_CAPTURECHANGED => {
             with_app(|app| app.on_mouse(msg, wp, lp));
@@ -825,6 +874,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_DESTROY => {
+            let _ = WTSUnRegisterSessionNotification(hwnd);
             input::set_host(None);
             tray::remove(hwnd);
             PostQuitMessage(0);
@@ -975,7 +1025,7 @@ impl App {
             (update::WM_UPDATE_DL, p) => self.install_progress(p),
             (WM_BACKDROP, _) => {
                 let mask = self.bd().take_dirty();
-                if mask != 0 && self.visible {
+                if mask != 0 && self.live() {
                     self.redraw(mask, false);
                 }
             }
@@ -1016,7 +1066,7 @@ impl App {
                 self.replace_monitor();
             }
             (_, T_DAY) => {
-                if self.now().day_key() != self.last_day && self.visible {
+                if self.now().day_key() != self.last_day && self.live() {
                     let all = self.all_mask();
                     self.redraw(all, false);
                 }
@@ -1321,7 +1371,7 @@ impl App {
     /// Widget schedules: call `tick` of every due card; animating cards repaint only their own rectangle (cached glass layers are just
     /// blitted + the overlay), a card whose static content went stale is re-rendered first.
     unsafe fn tick(&mut self) {
-        if !self.visible {
+        if !self.live() {
             return;
         }
         let t = Instant::now();
@@ -1345,7 +1395,11 @@ impl App {
     /// A background job of the card with handle `uid` finished: let the widget pick up the result.
     unsafe fn on_job(&mut self, uid: usize) {
         let Some(i) = self.scene.index_of_uid(uid) else { return };
-        if !self.visible {
+        if !self.live() {
+            // asleep: the card picks the result up when the desk wakes (`wake`)
+            if !self.missed_jobs.contains(&uid) {
+                self.missed_jobs.push(uid);
+            }
             return;
         }
         let now = self.now();
@@ -3110,8 +3164,9 @@ impl App {
         let all = self.all_mask();
         // same order as at start: one frame while the GPU is quiet, THEN the capture thread (a new backdrop does nothing until started)
         self.redraw(all | BIT_GALLERY | BIT_TOOLBAR, true);
+        self.bd().set_paused(self.pause.any()); // the new capture inherits the sleep
         self.bd().start();
-        if self.use_dupl {
+        if self.use_dupl && !self.pause.any() {
             let t = Instant::now();
             while self.bd().take_dirty() == 0 && t.elapsed() < Duration::from_millis(600) {
                 std::thread::sleep(Duration::from_millis(15));
@@ -3266,6 +3321,9 @@ impl App {
 
     /// WS_EX_TRANSPARENT toggled from a cursor poll: 100 ms normally, 16 ms within 8 px of a card.
     unsafe fn hit_test(&mut self) {
+        if self.pause.has(autopause::COVERED) && self.interacting() {
+            self.set_pause(autopause::COVERED, false); // edit mode / a menu opened behind a covering window
+        }
         if !self.visible {
             return;
         }
@@ -3304,15 +3362,12 @@ impl App {
         let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         place_above_desktop(self.hwnd);
         self.visible = true;
-        if let Some(b) = &self.backdrop {
-            b.set_paused(false);
-        }
         self.update_tick_timer();
     }
 
     /// One timer, armed for the earliest widget schedule; nothing is armed (zero wake-ups) while no visible card animates.
     unsafe fn update_tick_timer(&mut self) {
-        match (self.visible, self.scene.next_due()) {
+        match (self.live(), self.scene.next_due()) {
             (true, Some(d)) => {
                 let ms = d.saturating_duration_since(Instant::now()).as_millis().clamp(1, 3_600_000) as u32;
                 SetTimer(self.hwnd, T_TICK, ms, None);
@@ -3365,7 +3420,7 @@ impl App {
         }
         // insurance against a lost WM_BACKDROP wake-up (the capture thread only posts when its mask was empty)
         let m = self.bd().take_dirty();
-        if m != 0 && self.visible {
+        if m != 0 && self.live() {
             self.redraw(m, false);
         }
         let front = app_in_front(self.hwnd);
@@ -3379,20 +3434,90 @@ impl App {
             self.abort_menu();
             let _ = ShowWindow(self.hwnd, SW_HIDE);
             self.visible = false;
-            if let Some(b) = &self.backdrop {
-                b.set_paused(true);
-            }
-            self.update_tick_timer();
+            self.set_pause(autopause::HIDDEN, true);
         } else if !fs && !self.visible {
             self.show();
-            let all = self.all_mask();
-            self.redraw(all, false);
+            self.set_pause(autopause::HIDDEN, false);
         } else if self.visible {
             self.guard_n += 1;
             if self.guard_n % 8 == 0 && !self.ui.edit && self.ui.prompt.is_none() && self.ui.menu.is_none() {
                 place_above_desktop(self.hwnd); // explorer restarts / shell re-stacks
             }
         }
+        self.auto_pause();
+    }
+
+    /// The desk is shown and no reason to sleep is left.
+    fn live(&self) -> bool {
+        self.visible && !self.pause.any()
+    }
+
+    /// Raise / clear one pause reason. The capture, the tick timer and the backdrop / tick driven redraws follow the union of the reasons.
+    unsafe fn set_pause(&mut self, bit: u8, on: bool) {
+        if !self.pause.set(bit, on) {
+            return;
+        }
+        let asleep = self.pause.any();
+        if let Some(b) = &self.backdrop {
+            b.set_paused(asleep);
+            if !asleep {
+                b.boost(); // full rate at once, the capture thread was parked
+            }
+        }
+        self.update_tick_timer();
+        if !asleep && self.visible {
+            self.wake();
+        }
+    }
+
+    /// The last reason is gone: the jobs that finished meanwhile are picked up and every card is repainted from the live backdrop now.
+    unsafe fn wake(&mut self) {
+        for uid in std::mem::take(&mut self.missed_jobs) {
+            self.on_job(uid);
+        }
+        let all = self.all_mask() | BIT_GALLERY | BIT_TOOLBAR;
+        self.redraw(all, false);
+    }
+
+    /// The reasons window messages raise (session lock, monitors off, suspend), from autopause's atomic.
+    unsafe fn sync_pause(&mut self) {
+        let raised = autopause::raised();
+        for bit in [autopause::LOCKED, autopause::DISPLAY_OFF, autopause::SUSPEND] {
+            self.set_pause(bit, !self.autopause_off && raised & bit != 0);
+        }
+        if self.secure_poll && !self.autopause_off {
+            self.set_pause(autopause::SECURE, !input_desktop_open()); // the lock screen is a secure desktop: it ends with the unlock message
+        }
+    }
+
+    /// Something is open the user works with: the desk is never put to sleep behind it.
+    fn interacting(&self) -> bool {
+        self.editing || self.ui.edit || self.ui.settings || self.ui.gallery || self.ui.prompt.is_some() || self.ui.menu.is_some() || self.in_menu || self.drag.is_some() || !self.springs.is_empty() || self.ui.toast.is_some()
+    }
+
+    /// The cards in desktop px.
+    fn screen_cards(&self) -> Vec<RECT> {
+        self.card_rects().iter().map(|c| RECT { left: c.left + self.mon.left, top: c.top + self.mon.top, right: c.right + self.mon.left, bottom: c.bottom + self.mon.top }).collect()
+    }
+
+    /// Guard step (500 ms) of the reasons that are polled: the messages again (a lost one must not strand a pause), the input desktop, and
+    /// whether other windows hide every card (every 0.9 s while awake, every step while only that holds the desk asleep).
+    unsafe fn auto_pause(&mut self) {
+        if self.autopause_off {
+            return;
+        }
+        self.sync_pause();
+        if self.pause.hard() || self.interacting() {
+            self.set_pause(autopause::COVERED, false);
+            return;
+        }
+        if !self.pause.has(autopause::COVERED) && self.last_occ.elapsed() < Duration::from_millis(900) {
+            return;
+        }
+        self.last_occ = Instant::now();
+        let cards = self.screen_cards();
+        let wins = covering_windows(self.hwnd, &cards);
+        self.set_pause(autopause::COVERED, autopause::all_hidden(&cards, &wins));
     }
 
     /// `widgetsDim`: monochrome cards while an app window is in front (auto) / always / never; off while editing.
@@ -3405,7 +3530,7 @@ impl App {
             };
         if want != self.scene.dimmed() {
             self.scene.set_dim(want);
-            if self.visible {
+            if self.live() {
                 let d = RECT { left: self.win.left, top: self.win.top, right: self.win.right, bottom: self.win.bottom };
                 self.frame(d);
             }
@@ -4163,6 +4288,80 @@ unsafe fn app_in_front(me: HWND) -> bool {
         class.as_str(),
         "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Windows.UI.Core.CoreWindow" | "XamlExplorerHostIslandWindow" | "TopLevelWindowForOverflowXamlIsland" | "NotifyIconOverflowWindow" | "ForegroundStaging" | "#32768"
     )
+}
+
+/// The input desktop can be opened: false on the secure desktop (lock screen, UAC prompt).
+unsafe fn input_desktop_open() -> bool {
+    match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(0x0100) /* DESKTOP_SWITCHDESKTOP */) {
+        Ok(d) => {
+            let _ = CloseDesktop(d);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+struct Cover<'a> {
+    me: HWND,
+    pid: u32,
+    cards: &'a [RECT],
+    out: Vec<RECT>,
+}
+
+unsafe extern "system" fn cover_cb(h: HWND, lp: LPARAM) -> BOOL {
+    let c = &mut *(lp.0 as *mut Cover);
+    if h == c.me {
+        return BOOL(0); // everything above the layer is collected; what is below it cannot hide it
+    }
+    if !IsWindowVisible(h).as_bool() || IsIconic(h).as_bool() {
+        return BOOL(1);
+    }
+    let mut r = RECT::default();
+    if GetWindowRect(h, &mut r).is_err() || !c.cards.iter().any(|k| r.left < k.right && k.left < r.right && r.top < k.bottom && k.top < r.bottom) {
+        return BOOL(1);
+    }
+    // from here on only for windows over a card; every doubt that a window really hides what is behind it leaves it out (=> awake)
+    let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+    if ex & (WS_EX_TRANSPARENT.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) != 0 {
+        return BOOL(1);
+    }
+    if ex & WS_EX_LAYERED.0 != 0 {
+        // only a layered window with one constant, fully opaque alpha hides anything (per-pixel alpha: the call fails)
+        let (mut key, mut alpha, mut flags) = (COLORREF(0), 0u8, LAYERED_WINDOW_ATTRIBUTES_FLAGS(0));
+        if GetLayeredWindowAttributes(h, Some(&mut key), Some(&mut alpha), Some(&mut flags)).is_err() || flags.0 & LWA_COLORKEY.0 != 0 || (flags.0 & LWA_ALPHA.0 != 0 && alpha < 255) {
+            return BOOL(1);
+        }
+    }
+    if GetWindowRgnBox(h, &mut RECT::default()) != RGN_ERROR {
+        return BOOL(1); // a shaped window
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(h, Some(&mut pid));
+    let mut cloaked = 0u32;
+    if pid == c.pid || windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(h, windows::Win32::Graphics::Dwm::DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut _, 4).is_ok() && cloaked != 0 {
+        return BOOL(1);
+    }
+    let mut buf = [0u16; 64];
+    let n = GetClassNameW(h, &mut buf);
+    if matches!(String::from_utf16_lossy(&buf[..n.max(0) as usize]).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+        return BOOL(1);
+    }
+    // the visible frame (without the invisible resize borders), when DWM knows it
+    let mut f = RECT::default();
+    if windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(h, windows::Win32::Graphics::Dwm::DWMWA_EXTENDED_FRAME_BOUNDS, &mut f as *mut _ as *mut _, std::mem::size_of::<RECT>() as u32).is_ok() {
+        r = f;
+    }
+    c.out.push(r);
+    BOOL(1)
+}
+
+/// The rectangles (desktop px) of the windows above the layer in z-order that really hide what lies under them, limited to those that touch a
+/// card: visible, not minimized, not cloaked (other virtual desktop), not ours, no tool / click-through / no-activate window, no
+/// translucent or shaped one, not the shell's desktop / taskbar.
+unsafe fn covering_windows(me: HWND, cards: &[RECT]) -> Vec<RECT> {
+    let mut c = Cover { me, pid: windows::Win32::System::Threading::GetCurrentProcessId(), cards, out: Vec::new() };
+    let _ = EnumWindows(Some(cover_cb), LPARAM(&mut c as *mut _ as isize));
+    c.out
 }
 
 /// Same logic as `foreground_is_fullscreen` in src-tauri/src/main.rs (the own window does not count). Only a fullscreen window on `ours`, the

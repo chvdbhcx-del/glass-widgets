@@ -153,7 +153,11 @@ pub fn load_cache() -> Option<[u8; 3]> {
     (v.len() == 3).then(|| [v[0], v[1], v[2]])
 }
 
+/// Writes only when the stored colour differs (the live refresh calls this every few seconds with the same value).
 pub fn save_cache(rgb: [u8; 3]) {
+    if load_cache() == Some(rgb) {
+        return;
+    }
     if let Some(p) = cache_path() {
         let _ = std::fs::write(p, format!("{} {} {}", rgb[0], rgb[1], rgb[2]));
     }

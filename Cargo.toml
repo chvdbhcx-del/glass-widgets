@@ -1,6 +1,6 @@
 [package]
 name = "mswidgets"
-version = "0.5.10"
+version = "0.5.11"
 edition = "2021"
 description = "Glass Widgets: native (no WebView) Direct2D desktop widgets for Windows with a Liquid-Glass look"
 license = "MIT"
@@ -75,6 +75,9 @@ features = [
   "Win32_System_Diagnostics_Debug",
   "Win32_System_Console",
   "Devices_Radios",
+  # idle pause: session lock notifications, power setting notifications, the input desktop
+  "Win32_System_RemoteDesktop",
+  "Win32_System_StationsAndDesktops",
 ]
 
 [build-dependencies]

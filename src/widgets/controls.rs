@@ -449,6 +449,14 @@ struct Snap {
     radios: Option<(Option<bool>, Option<bool>)>,
 }
 
+/// Poll spacing: a bit under the 2 s schedule so a tick that lands a hair early still polls.
+const POLL_GAP: Duration = Duration::from_millis(1900);
+
+/// Is the next poll due, given the time since the previous one (None = never polled)?
+fn poll_due(since_last: Option<Duration>) -> bool {
+    since_last.map_or(true, |d| d >= POLL_GAP)
+}
+
 fn read_snap(with_radios: bool) -> Snap {
     Snap { audio: read_audio(), dark: read_dark(), radios: with_radios.then(|| (read_radio(RadioKind::WiFi), read_radio(RadioKind::Bluetooth))) }
 }
@@ -470,6 +478,8 @@ struct Controls {
     bri: Option<u32>,
     bri_mode: Option<BriMode>,
     polls: u32,
+    /// when the last poll job was spawned (None = none yet): a finished job wakes `tick` at once, so the 2 s pace needs its own gate
+    last_poll: Option<Instant>,
     snap_job: Option<Pending<Snap>>,
     act_jobs: Vec<Pending<Snap>>,
     bri_probe: Option<Pending<Option<(u32, BriMode)>>>,
@@ -511,6 +521,7 @@ impl Default for Controls {
             bri: None,
             bri_mode: None,
             polls: 0,
+            last_poll: None,
             snap_job: None,
             act_jobs: Vec::new(),
             bri_probe: None,
@@ -958,6 +969,7 @@ impl Widget for Controls {
                 return Tick::Never;
             }
             self.snap_job = Some(cx.spawn(|| read_snap(true)));
+            self.last_poll = Some(Instant::now());
             self.bri_probe = Some(cx.spawn(read_brightness));
         }
         if cx.preview {
@@ -1021,7 +1033,8 @@ impl Widget for Controls {
             cx.request_frame();
         }
         // the 2 s poll
-        if self.snap_job.is_none() && self.snap_in && self.drag.is_none() {
+        if self.snap_job.is_none() && self.snap_in && self.drag.is_none() && poll_due(self.last_poll.map(|t| t.elapsed())) {
+            self.last_poll = Some(Instant::now());
             self.polls += 1;
             self.snap_job = Some(cx.spawn({
                 let radios = self.polls % 5 == 0;
@@ -1052,7 +1065,7 @@ impl Widget for Controls {
         } else if live.is_some() {
             Tick::Every(Duration::from_millis(self.arm.remaining(now).clamp(100, 1000)))
         } else {
-            Tick::Every(Duration::from_secs(2))
+            Tick::Every(Duration::from_secs(2)) // the sliders live in `overlay`: repainted on every recompose; the poll itself is gated by `poll_due`
         }
     }
 
@@ -1149,6 +1162,15 @@ impl Widget for Controls {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_gate_waits_for_the_gap() {
+        assert!(poll_due(None), "first poll is immediate");
+        assert!(!poll_due(Some(Duration::from_millis(2))), "a job that just finished must not respawn");
+        assert!(!poll_due(Some(Duration::from_millis(1899))));
+        assert!(poll_due(Some(Duration::from_millis(1900))));
+        assert!(poll_due(Some(Duration::from_secs(2))));
+    }
 
     #[test]
     fn slider_motion_glides_settles_and_snaps() {
