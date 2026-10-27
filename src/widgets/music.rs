@@ -1,6 +1,7 @@
 //! Music (Now Playing) from the Windows System Media Transport Controls.
 //! S: the cover fills the card, a dark glass pill at the bottom with title / artist and a play-pause button.
-//! M: cover on the left, title + artist, a 24-bar equalizer (pseudo animation, not audio analysis) and prev / play-pause / next.
+//! M: cover on the left, title + artist, a 24-bar equalizer (the real spectrum of the system audio, spectrum.rs; `cfg.eq_audio = false` or a
+//! preview gives the pseudo animation instead) and prev / play-pause / next.
 //! L: full-width cover on top, title + artist, a progress bar with elapsed / remaining time and the three controls.
 //! Idle (no session): a dim note and "Ничего не играет". No cover: a soft gradient with a note glyph.
 //! Data: one long-lived worker thread polls the current SMTC session every 1 s (title, artist, status, timeline, thumbnail bytes decoded with WIC
@@ -586,9 +587,14 @@ impl Music {
         let bw = 4.0;
         let gap = (r.w - n * bw) / (n - 1.0);
         let t = cx.now.secs_f() as f64;
+        // the real spectrum of the system audio; the pseudo animation only in previews, with `eq_audio: false` or when capture is unavailable
+        let real = if live && !self.preview && cx.cfg_bool("eq_audio") != Some(false) { crate::spectrum::want() } else { None };
         for (i, &(w, ph, amp)) in self.bars.iter().enumerate() {
-            let k = if live { (0.5 + 0.5 * (t * w + ph).sin()) * 0.75 + (0.5 + 0.5 * (t * w * 0.37 + ph * 1.7).sin()) * 0.25 } else { 0.16 };
-            let h = 4.0 + (r.h - 4.0) * (k * amp) as f32;
+            let k = match &real {
+                Some(lv) => lv[i] as f64,
+                None => (if live { (0.5 + 0.5 * (t * w + ph).sin()) * 0.75 + (0.5 + 0.5 * (t * w * 0.37 + ph * 1.7).sin()) * 0.25 } else { 0.16 }) * amp,
+            };
+            let h = 4.0 + (r.h - 4.0) * k as f32;
             let x = r.x + i as f32 * (bw + gap);
             cx.pill(Rect::new(x, r.cy() - h / 2.0, bw, h), self.accent.fade(if live { 0.95 } else { 0.5 }));
         }

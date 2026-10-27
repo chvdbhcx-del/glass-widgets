@@ -35,6 +35,7 @@ mod net;
 mod prompt;
 mod registry;
 mod sha256;
+mod spectrum;
 mod sys;
 mod tray;
 pub mod tz;

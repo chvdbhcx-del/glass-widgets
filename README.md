@@ -155,6 +155,7 @@ Measured on a desktop with a video wallpaper:
   **Rates** and **Crypto** (open.er-api.com, CoinGecko), **Shortcuts** (the icon of a site tile), **Next event** (only when you give it a calendar link). **Quote of the Day** and
   everything else work offline. A card that is only a gallery preview never connects: previews use built-in sample data.
 - The update check runs only when you press "Check for updates" or turn on `checkUpdates` (off by default); an installer is downloaded only after you press "Update now".
+- The equalizer of the **Music** card (M) analyses the system output audio locally, only while the card is on screen and playing; the sound is never stored or sent (turn it off with `"eq_audio": false` in the card's `cfg`).
 - Everything is stored locally in `%APPDATA%\macshell\`.
 
 ## Settings file

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- The equalizer of the Music card shows the real spectrum of what is playing: 24 bands from 50 Hz to 14 kHz from a WASAPI loopback capture of the default output device (2048-point FFT every ~16 ms, auto-gain, fast attack and slow release). The capture runs on one thread only while the card is on screen and playing and stops 2 s after; the sound is analysed in memory and never stored or sent. Previews, `"eq_audio": false` in the card's `cfg` and a device that cannot be captured keep the old animated bars.
+
 ### Changed
 - Less work per redraw, same frame rates. When the wallpaper moves, a card now recomputes only the lens (the part that depends on the backdrop): the two blurred shadows, the inner glow and the soft text shadow of the card content are kept as bitmaps and redrawn as plain copies (the shadows follow the 2 Hz luminance probe, not the 15 Hz capture). Pixel-identical to before (checked on the headless renders), about a third less CPU per redraw of the whole desk (8 cards: 3.2 -> 2.1 ms, 3.3 -> 2.4 ms while the luminance changes every 7th redraw). `MSWIDGETS_NO_GLASS_CACHE=1` returns to the old path.
 - Background jobs (`cx.spawn`: weather, rates, volume, PowerShell, file scans) run on a small worker pool (4 threads, a few more only while a job blocks) instead of a new OS thread per job; the NVIDIA driver kept a small object for every thread ever created. Same API, same wake-ups, jobs start in submission order.
