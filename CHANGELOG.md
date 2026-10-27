@@ -2,8 +2,17 @@
 
 ## [Unreleased]
 
+## [0.5.12] - 2026-10-27
+
 ### Added
 - The equalizer of the Music card shows the real spectrum of what is playing: 24 bands from 50 Hz to 14 kHz from a WASAPI loopback capture of the default output device (2048-point FFT every ~16 ms, auto-gain, fast attack and slow release). The capture runs on one thread only while the card is on screen and playing and stops 2 s after; the sound is analysed in memory and never stored or sent. Previews, `"eq_audio": false` in the card's `cfg` and a device that cannot be captured keep the old animated bars.
+- Click action menu: the card menu has a "Click action" submenu: Default, Nothing, the presets of that widget (for example Task Manager for System) or a custom target (a program, link or `ms-settings:` page, validated before it is stored in the card's `cfg.click`). World clock: a click on the title opens Alarms & Clock.
+- Network: a click on the unit label flips MB/s and Mbit/s (decimal bits, as Task Manager and speed tests show them); stored in `cfg.unit`. The MB/s figure is MiB/s, like the other widgets.
+- Smooth S/M/L resize: changing a card's size springs the glass rectangle to the new size (the old and the new content cross-fade inside it, the bridges to neighbour cards follow); reduced motion jumps, nothing runs once it has settled.
+- Music card track change: the title and artist cross-fade, the last track stays on the card for 3 s while the player gives no session or empty properties (no more "Not Playing" flash between tracks) and the previous cover stays until the new one arrives.
+- Widgets open Task Manager / Explorer / calendar / weather site / settings on click. A left click on a card now opens the matching Windows tool: System, Network and Processes open Task Manager, Disks opens This PC, Clock opens Alarms & Clock, Batteries opens the Bluetooth settings, Calendar and Next event open the calendar app (or Google Calendar when none is installed), Weather opens a web search for the weather in the shown city. In Quick Actions the glyph left of the volume slider opens the Sound settings and the one left of the brightness slider the Display settings (the slider itself is not touched). Nothing opens in edit mode, while a card is dragged or in previews.
+- Weather: the city is now changed by clicking the city name (it lights up under the pointer); the rest of the card opens the weather site. Without a forecast ("City not found") the whole card still asks for a city.
+- Next event: with a working calendar a click opens the calendar, Ctrl+click changes the .ics path or link; an unset or broken source keeps the plain click that asks for it.
 
 ### Changed
 - Less work per redraw, same frame rates. When the wallpaper moves, a card now recomputes only the lens (the part that depends on the backdrop): the two blurred shadows, the inner glow and the soft text shadow of the card content are kept as bitmaps and redrawn as plain copies (the shadows follow the 2 Hz luminance probe, not the 15 Hz capture). Pixel-identical to before (checked on the headless renders), about a third less CPU per redraw of the whole desk (8 cards: 3.2 -> 2.1 ms, 3.3 -> 2.4 ms while the luminance changes every 7th redraw). `MSWIDGETS_NO_GLASS_CACHE=1` returns to the old path.
@@ -12,13 +21,6 @@
 
 ### Fixed
 - A card whose content holds clipped layers (the music cover) could stop redrawing with `D2DERR_LAYER_ALREADY_IN_USE` after a few backdrop updates (seen in a preview desk with the sample cover): the text shadow effect and the direct drawing of the same recorded content shared one draw session. The cached text shadow is rendered in its own session.
-
-## [0.5.12] - 2026-10-27
-
-### Added
-- Widgets open Task Manager / Explorer / calendar / weather site / settings on click. A left click on a card now opens the matching Windows tool: System, Network and Processes open Task Manager, Disks opens This PC, Clock opens Alarms & Clock, Batteries opens the Bluetooth settings, Calendar and Next event open the calendar app (or Google Calendar when none is installed), Weather opens a web search for the weather in the shown city. In Quick Actions the glyph left of the volume slider opens the Sound settings and the one left of the brightness slider the Display settings (the slider itself is not touched). Nothing opens in edit mode, while a card is dragged or in previews.
-- Weather: the city is now changed by clicking the city name (it lights up under the pointer); the rest of the card opens the weather site. Without a forecast ("City not found") the whole card still asks for a city.
-- Next event: with a working calendar a click opens the calendar, Ctrl+click changes the .ics path or link; an unset or broken source keeps the plain click that asks for it.
 
 ## [0.5.11] - 2026-10-26
 
