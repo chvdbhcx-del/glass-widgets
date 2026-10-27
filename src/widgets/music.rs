@@ -188,8 +188,13 @@ enum Cmd {
 struct Tracker {
     key: String,
     cover: Option<Arc<Cover>>,
+    /// the previous track's cover, kept on screen (up to `GRACE`) until the new one arrives: no flash of the no-cover gradient between tracks
+    old: Option<(Arc<Cover>, Instant)>,
     cover_id: u64,
 }
+
+/// How long the last known track (and its cover) stays on the card while the player gives no session / no cover (track change).
+const GRACE: Duration = Duration::from_secs(3);
 
 fn load_cover(props: &Props) -> Option<Cover> {
     let stream = props.Thumbnail().ok()?.OpenReadAsync().ok()?.get().ok()?;
@@ -235,17 +240,23 @@ fn read(mgr: &Manager, tr: &mut Tracker) -> windows::core::Result<Snap> {
     let key = format!("{title}\u{1}{artist}");
     if tr.key != key {
         tr.key = key;
-        tr.cover = None;
-        tr.cover_id += 1;
+        if let Some(c) = tr.cover.take() {
+            tr.old = Some((c, Instant::now()));
+        }
     }
     if tr.cover.is_none() {
         if let Some(c) = load_cover(&props) {
             tr.cover = Some(Arc::new(c));
+            tr.old = None;
+            tr.cover_id += 1;
+        } else if tr.old.as_ref().is_some_and(|(_, t)| t.elapsed() > GRACE) {
+            tr.old = None; // the new track really has no cover (or it never came): show the no-cover look
             tr.cover_id += 1;
         }
     }
+    let cover = tr.cover.clone().or_else(|| tr.old.as_ref().map(|(c, _)| c.clone()));
     let (pos_ms, dur_ms) = timeline(&s, playing).unwrap_or((0, 0));
-    Ok(Snap { has: true, playing, title, artist, pos_ms, dur_ms, stamp: Instant::now(), cover_id: tr.cover_id, cover: tr.cover.clone() })
+    Ok(Snap { has: true, playing, title, artist, pos_ms, dur_ms, stamp: Instant::now(), cover_id: tr.cover_id, cover })
 }
 
 fn control(mgr: &Manager, cmd: Cmd) {
@@ -258,6 +269,16 @@ fn control(mgr: &Manager, cmd: Cmd) {
     }
 }
 
+/// What the card shows now: the fresh reading, or the last good one (`held`, still inside GRACE) when the player gave no session or empty
+/// properties; idle when there is neither. The bool says the result is a fresh, good reading (to be remembered as the last good one).
+fn choose_snap(fresh: Option<Snap>, held: Option<Snap>) -> (Snap, bool) {
+    match (fresh, held) {
+        (Some(s), h) if !(s.title.is_empty() && s.artist.is_empty() && h.is_some()) => (s, true),
+        (_, Some(h)) => (h, false),
+        _ => (Snap::idle(), false),
+    }
+}
+
 /// Long-lived poller: ends by itself when the widget (and so the command sender) is dropped.
 fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Snap>>, waker: Waker) {
     unsafe {
@@ -265,6 +286,7 @@ fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Snap>>, waker: Waker) {
     }
     let mut mgr: Option<Manager> = None;
     let mut tr = Tracker::default();
+    let mut last_ok: Option<(Snap, Instant)> = None;
     loop {
         let cmd = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(c) => Some(c),
@@ -278,7 +300,11 @@ fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Snap>>, waker: Waker) {
             control(m, c);
             std::thread::sleep(Duration::from_millis(150)); // let the player apply it before re-reading
         }
-        let snap = mgr.as_ref().and_then(|m| read(m, &mut tr).ok()).unwrap_or_else(Snap::idle);
+        // A track change often shows as a moment without a session or with empty properties: the last good picture is kept for GRACE
+        // instead of switching the card to "Not Playing" and back. A player that really went away still ends in the idle look.
+        let held = last_ok.as_ref().filter(|(_, t)| t.elapsed() < GRACE).map(|(s, _)| s.clone());
+        let (snap, fresh) = choose_snap(mgr.as_ref().and_then(|m| read(m, &mut tr).ok()), held);
+        last_ok = if fresh { Some((snap.clone(), Instant::now())) } else if snap.has { last_ok } else { None };
         let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
         if Snap::differs(&g, &snap) {
             *g = snap;
@@ -381,10 +407,13 @@ struct Music {
     pp_tr: Option<(bool, Instant)>,
     /// M: the previous cover fading out over the new one (None inside = the no-cover gradient)
     cov_tr: Option<(Option<Bitmap>, Instant)>,
+    /// a track change in flight: the previous title / artist / title size and since when; `draw` leaves both texts out, `overlay` cross-fades
+    txt_tr: Option<(String, String, f32, Instant)>,
 }
-/// Play / pause icon swap and cover cross-fade durations (seconds).
+/// Play / pause icon swap, cover cross-fade and title cross-fade durations (seconds).
 const PP_T: f32 = 0.12;
 const COVER_T: f32 = 0.25;
+const TXT_T: f32 = 0.25;
 
 impl Music {
     fn new() -> Music {
@@ -422,6 +451,7 @@ impl Music {
             bars,
             pp_tr: None,
             cov_tr: None,
+            txt_tr: None,
         }
     }
 
@@ -470,6 +500,9 @@ impl Music {
         }
         let name = if s.has && s.title.is_empty() { cx.t("Без названия", "Untitled").to_string() } else { s.title.clone() };
         if name != self.title || s.artist != self.artist {
+            if s.has && !self.title.is_empty() && !self.preview && !reduced_motion() {
+                self.txt_tr = Some((self.title.clone(), self.artist.clone(), self.tsz, Instant::now()));
+            }
             self.artist = s.artist.clone();
             self.set_title(cx, &name);
             changed = true;
@@ -588,7 +621,14 @@ impl Music {
         let gap = (r.w - n * bw) / (n - 1.0);
         let t = cx.now.secs_f() as f64;
         // the real spectrum of the system audio; the pseudo animation only in previews, with `eq_audio: false` or when capture is unavailable
-        let real = if live && !self.preview && cx.cfg_bool("eq_audio") != Some(false) { crate::spectrum::want() } else { None };
+        // `_eq: true` (dump key): the real spectrum also in a preview, after a short warm-up, with the capture diagnostics under the bars
+        let dbg = cx.cfg_bool("_eq") == Some(true);
+        if dbg && live {
+            crate::spectrum::want();
+            std::thread::sleep(Duration::from_millis(400));
+            cx.text(Rect::new(r.x - 150.0, r.y + r.h + 4.0, 330.0, 24.0), &crate::spectrum::diag(), Style::new(8.0, 400), DIM);
+        }
+        let real = if live && (!self.preview || dbg) && cx.cfg_bool("eq_audio") != Some(false) { crate::spectrum::want() } else { None };
         for (i, &(w, ph, amp)) in self.bars.iter().enumerate() {
             let k = match &real {
                 Some(lv) => lv[i] as f64,
@@ -608,6 +648,11 @@ impl Music {
             cx.text(a, &fmt_clock(pos), Style::CAPTION.mono(), TEXT.fade(0.74));
             cx.text(b, &format!("−{}", fmt_clock(self.dur_ms - pos)), Style::CAPTION.mono().right(), TEXT.fade(0.74));
         }
+    }
+
+    fn artist_text(&self, cx: &Cx, l: &Lay, artist: &str) {
+        let art = if l.pill.is_some() { TEXT.fade(0.75) } else { TEXT.fade(0.74) };
+        cx.text(l.artist, artist, Style::new(if cx.size == Size::S { 11.0 } else { 13.0 }, 400).ellipsis(), art);
     }
 
     fn title_text(&self, cx: &Cx, l: &Lay, off: f32) {
@@ -664,11 +709,13 @@ impl Widget for Music {
             cx.rrect(p, p.h / 2.0, BLACK.alpha(0.36));
             cx.rrect_stroke(p, p.h / 2.0, 0.8, WHITE.alpha(0.2));
         }
-        let art = if l.pill.is_some() { TEXT.fade(0.75) } else { TEXT.fade(0.74) };
-        if !(self.playing && self.marquee(&l)) {
-            self.title_text(cx, &l, 0.0);
+        if self.txt_tr.is_none() {
+            // (during a track change `overlay` cross-fades both texts)
+            if !(self.playing && self.marquee(&l)) {
+                self.title_text(cx, &l, 0.0);
+            }
+            self.artist_text(cx, &l, &self.artist);
         }
-        cx.text(l.artist, &self.artist, Style::new(if cx.size == Size::S { 11.0 } else { 13.0 }, 400).ellipsis(), art);
         if !self.playing {
             if let Some(eq) = l.eq {
                 self.eq_bars(cx, eq, false);
@@ -693,12 +740,24 @@ impl Widget for Music {
                 let p = (t0.elapsed().as_secs_f32() / COVER_T).clamp(0.0, 1.0);
                 cx.with_opacity(1.0 - p, |c| self.paint_cover_of(c, old, l.cover, 18.0));
             }
+            // a track change: the old title / artist fade out while the new ones fade in
+            if let Some((ot, oa, otsz, t0)) = &self.txt_tr {
+                let p = (t0.elapsed().as_secs_f32() / TXT_T).clamp(0.0, 1.0);
+                cx.with_opacity(1.0 - p, |c| {
+                    c.text(l.title, ot, Style::new(*otsz, 600).ellipsis(), TEXT);
+                    self.artist_text(c, &l, oa);
+                });
+                cx.with_opacity(p, |c| {
+                    c.text(l.title, &self.title, self.title_style().ellipsis(), TEXT);
+                    self.artist_text(c, &l, &self.artist);
+                });
+            }
         }
         if !self.has || !self.playing {
             return Ok(());
         }
         let l = lay(cx.size);
-        if self.marquee(&l) {
+        if self.marquee(&l) && self.txt_tr.is_none() {
             let off = if self.preview { 0.0 } else { marquee_off(self.title_w - l.title.w, cx.now.secs_f() as f64) };
             self.title_text(cx, &l, off);
         }
@@ -735,7 +794,11 @@ impl Widget for Music {
         if self.cov_tr.as_ref().is_some_and(|(_, t0)| t0.elapsed().as_secs_f32() >= COVER_T) {
             self.cov_tr = None;
         }
-        if self.pp_tr.is_some() || self.cov_tr.is_some() {
+        if self.txt_tr.as_ref().is_some_and(|(_, _, _, t0)| t0.elapsed().as_secs_f32() >= TXT_T) {
+            self.txt_tr = None;
+            self.ver += 1;
+        }
+        if self.pp_tr.is_some() || self.cov_tr.is_some() || self.txt_tr.is_some() {
             return Tick::Fps(60);
         }
         if !(self.has && self.playing) {
@@ -785,6 +848,28 @@ impl Widget for Music {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snap(title: &str, artist: &str) -> Snap {
+        Snap { has: true, title: title.into(), artist: artist.into(), playing: true, ..Snap::idle() }
+    }
+
+    #[test]
+    fn track_change_keeps_the_last_picture() {
+        let held = || Some(snap("A", "x"));
+        // no session for a moment: the last track stays, and it is not re-remembered (its grace keeps running out)
+        let (s, fresh) = choose_snap(None, held());
+        assert!(s.has && s.title == "A" && !fresh);
+        // empty properties while the previous track is still held: also kept
+        let (s, fresh) = choose_snap(Some(snap("", "")), held());
+        assert!(s.title == "A" && !fresh);
+        // the new track wins at once
+        let (s, fresh) = choose_snap(Some(snap("B", "y")), held());
+        assert!(s.title == "B" && fresh);
+        // nothing held (grace over / never had one): idle for a missing session, the reading itself for empty properties
+        assert!(!choose_snap(None, None).0.has);
+        let (s, fresh) = choose_snap(Some(snap("", "")), None);
+        assert!(s.has && fresh);
+    }
 
     #[test]
     fn clock_format() {

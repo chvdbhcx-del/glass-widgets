@@ -4,7 +4,7 @@
 //! The thread runs only while `want()` is being called (the music card draws its equalizer: visible and playing); 2 s after the last call it
 //! closes the audio client and parks, so an idle card costs nothing. Audio is analysed in memory and never stored or sent anywhere.
 //! `want()` returns None when capture cannot start (no device, exotic format): the card falls back to its pseudo animation.
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering::*};
 use std::sync::{Mutex, OnceLock};
 use std::thread::Thread;
 use std::time::{Duration, Instant};
@@ -142,6 +142,43 @@ static STATE: AtomicU8 = AtomicU8::new(0);
 static LEVELS: Mutex<[f32; BANDS]> = Mutex::new([0.0; BANDS]);
 static THREAD: OnceLock<Option<Thread>> = OnceLock::new();
 static T0: OnceLock<Instant> = OnceLock::new();
+// diagnostics (`diag()`, the `_eq` dump key, `MSWIDGETS_EQ_LOG=1`)
+static OPENS: AtomicU64 = AtomicU64::new(0);
+static ERRS: AtomicU64 = AtomicU64::new(0);
+static LAST_ERR: AtomicI32 = AtomicI32::new(0);
+static PACKETS: AtomicU64 = AtomicU64::new(0);
+static HOPS: AtomicU64 = AtomicU64::new(0);
+/// peak |sample| of the last hop, f32 bits
+static PEAK: AtomicU32 = AtomicU32::new(0);
+static WANTS: AtomicU64 = AtomicU64::new(0);
+
+/// One line: capture state, device opens / errors, packets, hops, last peak sample and the current levels.
+pub fn diag() -> String {
+    let lv = *LEVELS.lock().unwrap_or_else(|e| e.into_inner());
+    format!(
+        "state={} opens={} errs={} (last {:#x}) packets={} hops={} wants={} sample_peak={:.3} level_max={:.2} levels={}",
+        STATE.load(Relaxed),
+        OPENS.load(Relaxed),
+        ERRS.load(Relaxed),
+        LAST_ERR.load(Relaxed),
+        PACKETS.load(Relaxed),
+        HOPS.load(Relaxed),
+        WANTS.load(Relaxed),
+        f32::from_bits(PEAK.load(Relaxed)),
+        lv.iter().cloned().fold(0.0, f32::max),
+        lv.iter().map(|&x| ['_', '.', ':', '|', '#'][((x * 4.0).round() as usize).min(4)]).collect::<String>()
+    )
+}
+
+fn log(msg: &str) {
+    if std::env::var_os("MSWIDGETS_EQ_LOG").is_none() {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(std::env::temp_dir().join("mswidgets-eq.log")) {
+        let _ = writeln!(f, "[{:>8} ms] {msg}", now_ms());
+    }
+}
 
 fn now_ms() -> u64 {
     T0.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
@@ -160,6 +197,7 @@ fn publish(v: [f32; BANDS]) {
 /// unavailable (draw the pseudo animation then).
 pub fn want() -> Option<[f32; BANDS]> {
     WANT_MS.store(now_ms(), Relaxed);
+    WANTS.fetch_add(1, Relaxed);
     let th = THREAD.get_or_init(|| std::thread::Builder::new().name("music-spectrum".into()).spawn(worker).ok().map(|h| h.thread().clone()));
     let Some(th) = th else { return None };
     if IDLE.swap(false, AcqRel) {
@@ -238,6 +276,7 @@ impl Stream {
     fn drain(&mut self) -> Result<()> {
         unsafe {
             while self.cap.GetNextPacketSize()? > 0 {
+                PACKETS.fetch_add(1, Relaxed);
                 let (mut data, mut frames, mut flags) = (std::ptr::null_mut::<u8>(), 0u32, 0u32);
                 self.cap.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
                 let (frames_u, ch) = (frames as usize, self.ch);
@@ -285,6 +324,8 @@ impl Stream {
                 let (a, b) = self.ring.split_at(self.pos); // oldest .. newest
                 x[..b.len()].copy_from_slice(b);
                 x[b.len()..].copy_from_slice(a);
+                HOPS.fetch_add(1, Relaxed);
+                PEAK.store(x.iter().fold(0.0f32, |m, v| m.max(v.abs())).to_bits(), Relaxed);
                 publish(sc.step(&dsp.bands_db(&x, self.sr), dt));
             }
             if dev_check.elapsed() > Duration::from_secs(2) {
@@ -326,10 +367,18 @@ fn worker() {
         match Stream::open() {
             Ok(mut s) => {
                 STATE.store(1, Relaxed);
-                let _ = s.run(&mut dsp);
+                OPENS.fetch_add(1, Relaxed);
+                log(&format!("open ok: {} ch {} Hz", s.ch, s.sr));
+                if let Err(e) = s.run(&mut dsp) {
+                    ERRS.fetch_add(1, Relaxed);
+                    LAST_ERR.store(e.code().0, Relaxed);
+                    log(&format!("capture error {e}"));
+                }
                 std::thread::sleep(Duration::from_millis(300));
             }
-            Err(_) => {
+            Err(e) => {
+                LAST_ERR.store(e.code().0, Relaxed);
+                log(&format!("open failed {e}"));
                 STATE.store(2, Relaxed);
                 std::thread::sleep(Duration::from_secs(3));
             }
