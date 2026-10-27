@@ -1,7 +1,8 @@
 //! Disks: S the system drive as a ring (used share) with the free space in the middle; M up to 3 drives as rows with a used bar;
 //! L up to 6 drives with bars. Fixed drives plus removable ones that have media; network / optical drives are skipped.
 //! Data: `GetLogicalDrives` / `GetDriveTypeW` / `GetDiskFreeSpaceExW` / `GetVolumeInformationW` on a worker thread every 30 s
-//! (a sleeping HDD or a flaky card reader may block, so never on the UI thread). Everything is static between refreshes: `draw` + `version()`.
+//! (a sleeping HDD or a flaky card reader may block, so never on the UI thread). Everything is static between refreshes: `draw` + `version()`;
+//! while the used share glides to a new reading (about 300 ms) the arc / bar fills move to `overlay` and `Tick::Fps(60)` runs.
 //! Colours (share used): green, amber from 80 %, red from 90 %.
 use super::sysmon::{fmt_size, fmt_size_parts, level_color};
 use crate::registry::{Registry, WidgetDef};
@@ -112,6 +113,32 @@ struct Disks {
     job: Option<Pending<Vec<Drive>>>,
     last: Option<Instant>,
     ver: u64,
+    /// free bytes per drive letter ("f:C") glide to each new reading (the used share, the numbers and the colour follow from them)
+    glide: GlideAnim,
+    /// a glide is in flight: `draw` leaves the ring arc, bar fills and numbers out, `overlay` paints them (re-recorded when it starts and ends)
+    moving: bool,
+}
+
+/// Row rects of M / L (the `bool` = the tall L row) for `n` drives in the content area `c`.
+fn rows(c: Rect, size: Size, n: usize) -> Vec<(Rect, bool)> {
+    match size {
+        Size::M => {
+            let (n, row_h) = (n.min(3), 46.0);
+            let top = c.y + (c.h - row_h * n as f32) / 2.0;
+            (0..n).map(|i| (Rect::new(c.x, top + i as f32 * row_h, c.w, row_h), false)).collect()
+        }
+        Size::L => (0..n.min(6)).map(|i| (Rect::new(c.x, c.y + 28.0 + i as f32 * 49.0, c.w, 49.0), true)).collect(),
+        Size::S => Vec::new(),
+    }
+}
+/// The used bar inside a drive row.
+fn bar_rect(r: Rect, tall: bool) -> Rect {
+    let x = r.x + if tall { 24.0 } else { 20.0 } + 8.0;
+    Rect::new(x, r.y + if tall { 27.0 } else { 25.0 }, r.right() - x, 6.0)
+}
+/// Ring of the S card: centre in the content area `c`.
+fn s_ring(c: Rect) -> Pt {
+    (c.cx(), c.y + 22.0 + 55.0)
 }
 
 impl Disks {
@@ -136,7 +163,6 @@ impl Widget for Disks {
     fn draw(&mut self, cx: &mut Cx) -> Result<()> {
         self.ensure_preview(cx);
         let lang = cx.lang;
-        let free_word = cx.t("свободно", "free");
         let c = cx.content();
         if self.drives.is_empty() {
             let (head, rest) = c.cut_top(18.0);
@@ -155,32 +181,45 @@ impl Widget for Disks {
                 // the title is a label, not decoration: brighter than DIM so it reads on any glass
                 cx.text(Rect::new(c.x, c.y, c.w, 18.0), &d.name(lang), Style::TITLE.ellipsis(), SUBTLE);
                 // a slimmer, larger ring leaves a roomy centre: number and unit sit clear of the stroke (inner width ~ 94 px)
-                let center = (c.cx(), c.y + 22.0 + 55.0);
-                cx.ring(center, 51.0, 7.0, d.used_pct() / 100.0, d.color());
-                let (n, u) = fmt_size_parts(d.free, lang);
-                cx.text(Rect::new(center.0 - 46.0, center.1 - 29.0, 92.0, 36.0), &n, Style::new(32.0, 300).mono().center().ellipsis(), TEXT);
-                cx.text(Rect::new(center.0 - 46.0, center.1 + 8.0, 92.0, 16.0), &format!("{u} {free_word}"), Style::new(11.0, 500).center().ellipsis(), SUBTLE);
+                let center = s_ring(c);
+                cx.ring_track(center, 51.0, 7.0);
+                if !self.moving {
+                    s_body(cx, center, d);
+                }
             }
             Size::M => {
-                let n = self.drives.len().min(3);
-                let row_h = 46.0;
-                let top = c.y + (c.h - row_h * n as f32) / 2.0;
-                for (i, d) in self.drives.iter().take(n).enumerate() {
-                    let r = Rect::new(c.x, top + i as f32 * row_h, c.w, row_h);
-                    drive_row(cx, r, d, false);
+                for (d, (r, tall)) in self.drives.iter().zip(rows(c, cx.size, self.drives.len())) {
+                    drive_row(cx, r, d, tall, self.moving);
                 }
             }
             Size::L => {
                 cx.text(Rect::new(c.x, c.y, c.w, 18.0), &cx.t("ДИСКИ", "DISKS"), Style::LABEL, accent());
-                let top = c.y + 28.0;
-                for (i, d) in self.drives.iter().take(6).enumerate() {
-                    let r = Rect::new(c.x, top + i as f32 * 49.0, c.w, 49.0);
+                for (i, (d, (r, tall))) in self.drives.iter().zip(rows(c, cx.size, self.drives.len())).enumerate() {
                     if i > 0 {
                         cx.rect(Rect::new(r.x, r.y, r.w, 0.6), FILL);
                     }
-                    drive_row(cx, r, d, true);
+                    drive_row(cx, r, d, tall, self.moving);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The gliding part: the ring arc / bar fills at their eased share (the tracks stay in `draw`).
+    fn overlay(&mut self, cx: &mut Cx) -> Result<()> {
+        if !self.moving || self.drives.is_empty() {
+            return Ok(());
+        }
+        let c = cx.content();
+        // the drive as it is drawn now: its free space on the way to the new value (used share, numbers and colour follow from it)
+        let shown = |d: &Drive| Drive { free: self.glide.or(&format!("f:{}", d.letter), d.free as f32) as u64, ..d.clone() };
+        if cx.size == Size::S {
+            s_body(cx, s_ring(c), &shown(&self.drives[0]));
+        }
+        for (d, (r, tall)) in self.drives.iter().zip(rows(c, cx.size, self.drives.len())) {
+            let d = shown(d);
+            drive_text(cx, r, &d, tall);
+            cx.bar_fill(bar_rect(r, tall), d.used_pct() / 100.0, d.color());
         }
         Ok(())
     }
@@ -205,6 +244,11 @@ impl Widget for Disks {
                         self.drives = list;
                         self.loaded = true;
                         self.ver += 1;
+                        for d in &self.drives {
+                            self.glide.set(&format!("f:{}", d.letter), d.free as f32, cx);
+                        }
+                        let letters: Vec<String> = self.drives.iter().map(|d| format!("f:{}", d.letter)).collect();
+                        self.glide.retain(|k| letters.iter().any(|l| l == k));
                     }
                 }
                 None if !j.busy() => self.job = None, // the worker died, try again below
@@ -215,6 +259,14 @@ impl Widget for Disks {
             self.last = Some(Instant::now());
             self.job = Some(cx.spawn(enumerate));
         }
+        let busy = self.glide.step(cx);
+        if busy != self.moving {
+            self.moving = busy;
+            self.ver += 1; // `draw` takes the arc / fills over again (or hands them to `overlay`)
+        }
+        if busy {
+            return Tick::Fps(60); // the gauges glide to the new reading
+        }
         Tick::Poll(Duration::from_secs(30))
     }
 
@@ -223,18 +275,27 @@ impl Widget for Disks {
     }
 }
 
-/// One drive row (M compact / L with a caption line): icon, name, used bar, free-of-total text.
-fn drive_row(cx: &Cx, r: Rect, d: &Drive, tall: bool) {
-    let lang = cx.lang;
-    let free = format!("{} {} {} {}", fmt_size(d.free, lang), cx.t("свободно", "free"), cx.t("из", "of"), fmt_size(d.total, lang));
+/// One drive row (M compact / L with a caption line): icon, name, used bar, free-of-total text. While the numbers glide (`moving`) only the
+/// icon and the bar track are here; `overlay` paints the texts and the fill.
+fn drive_row(cx: &Cx, r: Rect, d: &Drive, tall: bool, moving: bool) {
     let ix = if tall { 24.0 } else { 20.0 };
     cx.icon(Glyph::Disk, Rect::new(r.x, r.y + if tall { 8.0 } else { 3.0 }, ix - 4.0, ix - 4.0).inset(-1.0), disk_icon_color(d));
-    let x = r.x + ix + 8.0;
+    cx.pill(bar_rect(r, tall), FILL);
+    if !moving {
+        drive_text(cx, r, d, tall);
+        cx.bar_fill(bar_rect(r, tall), d.used_pct() / 100.0, d.color());
+    }
+}
+
+/// The texts of a drive row: name, free / total, and on L the used percent.
+fn drive_text(cx: &Cx, r: Rect, d: &Drive, tall: bool) {
+    let lang = cx.lang;
+    let free = format!("{} {} {} {}", fmt_size(d.free, lang), cx.t("свободно", "free"), cx.t("из", "of"), fmt_size(d.total, lang));
+    let x = bar_rect(r, tall).x;
     let w = r.right() - x;
     if tall {
         cx.text(Rect::new(x, r.y + 5.0, w - 50.0, 18.0), &d.name(lang), Style::BODY.ellipsis(), TEXT);
         cx.text(Rect::new(r.right() - 50.0, r.y + 5.0, 50.0, 18.0), &format!("{}%", d.used_pct().round() as i32), Style::MONO.right(), SUBTLE);
-        cx.bar(Rect::new(x, r.y + 27.0, w, 6.0), d.used_pct() / 100.0, d.color());
         cx.text(Rect::new(x, r.y + 34.0, w, 14.0), &free, Style::CAPTION.ellipsis(), SUBTLE);
     } else {
         // the name keeps the left, the free / total text the right (SUBTLE: readable on bright glass); a clear gap above the bar.
@@ -247,8 +308,15 @@ fn drive_row(cx: &Cx, r: Rect, d: &Drive, tall: bool) {
         let fw = (cx.measure(txt, st, 0.0).0 + 2.0).min(w * 0.6);
         cx.text(Rect::new(x, r.y, w - fw - 10.0, 18.0), &name, Style::BODY.ellipsis(), TEXT);
         cx.text(Rect::new(r.right() - fw, r.y + 1.0, fw, 18.0), txt, st.right().ellipsis(), SUBTLE);
-        cx.bar(Rect::new(x, r.y + 25.0, w, 6.0), d.used_pct() / 100.0, d.color());
     }
+}
+
+/// S: the ring arc and the free space in its middle (the track and the title stay in `draw`).
+fn s_body(cx: &Cx, center: Pt, d: &Drive) {
+    cx.ring_arc(center, 51.0, 7.0, d.used_pct() / 100.0, d.color());
+    let (n, u) = fmt_size_parts(d.free, cx.lang);
+    cx.text(Rect::new(center.0 - 46.0, center.1 - 29.0, 92.0, 36.0), &n, Style::new(32.0, 300).mono().center().ellipsis(), TEXT);
+    cx.text(Rect::new(center.0 - 46.0, center.1 + 8.0, 92.0, 16.0), &format!("{u} {}", cx.t("свободно", "free")), Style::new(11.0, 500).center().ellipsis(), SUBTLE);
 }
 
 #[cfg(test)]

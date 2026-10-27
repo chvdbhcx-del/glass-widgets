@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.5.13] - 2026-10-27
+
+### Changed
+- Smooth data everywhere: rings, bars and numbers glide to each new reading instead of jumping (System, Disks, Batteries, Processes, Network, Crypto, Rates, Weather). Reduced motion and previews jump as before; a settled card costs nothing.
+- Processes: rows move to their new rank (a process that falls out of the top slides down and fades at the bottom edge, one that climbs slides up from below); near-equal low rows keep their order, a row overtakes another only when it is clearly bigger.
+- Network: the big speeds show the mean of the last ~4 s; the graph is current (its right edge is the newest sample) and scrolls continuously between samples. System graphs scroll the same way.
+- Sparklines of the System and Network cards animate at 60 fps while the card is visible (about 3 % of one core measured with both open).
+
 ## [0.5.12] - 2026-10-27
 
 ### Added

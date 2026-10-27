@@ -373,6 +373,10 @@ struct Weather {
     flush_city: Option<String>,
     /// the pointer is over the city label
     city_hot: bool,
+    /// every temperature of the forecast glides to a refresh: "t" now, "h{key}" an hour, "l{key}" / "u{key}" a day's low / high
+    glide: GlideAnim,
+    /// a glide is in flight: `draw` is re-recorded every frame with the eased temperatures (a refresh comes every few minutes, so this is rare)
+    moving: bool,
 }
 
 impl Weather {
@@ -386,11 +390,45 @@ impl Weather {
         }
     }
 
-    fn apply(&mut self, l: Loaded) {
+    /// Point the glides at a forecast; the keys of hours and days that are gone are dropped.
+    fn feed(&mut self, wx: &Wx, cx: &Cx) {
+        self.glide.set("t", wx.temp, cx);
+        let mut keep: Vec<String> = vec!["t".into()];
+        for h in &wx.hours {
+            let k = format!("h{}", h.key);
+            self.glide.set(&k, h.temp, cx);
+            keep.push(k);
+        }
+        for d in &wx.days {
+            let (l, u) = (format!("l{}", d.key), format!("u{}", d.key));
+            self.glide.set(&l, d.lo, cx);
+            self.glide.set(&u, d.hi, cx);
+            keep.extend([l, u]);
+        }
+        self.glide.retain(|k| keep.iter().any(|x| x == k));
+    }
+
+    /// The forecast as drawn now: while a refresh glides in, every temperature is its eased value.
+    fn eased(&self, wx: &Wx) -> Wx {
+        let g = &self.glide;
+        let mut w = wx.clone();
+        w.temp = g.or("t", wx.temp);
+        for h in &mut w.hours {
+            h.temp = g.or(&format!("h{}", h.key), h.temp);
+        }
+        for d in &mut w.days {
+            d.lo = g.or(&format!("l{}", d.key), d.lo);
+            d.hi = g.or(&format!("u{}", d.key), d.hi);
+        }
+        w
+    }
+
+    fn apply(&mut self, l: Loaded, cx: &Cx) {
         if l.key != self.cur_key || (self.wx.is_some() && l.fetched < self.fetched) {
             return;
         }
         if let Some(wx) = parse_wx(&l.raw) {
+            self.feed(&wx, cx);
             self.wx = Some(wx);
             self.place = l.loc.name;
             self.auto = l.loc.auto;
@@ -583,9 +621,16 @@ fn draw_kind(cx: &Cx, kind: Kind, day: bool, r: Rect, c: Color) {
 
 impl Widget for Weather {
     fn draw(&mut self, cx: &mut Cx) -> Result<()> {
-        let Some(wx) = &self.wx else {
+        let Some(real) = &self.wx else {
             self.empty(cx);
             return Ok(());
+        };
+        let eased;
+        let wx = if self.moving {
+            eased = self.eased(real);
+            &eased
+        } else {
+            real
         };
         let f = cx.cfg_str("units").is_some_and(|u| u.eq_ignore_ascii_case("f"));
         let hours = wx.hours.get(self.hs..).unwrap_or(&[]);
@@ -653,6 +698,7 @@ impl Widget for Weather {
         if key != self.cur_key {
             if !self.cur_key.is_empty() {
                 self.wx = None;
+                self.glide = GlideAnim::default(); // the new place starts from its own numbers, not from the old city's
                 self.place.clear();
                 self.fetched = 0;
                 self.offline = false;
@@ -673,7 +719,7 @@ impl Widget for Weather {
             }
             if let Some(Some(l)) = res {
                 if self.wx.is_none() {
-                    self.apply(l);
+                    self.apply(l, cx);
                 }
             }
         }
@@ -689,7 +735,7 @@ impl Widget for Weather {
                         self.not_found = false;
                         self.ver += 1;
                     }
-                    self.apply(l);
+                    self.apply(l, cx);
                 }
                 Some(Err(e)) => {
                     self.net_job = None;
@@ -725,6 +771,14 @@ impl Widget for Weather {
                 }
                 self.ver += 1;
             }
+        }
+        let busy = self.glide.step(cx);
+        if busy || self.moving {
+            self.ver += 1; // `draw` takes the temperatures again, with the eased values (and once more with the final ones)
+        }
+        self.moving = busy;
+        if busy {
+            return Tick::Fps(60); // the temperatures count to the refreshed forecast
         }
         Tick::Poll(Duration::from_secs(60))
     }

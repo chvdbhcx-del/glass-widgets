@@ -135,27 +135,54 @@ pub(crate) fn fmt_bits_parts(bps: f64, lang: Lang) -> (String, &'static str) {
     (n, (if lang == Lang::Ru { &BIT_RATES_RU } else { &BIT_RATES_EN })[u])
 }
 
-/// Fixed-length history (oldest first) drawn as a sparkline that grows in from the right edge.
+/// Fixed-length history (oldest first) drawn as a sparkline that grows in from the right edge. `Hist::flow` keeps one spare sample and draws
+/// the line FLOWING (see `motion::flow_points`): between two samples it scrolls left continuously while its right edge always shows the newest sample (no lag).
 #[derive(Clone)]
 pub(crate) struct Hist {
     v: Vec<f32>,
     cap: usize,
+    /// samples kept: `cap`, or `cap + 1` for a flowing graph (the spare one sits just outside the left edge)
+    keep: usize,
+    flows: bool,
+    /// when the newest sample arrived, and the (smoothed) seconds between samples
+    at: Option<Instant>,
+    period: f32,
+    /// points of the current frame (reused, no allocation per frame)
+    pts: std::cell::RefCell<Vec<(f32, f32)>>,
 }
 impl Hist {
     pub(crate) fn new(cap: usize) -> Hist {
-        Hist { v: Vec::with_capacity(cap), cap }
+        Hist { v: Vec::with_capacity(cap), cap, keep: cap, flows: false, at: None, period: 1.0, pts: Default::default() }
+    }
+    /// A history whose graph flows between samples (`cap` samples fit the width).
+    pub(crate) fn flow(cap: usize) -> Hist {
+        Hist { keep: cap + 1, flows: true, v: Vec::with_capacity(cap + 1), ..Hist::new(cap) }
     }
     pub(crate) fn push(&mut self, x: f32) {
-        if self.v.len() >= self.cap {
+        if self.v.len() >= self.keep {
             self.v.remove(0);
         }
         self.v.push(x);
+        let now = Instant::now();
+        if let Some(t) = self.at {
+            self.period = (self.period * 0.7 + now.duration_since(t).as_secs_f32().clamp(0.3, 3.0) * 0.3).clamp(0.3, 3.0);
+        }
+        self.at = Some(now);
+    }
+    /// Enough samples that the graph moves (the widget then runs at 60 fps while it is visible).
+    pub(crate) fn flowing(&self) -> bool {
+        self.flows && self.v.len() >= 2
     }
     pub(crate) fn last(&self) -> Option<f32> {
         self.v.last().copied()
     }
     pub(crate) fn max(&self) -> f32 {
         self.v.iter().cloned().fold(0.0, f32::max)
+    }
+    /// Mean of the newest `n` samples (fewer while the history is still short): a reading that does not twitch with every sample.
+    pub(crate) fn mean_last(&self, n: usize) -> Option<f32> {
+        let s = &self.v[self.v.len().saturating_sub(n.max(1))..];
+        (!s.is_empty()).then(|| s.iter().sum::<f32>() / s.len() as f32)
     }
     /// A full history built from a deterministic function (previews).
     pub(crate) fn wave(cap: usize, f: impl Fn(usize) -> f32) -> Hist {
@@ -165,13 +192,22 @@ impl Hist {
         }
         h
     }
-    pub(crate) fn draw(&self, cx: &Cx, r: Rect, lo: f32, hi: f32, color: Color) {
+    /// `moving` = draw the flowing line (a widget passes false in previews and with reduced motion: the plain graph of the samples).
+    pub(crate) fn draw(&self, cx: &Cx, r: Rect, lo: f32, hi: f32, color: Color, moving: bool) {
         let n = self.v.len();
         if n < 2 {
             return;
         }
-        let w = r.w * (n - 1) as f32 / (self.cap - 1).max(1) as f32;
-        cx.sparkline_range(Rect::new(r.right() - w, r.y, w, r.h), &self.v, lo, hi, color);
+        if self.flows && moving {
+            let since = self.at.map_or(0.0, |t| t.elapsed().as_secs_f32());
+            let mut pts = self.pts.borrow_mut();
+            crate::motion::flow_points(&self.v, self.cap, crate::motion::flow_phase(since, self.period), &mut pts);
+            cx.sparkline_flow(r, &pts, lo, hi, color);
+            return;
+        }
+        let s = &self.v[n.saturating_sub(self.cap)..];
+        let w = r.w * (s.len() - 1) as f32 / (self.cap - 1).max(1) as f32;
+        cx.sparkline_range(Rect::new(r.right() - w, r.y, w, r.h), s, lo, hi, color);
     }
 }
 
@@ -403,11 +439,51 @@ struct Sysmon {
     /// GPU count the static layout was recorded for
     ngpu: usize,
     init: bool,
+    /// the shown percents (keys "cpu", "ram", "gpu{i}") and the VRAM fraction ("vram{i}") glide to each new sample
+    glide: GlideAnim,
 }
 
 impl Sysmon {
     fn new() -> Sysmon {
-        Sysmon { ver: 0, sampler: Some(Sampler::default()), job: None, last: None, cur: None, cpu: Hist::new(60), ram: Hist::new(60), gpu: Vec::new(), ngpu: 0, init: false }
+        Sysmon { ver: 0, sampler: Some(Sampler::default()), job: None, last: None, cur: None, cpu: Hist::flow(60), ram: Hist::flow(60), gpu: Vec::new(), ngpu: 0, init: false, glide: GlideAnim::default() }
+    }
+
+    /// Point the glides at the latest sample (call after `apply` / `init_preview`).
+    fn feed(&mut self, cx: &Cx) {
+        let put = |g: &mut GlideAnim, key: String, v: Option<f32>| match v {
+            Some(v) => g.set(&key, v, cx),
+            None => g.forget(&key),
+        };
+        put(&mut self.glide, "cpu".into(), self.cpu.last());
+        put(&mut self.glide, "ram".into(), self.cur.as_ref().map(|s| s.ram_pct));
+        put(&mut self.glide, "thr".into(), self.cur.as_ref().map(|s| s.threads as f32));
+        put(&mut self.glide, "ramu".into(), self.cur.as_ref().map(|s| s.ram_used as f32));
+        for i in 0..self.ngpu.max(1) {
+            let g = self.cur.as_ref().and_then(|s| s.gpus.get(i));
+            put(&mut self.glide, format!("gpu{i}"), g.map(|g| g.util));
+            put(&mut self.glide, format!("vram{i}"), g.filter(|g| g.total > 0).map(|g| g.used as f32 / g.total as f32));
+            put(&mut self.glide, format!("vramu{i}"), g.map(|g| g.used as f32));
+            put(&mut self.glide, format!("temp{i}"), g.and_then(|g| g.temp).map(|t| t as f32));
+            put(&mut self.glide, format!("pw{i}"), g.and_then(|g| g.power_w));
+        }
+    }
+
+    /// The glided value of `key` (the raw `v` before the first feed).
+    fn e(&self, key: &str, v: f32) -> f32 {
+        self.glide.or(key, v)
+    }
+    /// "12 threads" with the count counting up / down.
+    fn threads_text(&self, cx: &Cx, s: &Sample) -> String {
+        let n = self.e("thr", s.threads as f32).round() as u32;
+        format!("{} {}", n, plural(n, cx.t("поток", "thread"), cx.t("потока", "threads"), cx.t("потоков", "threads")))
+    }
+    /// "used / total" of the RAM with the used part counting.
+    fn ram_text(&self, s: &Sample, lang: Lang) -> String {
+        fmt_pair(self.e("ramu", s.ram_used as f32) as u64, s.ram_total, lang)
+    }
+    /// The glided value of `key` (the raw one before the first feed).
+    fn shown(&self, key: &str, v: Option<f32>) -> Option<f32> {
+        v.map(|v| self.glide.or(key, v))
     }
 
     fn init_preview(&mut self, cx: &Cx) {
@@ -418,7 +494,13 @@ impl Sysmon {
         let n = cx.cfg_f64("sample_gpus").map(|v| v as usize).unwrap_or(1).min(2);
         let (c, r, g, s) = preview_data(n, cx.cfg_bool("sample_hot").unwrap_or(false));
         (self.cpu, self.ram, self.gpu, self.cur, self.ngpu) = (c, r, g, Some(s), n);
+        self.feed(cx);
         self.ver += 1;
+    }
+
+    /// An M / L graph is on screen and moving with the clock (60 fps; never in previews or with reduced motion).
+    fn flowing(&self, cx: &Cx) -> bool {
+        cx.size != Size::S && self.cpu.flowing() && !reduced_motion()
     }
 
     fn apply(&mut self, s: Sample) {
@@ -426,7 +508,7 @@ impl Sysmon {
             self.cpu.push(c);
         }
         self.ram.push(s.ram_pct);
-        self.gpu.resize(s.gpus.len(), Hist::new(60));
+        self.gpu.resize(s.gpus.len(), Hist::flow(60));
         for (h, g) in self.gpu.iter_mut().zip(&s.gpus) {
             h.push(g.util);
         }
@@ -586,11 +668,13 @@ impl Widget for Sysmon {
     fn overlay(&mut self, cx: &mut Cx) -> Result<()> {
         self.init_preview(cx);
         let lang = cx.lang;
+        let flow = !cx.preview && !reduced_motion(); // the graphs scroll with the clock; previews and reduced motion show the plain graph
         match cx.size {
             Size::S => {
-                let mut gauges = vec![self.cpu_now(), self.ram_now()];
+                let mut gauges = vec![self.shown("cpu", self.cpu_now()), self.shown("ram", self.ram_now())];
                 if self.ngpu > 0 {
-                    gauges.push(self.gpu_now(self.main_gpu()).map(|g| g.util));
+                    let m = self.main_gpu();
+                    gauges.push(self.shown(&format!("gpu{m}"), self.gpu_now(m).map(|g| g.util)));
                 }
                 let n = gauges.len();
                 for (i, v) in gauges.iter().enumerate() {
@@ -609,17 +693,18 @@ impl Widget for Sysmon {
             }
             Size::M => {
                 let n = if self.ngpu > 0 { 3 } else { 2 };
-                let g = self.gpu_now(self.main_gpu());
+                let m = self.main_gpu();
+                let g = self.gpu_now(m);
                 for i in 0..n {
                     let r = m_row(i, n);
                     let (v, hist, detail): (Option<f32>, Option<&Hist>, String) = match i {
-                        0 => (self.cpu_now(), Some(&self.cpu), self.cur.as_ref().map_or(String::new(), |s| format!("{} {}", s.threads, plural(s.threads, cx.t("поток", "thread"), cx.t("потока", "threads"), cx.t("потоков", "threads"))))),
-                        1 => (self.ram_now(), Some(&self.ram), self.cur.as_ref().map_or(String::new(), |s| fmt_pair(s.ram_used, s.ram_total, lang))),
+                        0 => (self.shown("cpu", self.cpu_now()), Some(&self.cpu), self.cur.as_ref().map_or(String::new(), |s| self.threads_text(cx, s))),
+                        1 => (self.shown("ram", self.ram_now()), Some(&self.ram), self.cur.as_ref().map_or(String::new(), |s| self.ram_text(s, lang))),
                         _ => (
-                            g.map(|g| g.util),
+                            self.shown(&format!("gpu{m}"), g.map(|g| g.util)),
                             self.gpu.get(self.main_gpu()),
                             g.map_or(String::new(), |g| match g.temp {
-                                Some(t) => format!("{t}°C"),
+                                Some(t) => format!("{}°C", self.e(&format!("temp{m}"), t as f32).round() as u32),
                                 None => short_name(&g.name).to_string(),
                             }),
                         ),
@@ -629,39 +714,42 @@ impl Widget for Sysmon {
                     let vs = ((r.h - 14.0) * 0.85).min(34.0);
                     cx.text(Rect::new(r.x, r.y + 14.0, 116.0, r.h - 14.0), &pct_text(v), Style::new(vs, 300).mono(), TEXT);
                     if let Some(h) = hist {
-                        h.draw(cx, Rect::new(r.x + 124.0, r.y + 5.0, r.w - 128.0, r.h - 10.0), 0.0, 100.0, col);
+                        h.draw(cx, Rect::new(r.x + 124.0, r.y + 5.0, r.w - 128.0, r.h - 10.0), 0.0, 100.0, col, flow);
                     }
                 }
             }
             Size::L => {
                 for s in l_layout(self.ngpu) {
                     let (v, hist, detail): (Option<f32>, Option<&Hist>, String) = match s.kind {
-                        Kind::Cpu => (self.cpu_now(), Some(&self.cpu), self.cur.as_ref().map_or(String::new(), |c| format!("{} {}", c.threads, plural(c.threads, cx.t("поток", "thread"), cx.t("потока", "threads"), cx.t("потоков", "threads"))))),
-                        Kind::Ram => (self.ram_now(), Some(&self.ram), self.cur.as_ref().map_or(String::new(), |c| fmt_pair(c.ram_used, c.ram_total, lang))),
-                        Kind::Gpu(i) => (self.gpu_now(i).map(|g| g.util), self.gpu.get(i), self.gpu_now(i).map_or(String::new(), |g| short_name(&g.name).to_string())),
+                        Kind::Cpu => (self.shown("cpu", self.cpu_now()), Some(&self.cpu), self.cur.as_ref().map_or(String::new(), |c| self.threads_text(cx, c))),
+                        Kind::Ram => (self.shown("ram", self.ram_now()), Some(&self.ram), self.cur.as_ref().map_or(String::new(), |c| self.ram_text(c, lang))),
+                        Kind::Gpu(i) => (self.shown(&format!("gpu{i}"), self.gpu_now(i).map(|g| g.util)), self.gpu.get(i), self.gpu_now(i).map_or(String::new(), |g| short_name(&g.name).to_string())),
                     };
                     let col = v.map_or(FAINT, load_color);
                     cx.text(Rect::new(s.head.x + 74.0, s.head.y, s.head.w - 74.0 - 64.0, s.head.h), &detail, Style::CAPTION.ellipsis(), DIM);
                     cx.text(Rect::new(s.head.right() - 64.0, s.head.y - 3.0, 64.0, s.head.h + 6.0), &pct_text(v), Style::new(21.0, 300).mono().right(), TEXT);
                     if let Some(h) = hist {
-                        h.draw(cx, s.graph.inset_xy(1.0, 5.0), 0.0, 100.0, col);
+                        h.draw(cx, s.graph.inset_xy(1.0, 5.0), 0.0, 100.0, col, flow);
                     }
                     if let (Some(d), Kind::Gpu(i)) = (s.detail, s.kind) {
                         let (t, vr, p) = l_cols(d);
                         let val = Style::new(14.0, 600).mono().ellipsis();
                         let g = self.gpu_now(i);
                         let (temp_s, temp_c) = match g.and_then(|g| g.temp) {
-                            Some(t) => (format!("{t}°C"), level_color(t as f32, 75.0, 85.0)),
+                            Some(t) => {
+                                let t = self.e(&format!("temp{i}"), t as f32);
+                                (format!("{}°C", t.round() as u32), level_color(t, 75.0, 85.0))
+                            }
                             None => ("–".to_string(), TEXT),
                         };
                         cx.text(Rect::new(t.x, t.y + 14.0, t.w, 18.0), &temp_s, val, temp_c);
                         let (vram_s, frac) = match g {
-                            Some(g) if g.total > 0 => (fmt_pair(g.used, g.total, lang), g.used as f32 / g.total as f32),
+                            Some(g) if g.total > 0 => (fmt_pair(self.e(&format!("vramu{i}"), g.used as f32) as u64, g.total, lang), self.glide.or(&format!("vram{i}"), g.used as f32 / g.total as f32)),
                             _ => ("–".to_string(), 0.0),
                         };
                         cx.text(Rect::new(vr.x, vr.y + 14.0, vr.w, 18.0), &vram_s, val, TEXT);
                         cx.bar(Rect::new(vr.x, vr.y + 33.0, vr.w, 4.0), frac, load_color(frac * 100.0));
-                        let pw = g.and_then(|g| g.power_w).map_or("–".to_string(), |w| format!("{} {}", w.round() as i32, cx.t("Вт", "W")));
+                        let pw = g.and_then(|g| g.power_w).map_or("–".to_string(), |w| format!("{} {}", self.e(&format!("pw{i}"), w).round() as i32, cx.t("Вт", "W")));
                         cx.text(Rect::new(p.x, p.y + 14.0, p.w, 18.0), &pw, val, TEXT);
                     }
                 }
@@ -688,6 +776,7 @@ impl Widget for Sysmon {
                     self.sampler = Some(s);
                     self.job = None;
                     self.apply(smp);
+                    self.feed(cx);
                     cx.request_frame();
                 }
                 None if !j.busy() => {
@@ -698,7 +787,7 @@ impl Widget for Sysmon {
                 None => {}
             }
         }
-        if self.job.is_none() && self.last.map_or(true, |t| t.elapsed() >= Duration::from_millis(900)) {
+        if self.job.is_none() && self.last.map_or(true, |t| t.elapsed() >= Duration::from_millis(990)) {
             if let Some(mut s) = self.sampler.take() {
                 self.last = Some(Instant::now());
                 self.job = Some(cx.spawn(move || {
@@ -706,6 +795,9 @@ impl Widget for Sysmon {
                     (s, smp)
                 }));
             }
+        }
+        if self.glide.step(cx) || self.flowing(cx) {
+            return Tick::Fps(60); // the rings, bars and numbers glide to the new sample; M / L graphs scroll with the clock
         }
         Tick::Every(Duration::from_secs(1)) // the values live in `overlay`: it is repainted on every recompose (video wallpaper), `Poll` would paint it once and lose it
     }
@@ -718,6 +810,19 @@ impl Widget for Sysmon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mean_of_the_newest_samples() {
+        let mut h = Hist::new(10);
+        assert_eq!(h.mean_last(4), None);
+        for x in [100.0, 0.0, 0.0, 0.0, 0.0] {
+            h.push(x);
+        }
+        assert_eq!(h.mean_last(4), Some(0.0)); // the burst is out of the window
+        h.push(40.0);
+        assert_eq!(h.mean_last(4), Some(10.0));
+        assert_eq!(h.mean_last(99), Some(140.0 / 6.0)); // a short history: all of it
+    }
 
     #[test]
     fn cpu_delta() {
@@ -785,6 +890,18 @@ mod tests {
         assert_eq!(h.v, vec![7.0, 8.0, 9.0]);
         assert_eq!(h.last(), Some(9.0));
         assert_eq!(h.max(), 9.0);
+    }
+
+    #[test]
+    fn flowing_history_keeps_one_spare_sample() {
+        let mut h = Hist::flow(3);
+        for i in 0..10 {
+            h.push(i as f32);
+        }
+        assert_eq!(h.v, vec![6.0, 7.0, 8.0, 9.0]); // 3 fit the width, the 4th waits just outside the left edge
+        assert!(h.flowing());
+        assert!(!Hist::new(3).flowing(), "a plain history never scrolls");
+        assert!(!Hist::flow(3).flowing(), "nothing to scroll before two samples");
     }
 
     /// Prints real numbers from this machine: `cargo test sysmon_live -- --ignored --nocapture`.

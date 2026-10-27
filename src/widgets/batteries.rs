@@ -41,6 +41,7 @@ struct Device {
 }
 
 /// One ring column / list row.
+#[derive(Clone)]
 struct Item {
     name: String,
     glyph: Glyph,
@@ -187,6 +188,10 @@ struct Batteries {
     job: Option<Pending<Vec<Device>>>,
     last_job: Option<Instant>,
     ver: u64,
+    /// charge per item name ("b:name", 0..1) glides to each new reading
+    glide: GlideAnim,
+    /// a glide is in flight: `draw` leaves the ring arcs / bar fills out, `overlay` paints them (re-recorded when it starts and ends)
+    moving: bool,
 }
 
 fn glyph_of(kind: &str) -> Glyph {
@@ -252,18 +257,56 @@ fn pct_label(cx: &Cx, r: Rect, it: &Item, st: Style, c: Color, right: bool) {
     cx.text(Rect::new(x0 + bw + gap, r.y, tw + 2.0, r.h), &txt, st, c);
 }
 
-/// One ring column: gauge with the glyph inside, the percent below. `c` = ring centre.
-fn ring_item(cx: &Cx, c: Pt, it: &Item) {
-    let r = 27.25; // 60 px outer diameter with the 5.5 stroke
+/// S / M: ring centre of column `i` of `n`, and whether this PC is alone (a hint goes underneath).
+fn ring_centre(cx: &Cx, i: usize, n: usize) -> Pt {
+    let colw = if cx.size == Size::S { 69.0 } else { 81.0 };
+    let top = (cx.h - 86.0) / 2.0 - if n == 1 { 8.0 } else { 0.0 };
+    ((cx.w - colw * n as f32) / 2.0 + colw * (i as f32 + 0.5), top + 30.0)
+}
+const RING_R: f32 = 27.25; // 60 px outer diameter with the 5.5 stroke
+/// L: the bar of row `i`.
+fn row_bar(i: usize) -> Rect {
+    Rect::new(16.0 + 36.0, 44.0 + 44.0 * i as f32 + 30.0, 214.0, 5.0)
+}
+/// The item as it is drawn now: its charge on the way to the new reading (the arc, the bar, the percent and the colour all follow from it).
+fn shown(g: &GlideAnim, it: &Item) -> Item {
+    match it.pct {
+        Some(p) if !it.plug => Item { pct: Some(g.or(&format!("b:{}", it.name), p as f32).round().clamp(0.0, 100.0) as u8), ..it.clone() },
+        _ => it.clone(),
+    }
+}
+fn frac(it: &Item) -> f32 {
+    it.pct.map_or(0.0, |p| p as f32 / 100.0)
+}
+/// The percent under a ring (S / M).
+fn ring_label(cx: &Cx, c: Pt, it: &Item) {
+    let label = Rect::new(c.0 - 40.0, c.1 + RING_R + 8.0, 80.0, 18.0);
+    pct_label(cx, label, it, Style::new(13.0, 600), if it.pct.is_none() && !it.plug { DIM } else { TEXT }, false);
+}
+/// The percent at the right of list row `i` (L).
+fn row_label(cx: &Cx, i: usize, it: &Item) {
+    let row = Rect::new(16.0, 44.0 + 44.0 * i as f32, 324.0, 44.0);
+    let dim = !it.connected;
+    let st = Style::new(14.0, 500).mono();
+    pct_label(cx, Rect::new(row.right() - 62.0, row.y, 62.0, 44.0), it, if it.plug { Style::new(12.0, 500) } else { st }, if dim || (it.pct.is_none() && !it.plug) { DIM } else { TEXT }, true);
+}
+
+/// One ring column: gauge with the glyph inside, the percent below. `c` = ring centre; the arc is left to `overlay` while it glides.
+fn ring_item(cx: &Cx, c: Pt, it: &Item, moving: bool) {
+    let r = RING_R;
     if it.plug {
         cx.ring(c, r, 5.5, 1.0, GREEN.fade(0.55));
     } else {
-        cx.ring(c, r, 5.5, it.pct.map_or(0.0, |p| p as f32 / 100.0), level_color(it));
+        cx.ring_track(c, r, 5.5);
+        if !moving {
+            cx.ring_arc(c, r, 5.5, frac(it), level_color(it));
+        }
     }
     let gc = if it.plug { DIM } else if it.pct.is_none() { FAINT } else { TEXT };
     cx.icon(it.glyph, Rect::new(c.0 - 12.0, c.1 - 12.0, 24.0, 24.0), gc);
-    let label = Rect::new(c.0 - 40.0, c.1 + r + 8.0, 80.0, 18.0);
-    pct_label(cx, label, it, Style::new(13.0, 600), if it.pct.is_none() && !it.plug { DIM } else { TEXT }, false);
+    if !moving {
+        ring_label(cx, c, it);
+    }
 }
 
 impl Widget for Batteries {
@@ -273,16 +316,40 @@ impl Widget for Batteries {
             return self.draw_list(cx, &items);
         }
         let n = items.len();
-        let colw = if cx.size == Size::S { 69.0 } else { 81.0 };
         let lone = n == 1; // only this PC: leave room for a hint underneath
-        let top = (cx.h - 86.0) / 2.0 - if lone { 8.0 } else { 0.0 };
-        let x0 = (cx.w - colw * n as f32) / 2.0;
         for (i, it) in items.iter().enumerate() {
-            ring_item(cx, (x0 + colw * (i as f32 + 0.5), top + 30.0), it);
+            ring_item(cx, ring_centre(cx, i, n), it, self.moving);
         }
         if lone {
             let hint = if self.devices.is_none() && !cx.preview { cx.t("Поиск устройств…", "Looking for devices…") } else { cx.t("Устройств Bluetooth нет", "No Bluetooth devices") };
             cx.text(Rect::new(16.0, cx.h - 36.0, cx.w - 32.0, 16.0), hint, Style::CAPTION.center().ellipsis(), DIM);
+        }
+        Ok(())
+    }
+
+    /// The gliding part: ring arcs / bar fills at their eased charge (the tracks stay in `draw`).
+    fn overlay(&mut self, cx: &mut Cx) -> Result<()> {
+        if !self.moving {
+            return Ok(());
+        }
+        let items = self.items(cx);
+        for (i, it) in items.iter().enumerate() {
+            let it = shown(&self.glide, it);
+            let c = ring_centre(cx, i, items.len());
+            match (cx.size == Size::L, it.plug) {
+                (true, plug) => {
+                    if !plug {
+                        cx.bar_fill(row_bar(i), frac(&it), level_color(&it));
+                    }
+                    row_label(cx, i, &it);
+                }
+                (false, plug) => {
+                    if !plug {
+                        cx.ring_arc(c, RING_R, 5.5, frac(&it), level_color(&it));
+                    }
+                    ring_label(cx, c, &it);
+                }
+            }
         }
         Ok(())
     }
@@ -345,6 +412,20 @@ impl Widget for Batteries {
             self.last_job = Some(Instant::now());
             self.job = Some(cx.spawn(fetch_devices));
         }
+        for it in self.items(cx).iter().filter(|it| !it.plug) {
+            match it.pct {
+                Some(p) => self.glide.set(&format!("b:{}", it.name), p as f32 / 100.0, cx),
+                None => self.glide.forget(&format!("b:{}", it.name)),
+            }
+        }
+        let busy = self.glide.step(cx);
+        if busy != self.moving {
+            self.moving = busy;
+            self.ver += 1; // `draw` takes the arcs / fills over again (or hands them to `overlay`)
+        }
+        if busy {
+            return Tick::Fps(60); // the gauges glide to the new reading
+        }
         Tick::Poll(Duration::from_secs(if self.devices.is_none() { 3 } else { 30 }))
     }
 
@@ -365,14 +446,18 @@ impl Batteries {
             let dim = !it.connected;
             cx.icon(it.glyph, Rect::new(row.x, row.cy() - 11.0, 22.0, 22.0), if dim { FAINT } else { TEXT });
             cx.text(Rect::new(row.x + 36.0, row.y + 8.0, 220.0, 18.0), &it.name, Style::new(13.0, 600).ellipsis(), if dim { DIM } else { TEXT });
-            let bar = Rect::new(row.x + 36.0, row.y + 30.0, 214.0, 5.0);
+            let bar = row_bar(i);
             if it.plug {
                 cx.bar(bar, 1.0, GREEN.fade(0.55));
             } else {
-                cx.bar(bar, it.pct.map_or(0.0, |p| p as f32 / 100.0), level_color(it));
+                cx.pill(bar, FILL);
+                if !self.moving {
+                    cx.bar_fill(bar, frac(it), level_color(it));
+                }
             }
-            let st = Style::new(14.0, 500).mono();
-            pct_label(cx, Rect::new(row.right() - 62.0, row.y, 62.0, 44.0), it, if it.plug { Style::new(12.0, 500) } else { st }, if dim || (it.pct.is_none() && !it.plug) { DIM } else { TEXT }, true);
+            if !self.moving {
+                row_label(cx, i, it);
+            }
         }
         if self.devices.as_ref().is_some_and(|d| d.is_empty()) || items.len() == 1 {
             let y = 44.0 + 44.0 * items.len() as f32;
@@ -386,6 +471,17 @@ impl Batteries {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shown_item_falls_back_to_the_real_charge_and_leaves_plugs_alone() {
+        let it = |pct: Option<u8>, plug: bool| Item { name: "Mouse".into(), glyph: Glyph::Mouse, pct, charging: false, plug, connected: true };
+        let g = GlideAnim::default(); // nothing glides: the shown charge is the real one
+        assert_eq!(shown(&g, &it(Some(64), false)).pct, Some(64));
+        assert_eq!(shown(&g, &it(None, false)).pct, None);
+        assert_eq!(shown(&g, &it(Some(0), true)).pct, Some(0));
+        assert_eq!(frac(&it(Some(50), false)), 0.5);
+        assert_eq!(frac(&it(None, false)), 0.0);
+    }
 
     #[test]
     fn classify_names() {

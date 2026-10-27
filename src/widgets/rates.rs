@@ -301,6 +301,8 @@ struct Row {
     value: Option<f64>,
     change: Option<f64>,
     spark: Vec<f32>,
+    /// the previous picture of `spark` while a refresh blends into the new one
+    spark_from: Vec<f32>,
 }
 
 #[derive(Default)]
@@ -319,6 +321,10 @@ struct Rates {
     last_try: i64,
     /// new pairs not yet written to cfg (written by `draw` / `mouse`, which own `&mut Cx`)
     save_pairs: bool,
+    /// per pair: "v:P" value, "c:P" change, "s:P" blend of the sparkline 0 -> 1; they move for ~300 ms after a refresh
+    glide: GlideAnim,
+    /// a glide is in flight: `draw` is re-recorded every frame with the eased numbers (the data comes every few minutes, so this is rare)
+    moving: bool,
 }
 
 pub fn register(r: &mut Registry) {
@@ -342,12 +348,45 @@ impl Rates {
             .map(|p| {
                 let (a, b) = split_pair(p);
                 let h = self.hist.get(p).map(|h| h.as_slice()).unwrap_or(&[]);
-                Row { label: p.clone(), value: self.market.value(a, b), change: self.market.change(a, b).or_else(|| hist_change(h)), spark: spark(h, 48) }
+                Row { label: p.clone(), value: self.market.value(a, b), change: self.market.change(a, b).or_else(|| hist_change(h)), spark: spark(h, 48), spark_from: Vec::new() }
             })
             .collect();
         if self.sel >= self.rows.len() {
             self.sel = 0;
         }
+    }
+
+    /// `rebuild` + point the glides at the new rows: a pair that was on screen eases from its old value / change / sparkline.
+    fn rebuild_anim(&mut self, cx: &Cx) {
+        let old = std::mem::take(&mut self.rows);
+        self.rebuild();
+        for row in &mut self.rows {
+            let t = &row.label;
+            if let Some(v) = row.value {
+                self.glide.set(&format!("v:{t}"), v as f32, cx);
+            }
+            if let Some(c) = row.change {
+                self.glide.set(&format!("c:{t}"), c as f32, cx);
+            }
+            if let Some(o) = old.iter().find(|o| o.label == *t).filter(|o| o.spark.len() == row.spark.len() && o.spark != row.spark) {
+                row.spark_from = o.spark.clone();
+                self.glide.start(&format!("s:{t}"), 0.0, 1.0, cx);
+            }
+        }
+    }
+    /// What a row shows now: the real number, or its eased value while a refresh glides in.
+    fn value_of(&self, row: &Row) -> Option<f64> {
+        row.value.map(|v| if self.moving { self.glide.or(&format!("v:{}", row.label), v as f32) as f64 } else { v })
+    }
+    fn change_of(&self, row: &Row) -> Option<f64> {
+        row.change.map(|c| if self.moving { self.glide.or(&format!("c:{}", row.label), c as f32) as f64 } else { c })
+    }
+    fn spark_of(&self, row: &Row) -> Vec<f32> {
+        if !self.moving || row.spark_from.len() != row.spark.len() {
+            return row.spark.clone();
+        }
+        let k = self.glide.or(&format!("s:{}", row.label), 1.0);
+        row.spark_from.iter().zip(&row.spark).map(|(a, b)| a + (b - a) * k).collect()
     }
 
     fn start_job(&mut self, cx: &Cx, now: i64) {
@@ -371,7 +410,7 @@ impl Rates {
     }
 
     /// merge a finished fetch: market, history, cache file
-    fn apply(&mut self, f: Fetched, now: i64) {
+    fn apply(&mut self, f: Fetched, now: i64, cx: &Cx) {
         if let Some(fi) = f.fiat {
             self.market.fiat = fi;
         }
@@ -384,7 +423,7 @@ impl Rates {
         }
         self.stale = !f.ok;
         self.have_data = !self.market.fiat.is_empty() || !self.market.crypto.is_empty();
-        self.rebuild();
+        self.rebuild_anim(cx);
         save_cache(&self.market, &self.hist, now);
     }
 
@@ -412,8 +451,9 @@ impl Rates {
 
     /// sparkline, or a faint flat line while there are fewer than two samples
     fn draw_spark(&self, cx: &Cx, r: Rect, row: &Row) {
-        if row.spark.len() >= 2 {
-            cx.sparkline(r, &row.spark, Self::spark_color(row.change));
+        let spark = self.spark_of(row);
+        if spark.len() >= 2 {
+            cx.sparkline(r, &spark, Self::spark_color(row.change));
         } else {
             cx.line((r.x, r.cy()), (r.right(), r.cy()), 1.2, FILL);
         }
@@ -465,14 +505,14 @@ impl Rates {
                 cx.circle((x, c.y + 9.0), 2.5, if i == self.sel { TEXT } else { FAINT });
             }
         }
-        let vt = self.value_text(cx, row.value);
+        let vt = self.value_text(cx, self.value_of(row));
         let mut size = 40.0f32;
         while size > 22.0 && cx.measure(&vt, Style::new(size, 300).mono(), 0.0).0 > c.w {
             size -= 2.0;
         }
         cx.text(Rect::new(c.x, c.y + 22.0, c.w, 50.0), &vt, Style::new(size, 300).mono().ellipsis(), TEXT);
         let line = Rect::new(c.x, c.y + 72.0, c.w, 22.0);
-        self.draw_change(cx, line, row.change, 12.0, false);
+        self.draw_change(cx, line, self.change_of(row), 12.0, false);
         if self.stale {
             cx.text(line, cx.t("нет сети", "offline"), Style::CAPTION.right(), FAINT);
         }
@@ -489,8 +529,8 @@ impl Rates {
             let (col, rw) = ((i % 2) as f32, (i / 2) as f32);
             let cell = Rect::new(area.x + col * (cw + gap_x), area.y + rw * (ch + gap_y), cw, ch);
             cx.text(Rect::new(cell.x, cell.y, 74.0, 16.0), &row.label, Style::new(11.0, 700).track(0.4).ellipsis(), accent());
-            self.draw_change(cx, Rect::new(cell.x + 60.0, cell.y, cell.w - 60.0, 16.0), row.change, 10.5, true);
-            let vt = self.value_text(cx, row.value);
+            self.draw_change(cx, Rect::new(cell.x + 60.0, cell.y, cell.w - 60.0, 16.0), self.change_of(row), 10.5, true);
+            let vt = self.value_text(cx, self.value_of(row));
             let vw = cell.w - 62.0;
             let mut size = 22.0f32;
             while size > 14.0 && cx.measure(&vt, Style::new(size, 300).mono(), 0.0).0 > vw {
@@ -511,9 +551,9 @@ impl Rates {
                 cx.rect(Rect::new(r.x, r.y, r.w, 0.6), FILL);
             }
             cx.text(Rect::new(r.x, r.y + rh / 2.0 - 19.0, 100.0, 18.0), &row.label.replace('/', " / "), Style::TITLE.ellipsis(), TEXT);
-            self.draw_change(cx, Rect::new(r.x, r.y + rh / 2.0 + 1.0, 100.0, 18.0), row.change, 11.0, false);
+            self.draw_change(cx, Rect::new(r.x, r.y + rh / 2.0 + 1.0, 100.0, 18.0), self.change_of(row), 11.0, false);
             self.draw_spark(cx, Rect::new(r.x + 112.0, r.y + 9.0, 78.0, rh - 18.0), row);
-            let vt = self.value_text(cx, row.value);
+            let vt = self.value_text(cx, self.value_of(row));
             let vw = r.w - 204.0;
             let mut size = 24.0f32;
             while size > 14.0 && cx.measure(&vt, Style::new(size, 300).mono(), 0.0).0 > vw {
@@ -577,7 +617,7 @@ impl Widget for Rates {
                 self.have_data = true;
                 self.stale = true; // until the first refresh succeeds
             }
-            self.rebuild();
+            self.rebuild_anim(cx);
             self.ver += 1;
         }
         if cx.preview {
@@ -591,7 +631,7 @@ impl Widget for Rates {
                     self.sel = 0;
                     self.save_pairs = true;
                     self.last_try = 0; // refetch now
-                    self.rebuild();
+                    self.rebuild_anim(cx);
                     self.ver += 1;
                 }
             } else if !p.busy() {
@@ -601,13 +641,21 @@ impl Widget for Rates {
         if let Some(p) = &self.job {
             if let Some(f) = p.take() {
                 self.job = None;
-                self.apply(f, now);
+                self.apply(f, now, cx);
                 self.ver += 1;
             } else if !p.busy() {
                 self.job = None; // the worker died: treat as offline
                 self.stale = true;
                 self.ver += 1;
             }
+        }
+        let busy = self.glide.step(cx);
+        if busy || self.moving {
+            self.ver += 1; // `draw` takes the numbers again, with the eased values (and once more with the final ones)
+        }
+        self.moving = busy;
+        if busy {
+            return Tick::Fps(60); // the values, changes and sparklines glide to the refreshed data
         }
         let interval = if self.stale { RETRY_SECS } else { REFRESH_SECS };
         if self.job.is_none() && now - self.last_try >= interval {

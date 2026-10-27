@@ -32,6 +32,8 @@ const IF_LOOPBACK: u32 = 24;
 const IF_TUNNEL: u32 = 131;
 /// the smallest graph scale (bytes/s) so an idle line does not look like a storm
 const MIN_SCALE: f32 = 64.0 * 1024.0;
+/// Readings (about one per second) averaged into the big speed numbers.
+const AVG_SAMPLES: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 struct Row {
@@ -122,11 +124,13 @@ struct Network {
     /// click zones of the unit labels, filled by `overlay` (card px); `hot` = the cursor is over one
     zones: Vec<Rect>,
     hot: bool,
+    /// the shown numbers glide to each reading: "d" / "u" speeds, "rx" / "tx" totals (all in bytes), "sc" / "sc0" / "sc1" graph scales
+    glide: GlideAnim,
 }
 
 impl Network {
     fn new() -> Network {
-        Network { init: false, reader: Some(Reader::default()), job: None, spawned: None, last: None, down: Hist::new(60), up: Hist::new(60), total_rx: 0, total_tx: 0, online: true, zones: Vec::new(), hot: false }
+        Network { init: false, reader: Some(Reader::default()), job: None, spawned: None, last: None, down: Hist::flow(60), up: Hist::flow(60), total_rx: 0, total_tx: 0, online: true, zones: Vec::new(), hot: false, glide: GlideAnim::default() }
     }
 
     fn init_preview(&mut self, cx: &Cx) {
@@ -139,6 +143,21 @@ impl Network {
         self.up = Hist::wave(60, |i| ((0.8 + 0.5 * (i as f32 * 0.31 + 2.0).sin() + 0.25 * (i as f32 * 1.1).sin()) * MB).max(0.01 * MB));
         self.total_rx = 2_580_000_000;
         self.total_tx = 327_000_000;
+        self.feed(cx);
+    }
+
+    /// Point the glides at the latest reading (after `apply` / `init_preview`): the speeds, the totals and the graph scales.
+    fn feed(&mut self, cx: &Cx) {
+        // the big numbers show the mean of the last AVG_SAMPLES readings (~3-4 s): a drop from a burst winds down instead of snapping; the graph keeps every sample
+        let (d, u) = (self.down.mean_last(AVG_SAMPLES).unwrap_or(0.0), self.up.mean_last(AVG_SAMPLES).unwrap_or(0.0));
+        for (k, v) in [("d", d), ("u", u), ("rx", self.total_rx as f32), ("tx", self.total_tx as f32), ("sc", scale_of(&self.down, Some(&self.up))), ("sc0", scale_of(&self.down, None)), ("sc1", scale_of(&self.up, None))] {
+            self.glide.set(k, v, cx);
+        }
+    }
+
+    /// A graph is moving with the clock (60 fps; never in previews, offline or with reduced motion).
+    fn flowing(&self) -> bool {
+        self.online && self.down.flowing() && !reduced_motion()
     }
 
     fn apply(&mut self, (at, online, rx, tx): Reading) {
@@ -215,8 +234,9 @@ impl Widget for Network {
     fn overlay(&mut self, cx: &mut Cx) -> Result<()> {
         self.init_preview(cx);
         let c = cx.content();
-        let (d, u) = (self.down.last().unwrap_or(0.0), self.up.last().unwrap_or(0.0));
+        let (d, u) = (self.glide.or("d", self.down.last().unwrap_or(0.0)), self.glide.or("u", self.up.last().unwrap_or(0.0)));
         let lang = cx.lang;
+        let flow = !cx.preview && !reduced_motion(); // the graphs scroll with the clock; previews and reduced motion show the plain graph
         self.zones.clear();
         match cx.size {
             Size::S => {
@@ -236,9 +256,9 @@ impl Widget for Network {
                     cx.text(Rect::new(c.x + 20.0, c.y + 70.0, c.w - 20.0, 20.0), cx.t("Нет подключения", "Offline"), Style::BODY.ellipsis(), DIM);
                 }
                 let r = Rect::new(c.x, c.y + 96.0, c.w, 42.0);
-                let hi = scale_of(&self.down, Some(&self.up));
-                self.down.draw(cx, r, 0.0, hi, accent());
-                self.up.draw(cx, r, 0.0, hi, UP);
+                let hi = self.glide.or("sc", scale_of(&self.down, Some(&self.up)));
+                self.down.draw(cx, r, 0.0, hi, accent(), flow);
+                self.up.draw(cx, r, 0.0, hi, UP, flow);
             }
             Size::M => {
                 for i in 0..2 {
@@ -250,10 +270,11 @@ impl Widget for Network {
                     } else {
                         cx.text(Rect::new(lane.x, lane.y + 14.0, 110.0, lane.h - 14.0), "–", Style::new(28.0, 300), FAINT);
                     }
-                    h.draw(cx, Rect::new(lane.x + 128.0, lane.y + 5.0, lane.w - 132.0, lane.h - 10.0), 0.0, scale_of(h, None), color);
+                    let hi = self.glide.or(if i == 0 { "sc0" } else { "sc1" }, scale_of(h, None));
+                    h.draw(cx, Rect::new(lane.x + 128.0, lane.y + 5.0, lane.w - 132.0, lane.h - 10.0), 0.0, hi, color, flow);
                 }
                 let cap = Rect::new(c.x, c.bottom() - 14.0, c.w, 14.0);
-                let text = if self.online { format!("{}: ↓ {}   ↑ {}", cx.t("С запуска", "Since start"), fmt_size(self.total_rx, lang), fmt_size(self.total_tx, lang)) } else { cx.t("Нет подключения", "No connection").to_string() };
+                let text = if self.online { format!("{}: ↓ {}   ↑ {}", cx.t("С запуска", "Since start"), fmt_size(self.glide.or("rx", self.total_rx as f32) as u64, lang), fmt_size(self.glide.or("tx", self.total_tx as f32) as u64, lang)) } else { cx.t("Нет подключения", "No connection").to_string() };
                 cx.text(cap, &text, Style::CAPTION.ellipsis(), DIM);
             }
             Size::L => {}
@@ -287,6 +308,7 @@ impl Widget for Network {
                     self.job = None;
                     if let Some(x) = reading {
                         self.apply(x);
+                        self.feed(cx);
                     }
                     cx.request_frame();
                 }
@@ -297,7 +319,7 @@ impl Widget for Network {
                 None => {}
             }
         }
-        if self.job.is_none() && self.spawned.map_or(true, |t| t.elapsed() >= Duration::from_millis(900)) {
+        if self.job.is_none() && self.spawned.map_or(true, |t| t.elapsed() >= Duration::from_millis(990)) {
             if let Some(mut r) = self.reader.take() {
                 self.spawned = Some(Instant::now());
                 self.job = Some(cx.spawn(move || {
@@ -305,6 +327,9 @@ impl Widget for Network {
                     (r, x)
                 }));
             }
+        }
+        if self.glide.step(cx) || self.flowing() {
+            return Tick::Fps(60); // the numbers count to the new reading and the graphs scroll with the clock
         }
         Tick::Every(Duration::from_secs(1)) // the speeds live in `overlay`: see sysmon, `Poll` would lose them on the next recompose
     }
@@ -347,6 +372,32 @@ mod tests {
         // adapter 2 vanishes and returns: counted from zero again
         assert_eq!(step(&mut prev, &[row(1, true, 6, true, 20, 5)]), (10, 0));
         assert_eq!(step(&mut prev, &[row(1, true, 6, true, 20, 5), row(2, true, 6, true, 1, 1)]), (0, 0));
+    }
+
+    #[test]
+    fn counted_speeds_switch_units_once_and_never_twitch() {
+        // 900 KiB/s -> 3 MiB/s eased in base units: the text is read off the eased value, the unit changes exactly once on the way
+        let mut g = crate::motion::Glide::default();
+        g.set("d", 900.0 * 1024.0);
+        g.set("d", 3.0 * 1048576.0);
+        let (mut units, mut last): (Vec<&str>, f64) = (Vec::new(), 0.0);
+        let mut frames = 0;
+        loop {
+            let v = g.get("d").unwrap();
+            assert!(v as f64 >= last, "the number only counts up");
+            last = v as f64;
+            let (_, u) = fmt_rate_parts(v as f64, Lang::En);
+            if units.last() != Some(&u) {
+                units.push(u);
+            }
+            if !g.step(1.0 / 60.0) {
+                break;
+            }
+            frames += 1;
+            assert!(frames < 120, "counting took too long");
+        }
+        assert_eq!(units.len(), 2, "{units:?}");
+        assert_eq!(fmt_rate_parts(g.get("d").unwrap() as f64, Lang::En), fmt_rate_parts(3.0 * 1048576.0, Lang::En)); // ends exactly on the real number
     }
 
     /// `cargo test network_live -- --ignored --nocapture`

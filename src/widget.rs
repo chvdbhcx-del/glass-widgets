@@ -10,7 +10,7 @@
 //! All drawing helpers take LOGICAL px (the framework applies the UI scale) in card-local coordinates (0,0 = top-left of the card).
 use crate::gfx::*;
 use crate::icons;
-use crate::motion::HoverRamps;
+use crate::motion::{Glide, HoverRamps};
 use crate::sys;
 pub use crate::icons::Glyph;
 pub use crate::sys::{decode_image_bytes, decode_image_file, http_get, powershell, run_hidden, spawn_hidden, Action, Decoded, MediaKey, PowerOp};
@@ -170,6 +170,74 @@ impl HoverAnim {
     /// Cell under the pointer.
     pub fn hot(&self) -> Option<usize> {
         self.hot
+    }
+}
+
+/// Values that glide INSIDE a widget, by key (a ring's fraction, a bar, the number beside it, a list row's slot). `set` the fresh
+/// targets from `tick`, then `step` (it advances by the real time elapsed); `get` / `or` in `overlay`. While anything moves `step` is true
+/// and the widget returns `Tick::Fps(60)`; after the last movement a frame is requested here and the widget goes back to its idle schedule
+/// (idle cost stays zero). A key seen for the first time starts at its target; previews and reduced motion jump straight to the end.
+pub struct GlideAnim {
+    g: Glide,
+    since: Option<Instant>,
+}
+impl Default for GlideAnim {
+    fn default() -> GlideAnim {
+        GlideAnim { g: Glide::default(), since: None }
+    }
+}
+impl GlideAnim {
+    /// Fixed-time ease-in-out moves of `secs` (a soft start and end): list rows changing places.
+    pub fn smooth(secs: f32) -> GlideAnim {
+        GlideAnim { g: Glide::smooth(secs), since: None }
+    }
+    pub fn set(&mut self, key: &str, target: f32, cx: &Cx) {
+        if cx.preview || reduced_motion() {
+            self.g.jump(key, target);
+        } else if self.g.set(key, target) {
+            self.since.get_or_insert_with(Instant::now);
+        }
+    }
+    /// Like `set`, with the value a new key starts from (a row sliding in).
+    pub fn set_from(&mut self, key: &str, from: f32, target: f32, cx: &Cx) {
+        if cx.preview || reduced_motion() {
+            self.g.jump(key, target);
+        } else if self.g.set_from(key, from, target) {
+            self.since.get_or_insert_with(Instant::now);
+        }
+    }
+    /// Restart `key` from `from` to `target` (a 0 -> 1 blend between the old and the new picture of a graph).
+    pub fn start(&mut self, key: &str, from: f32, target: f32, cx: &Cx) {
+        if cx.preview || reduced_motion() {
+            self.g.jump(key, target);
+        } else if self.g.start(key, from, target) {
+            self.since.get_or_insert_with(Instant::now);
+        }
+    }
+    /// Advance to now (call from `tick`, after the `set`s). True while something is still moving: `Tick::Fps(60)`.
+    pub fn step(&mut self, cx: &Cx) -> bool {
+        let Some(t0) = self.since else { return false };
+        let now = Instant::now();
+        if self.g.step(now.saturating_duration_since(t0).as_secs_f32().min(0.05)) {
+            self.since = Some(now);
+            return true;
+        }
+        self.since = None;
+        cx.request_frame(); // the last position
+        false
+    }
+    pub fn get(&self, key: &str) -> Option<f32> {
+        self.g.get(key)
+    }
+    /// The shown value, or `fallback` for a key that was never set.
+    pub fn or(&self, key: &str, fallback: f32) -> f32 {
+        self.g.get(key).unwrap_or(fallback)
+    }
+    pub fn forget(&mut self, key: &str) {
+        self.g.forget(key);
+    }
+    pub fn retain(&mut self, keep: impl FnMut(&str) -> bool) {
+        self.g.retain(keep);
     }
 }
 
@@ -1526,7 +1594,15 @@ impl<'a> Cx<'a> {
     }
     /// Ring gauge: a faint full track plus the arc for `frac` (0..1) from 12 o'clock clockwise, round caps (batteries, disks, timers).
     pub fn ring(&self, c: Pt, r: f32, stroke: f32, frac: f32, color: Color) {
+        self.ring_track(c, r, stroke);
+        self.ring_arc(c, r, stroke, frac, color);
+    }
+    /// The faint full track of a ring alone (a widget whose arc glides in `overlay` keeps the track in `draw`).
+    pub fn ring_track(&self, c: Pt, r: f32, stroke: f32) {
         self.circle_stroke(c, r, stroke, FILL);
+    }
+    /// The arc of a ring alone (see `ring_track`).
+    pub fn ring_arc(&self, c: Pt, r: f32, stroke: f32, frac: f32, color: Color) {
         let f = frac.clamp(0.0, 1.0);
         if f > 0.0 {
             self.arc(c, r, stroke, 0.0, 360.0 * f, color);
@@ -1535,6 +1611,10 @@ impl<'a> Cx<'a> {
     /// Horizontal progress bar: faint pill track + pill fill of `frac` (0..1).
     pub fn bar(&self, r: Rect, frac: f32, color: Color) {
         self.pill(r, FILL);
+        self.bar_fill(r, frac, color);
+    }
+    /// The fill of a bar alone (the track is `pill(r, FILL)`; see `ring_arc`).
+    pub fn bar_fill(&self, r: Rect, frac: f32, color: Color) {
         let f = frac.clamp(0.0, 1.0);
         if f > 0.0 {
             self.pill(Rect::new(r.x, r.y, (r.w * f).max(r.h), r.h), color);
@@ -1572,7 +1652,19 @@ impl<'a> Cx<'a> {
         if n < 2 || hi <= lo {
             return;
         }
-        let p = |i: usize| (r.x + r.w * i as f32 / (n - 1) as f32, r.bottom() - r.h * ((values[i] - lo) / (hi - lo)).clamp(0.0, 1.0));
+        self.spark_geom(r, n, color, |i| (r.x + r.w * i as f32 / (n - 1) as f32, r.bottom() - r.h * ((values[i] - lo) / (hi - lo)).clamp(0.0, 1.0)));
+    }
+    /// A sparkline that flows: `pts` from `motion::flow_points` (x 0..1 across `r`, may start left of 0; value), clipped to `r`.
+    pub fn sparkline_flow(&self, r: Rect, pts: &[(f32, f32)], lo: f32, hi: f32, color: Color) {
+        if pts.len() < 2 || hi <= lo {
+            return;
+        }
+        self.clip(Rect::new(r.x, r.y - 2.0, r.w, r.h + 4.0)); // the stroke may reach past the top / bottom edge
+        self.spark_geom(r, pts.len(), color, |i| (r.x + r.w * pts[i].0, r.bottom() - r.h * ((pts[i].1 - lo) / (hi - lo)).clamp(0.0, 1.0)));
+        self.pop_clip();
+    }
+    /// The line + the soft area under it through the `n` points `p(0..n)` (card px).
+    fn spark_geom(&self, r: Rect, n: usize, color: Color, p: impl Fn(usize) -> (f32, f32)) {
         unsafe {
             let (Ok(line), Ok(area)) = (self.gfx.d2d.CreatePathGeometry(), self.gfx.d2d.CreatePathGeometry()) else { return };
             let (Ok(sl), Ok(sa)) = (line.Open(), area.Open()) else { return };
@@ -1585,7 +1677,7 @@ impl<'a> Cx<'a> {
                 sl.AddLine(pt(q.0, q.1));
                 sa.AddLine(pt(q.0, q.1));
             }
-            sa.AddLine(pt(r.right(), r.bottom()));
+            sa.AddLine(pt(p(n - 1).0, r.bottom()));
             sl.EndFigure(D2D1_FIGURE_END_OPEN);
             sa.EndFigure(D2D1_FIGURE_END_CLOSED);
             if sl.Close().is_err() || sa.Close().is_err() {

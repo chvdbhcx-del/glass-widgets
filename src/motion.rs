@@ -536,9 +536,268 @@ pub fn merge_pairs(rects: &[R4], scale: f32) -> Vec<(usize, usize, f32)> {
     out
 }
 
+// ---------------------------------------------------------------- keyed glides
+
+/// Eased values by key (a ring's fraction, a bar, a percent, a list row's slot): `set` a target, `step` moves every shown value
+/// towards its target by `dt`, `get` reads what to draw. A key seen for the first time starts AT its target (no animation on first show).
+/// Exponential approach: about 95 % of the way in 3 `tau`, snapping once within a hair of the target so the motion really ends.
+#[derive(Clone, Debug)]
+pub struct Glide {
+    v: std::collections::HashMap<String, Slot>,
+    tau: f32,
+    /// `Some(seconds)`: a fixed-time ease-in-out (smoothstep) instead of the exponential approach: it starts gently (list rows that change places)
+    dur: Option<f32>,
+}
+/// One key: the shown value, its target, and (smooth mode) where the current move started and how far along it is.
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    v: f32,
+    to: f32,
+    from: f32,
+    t: f32,
+}
+impl Slot {
+    fn at(v: f32, to: f32) -> Slot {
+        Slot { v, to, from: v, t: 0.0 }
+    }
+}
+impl Default for Glide {
+    fn default() -> Glide {
+        Glide::new(0.09)
+    }
+}
+impl Glide {
+    /// `tau` = the time constant in seconds (0.09 settles in about 300 ms).
+    pub fn new(tau: f32) -> Glide {
+        Glide { v: Default::default(), tau, dur: None }
+    }
+    /// Fixed-time ease-in-out of `secs` per move; a new target in mid-air restarts the move from where the value is now.
+    pub fn smooth(secs: f32) -> Glide {
+        Glide { v: Default::default(), tau: 0.09, dur: Some(secs.max(0.05)) }
+    }
+    /// New target. True when it changed (something will move).
+    pub fn set(&mut self, key: &str, target: f32) -> bool {
+        match self.v.get_mut(key) {
+            Some(e) if e.to != target => {
+                e.to = target;
+                e.from = e.v;
+                e.t = 0.0;
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.v.insert(key.to_string(), Slot::at(target, target));
+                false
+            }
+        }
+    }
+    /// Like `set`, but a key seen for the first time starts at `from` (a row sliding in, a row fading out).
+    pub fn set_from(&mut self, key: &str, from: f32, target: f32) -> bool {
+        if !self.v.contains_key(key) {
+            self.v.insert(key.to_string(), Slot::at(from, target));
+            return from != target;
+        }
+        self.set(key, target)
+    }
+    /// Restart the move of `key` from `from` to `target` (also when the key exists): a blend 0 -> 1 between two pictures.
+    pub fn start(&mut self, key: &str, from: f32, target: f32) -> bool {
+        self.v.insert(key.to_string(), Slot::at(from, target));
+        from != target
+    }
+    /// Show `target` at once (previews, reduced motion).
+    pub fn jump(&mut self, key: &str, target: f32) {
+        self.v.insert(key.to_string(), Slot::at(target, target));
+    }
+    /// What to draw now (None = the key was never set).
+    pub fn get(&self, key: &str) -> Option<f32> {
+        self.v.get(key).map(|e| e.v)
+    }
+    pub fn target(&self, key: &str) -> Option<f32> {
+        self.v.get(key).map(|e| e.to)
+    }
+    pub fn forget(&mut self, key: &str) {
+        self.v.remove(key);
+    }
+    /// Keep only the keys `keep` accepts.
+    pub fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.v.retain(|k, _| keep(k));
+    }
+    /// Is any shown value off its target?
+    pub fn moving(&self) -> bool {
+        self.v.values().any(|e| e.v != e.to)
+    }
+    /// Advance every value by `dt` seconds. True while something is still moving.
+    pub fn step(&mut self, dt: f32) -> bool {
+        let (tau, dur) = (self.tau, self.dur);
+        let mut busy = false;
+        for e in self.v.values_mut() {
+            if e.v == e.to {
+                continue;
+            }
+            if let Some(d) = dur {
+                e.t = (e.t + dt / d).min(1.0);
+                e.v = if e.t >= 1.0 { e.to } else { e.from + (e.to - e.from) * smooth(e.t) };
+            } else {
+                // relative eps: byte counts and percents both end (an absolute one would never be met by a float near 1e9)
+                e.v = follow(e.v, e.to, dt, tau, 0.002f32.max(e.to.abs() * 1e-3));
+            }
+            busy |= e.v != e.to;
+        }
+        busy
+    }
+}
+
+// ---------------------------------------------------------------- flowing graphs
+
+/// Polyline of a sparkline that FLOWS instead of jumping when a sample arrives: `values` is the history (oldest first), `visible` the number
+/// of samples that fit the graph width, `p` 0..1 how far the NEXT sample interval has come (time since the newest sample / the sample period).
+/// Output points are (x, value) with x = 0 at the left edge of the graph and 1 at the right (points left of 0 are meant to be clipped).
+/// The graph is CURRENT: the right edge always shows the newest sample's value (a spike appears at once and keeps its real shape, it is not
+/// smeared over a whole interval). Between samples every point slides left by `p` of a step and the head holds the newest value out to the
+/// right edge, so the line scrolls continuously; when the next sample arrives (`p` back at 0) every old point is exactly where it was at
+/// `p` = 1 and only the head turns from a flat hold into the real step to the new value.
+pub fn flow_points(values: &[f32], visible: usize, p: f32, out: &mut Vec<(f32, f32)>) {
+    out.clear();
+    let n = values.len();
+    if n < 2 {
+        return;
+    }
+    let step = 1.0 / (visible.max(2) - 1) as f32;
+    let p = p.clamp(0.0, 1.0);
+    for (i, &v) in values.iter().enumerate() {
+        let x = 1.0 - ((n - 1 - i) as f32 + p) * step;
+        if x >= -step {
+            out.push((x, v));
+        }
+    }
+    out.push((1.0, values[n - 1])); // the hold up to the right edge
+}
+
+/// Position inside the current sample interval: 0 right after a sample arrived, 1 one period later (it waits there for a late sample).
+pub fn flow_phase(since_sample: f32, period: f32) -> f32 {
+    (since_sample / period.max(0.05)).clamp(0.0, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flow_points_are_current_and_scroll_without_jumping() {
+        let mut a = Vec::new();
+        let v = [1.0, 5.0, 3.0, 9.0];
+        flow_points(&v, 4, 1.0, &mut a); // visible 4: step 1/3; a whole interval later: the last sample sits one step left, the head holds it
+        assert_eq!(a.last().copied(), Some((1.0, 9.0)));
+        assert!((a[a.len() - 2].0 - (1.0 - 1.0 / 3.0)).abs() < 1e-6 && a[a.len() - 2].1 == 9.0);
+        // a new sample arrives (p back to 0): every old point is where it was, and the right edge shows the NEW value at once
+        let mut b = Vec::new();
+        let w = [1.0, 5.0, 3.0, 9.0, 2.0];
+        flow_points(&w, 4, 0.0, &mut b);
+        let at = |pts: &[(f32, f32)], x: f32| pts.iter().find(|q| (q.0 - x).abs() < 1e-5).map(|q| q.1);
+        for &(x, y) in &a[..a.len() - 1] {
+            assert_eq!(at(&b, x), Some(y), "x = {x}");
+        }
+        assert_eq!(b.last().copied(), Some((1.0, 2.0)), "the spike / drop is not smeared over the interval");
+        // half way: the newest sample has slid half a step left, the head still shows the newest value
+        flow_points(&w, 4, 0.5, &mut b);
+        assert_eq!(b.last().copied(), Some((1.0, 2.0)));
+        assert!((b[b.len() - 2].0 - (1.0 - 0.5 / 3.0)).abs() < 1e-5 && b[b.len() - 2].1 == 2.0);
+        // points far left of the graph are dropped (a full history keeps one spare sample just outside)
+        let long: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        flow_points(&long, 4, 0.0, &mut b);
+        assert!(b.iter().all(|q| q.0 >= -1.0 / 3.0 - 1e-6) && b.len() <= 6);
+        // fewer than two samples: nothing to draw
+        flow_points(&[1.0], 4, 0.5, &mut b);
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn flow_phase_runs_one_period_and_waits() {
+        assert_eq!(flow_phase(0.0, 1.0), 0.0);
+        assert_eq!(flow_phase(0.25, 1.0), 0.25);
+        assert_eq!(flow_phase(3.0, 1.0), 1.0);
+        assert_eq!(flow_phase(0.5, 0.0), 1.0); // a zero period does not divide by zero
+    }
+
+    #[test]
+    fn glide_first_seen_key_has_no_animation() {
+        let mut g = Glide::default();
+        assert!(!g.set("a", 40.0));
+        assert_eq!((g.get("a"), g.target("a")), (Some(40.0), Some(40.0)));
+        assert!(!g.moving() && !g.step(0.016));
+        assert_eq!(g.get("nope"), None);
+    }
+
+    #[test]
+    fn glide_settles_in_about_300_ms_and_snaps() {
+        let mut g = Glide::default();
+        g.set("a", 0.0);
+        assert!(g.set("a", 1.0));
+        let mut t = 0.0;
+        let mut mid = None;
+        while g.step(1.0 / 60.0) {
+            t += 1.0 / 60.0;
+            if mid.is_none() && t > 0.05 {
+                mid = g.get("a");
+            }
+            assert!(t < 1.0, "never settled");
+        }
+        assert!(t > 0.15 && t < 0.6, "settled after {t}");
+        assert!(mid.unwrap() > 0.0 && mid.unwrap() < 1.0);
+        assert_eq!(g.get("a"), Some(1.0)); // exactly the target
+        assert!(!g.moving());
+        // big magnitudes (bytes) end as well
+        g.set("ram", 3.0e9);
+        g.set("ram", 3.2e9);
+        let mut n = 0;
+        while g.step(0.016) {
+            n += 1;
+            assert!(n < 200);
+        }
+        assert_eq!(g.get("ram"), Some(3.2e9));
+    }
+
+    #[test]
+    fn smooth_glide_starts_gently_and_takes_its_time() {
+        let (mut s, mut e) = (Glide::smooth(0.6), Glide::new(0.12));
+        for g in [&mut s, &mut e] {
+            g.set("y", 0.0);
+            g.set("y", 1.0);
+            g.step(0.03);
+        }
+        assert!(s.get("y").unwrap() < 0.02 && e.get("y").unwrap() > 0.2, "ease-in vs the exponential's instant start");
+        let mut t = 0.03;
+        while s.step(1.0 / 60.0) {
+            t += 1.0 / 60.0;
+            assert!(t < 1.0);
+        }
+        assert!(t > 0.55 && t < 0.7, "{t}");
+        assert_eq!(s.get("y"), Some(1.0));
+        // a new target in mid-air restarts the move from where the value is now
+        s.set("y", 0.0);
+        s.step(0.3);
+        let mid = s.get("y").unwrap();
+        s.set("y", 1.0);
+        assert_eq!(s.get("y"), Some(mid));
+        while s.step(1.0 / 60.0) {}
+        assert_eq!(s.get("y"), Some(1.0));
+    }
+
+    #[test]
+    fn glide_set_from_and_jump_and_retain() {
+        let mut g = Glide::default();
+        assert!(g.set_from("row", 4.6, 3.0)); // a row sliding in from below
+        assert_eq!(g.get("row"), Some(4.6));
+        g.step(0.05);
+        let y = g.get("row").unwrap();
+        assert!(y < 4.6 && y > 3.0);
+        assert!(!g.set_from("row", 9.0, 3.0)); // already known: the start is ignored
+        g.jump("row", 1.0);
+        assert_eq!((g.get("row"), g.moving()), (Some(1.0), false));
+        g.set("keep", 1.0);
+        g.retain(|k| k == "keep");
+        assert_eq!((g.get("row"), g.get("keep")), (None, Some(1.0)));
+    }
 
     #[test]
     fn size_morph_springs_to_the_target_and_comes_to_rest() {

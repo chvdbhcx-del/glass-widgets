@@ -158,6 +158,8 @@ struct Row {
     price: Option<f64>,
     change: Option<f64>,
     spark: Vec<f32>,
+    /// the previous picture of `spark` while a refresh blends into the new one
+    spark_from: Vec<f32>,
 }
 
 #[derive(Default)]
@@ -177,6 +179,10 @@ struct Crypto {
     last_try: i64,
     /// new coin list not yet written to cfg (written by `draw` / `mouse`, which own `&mut Cx`)
     save_coins: bool,
+    /// per coin: "p:T" price, "c:T" change, "s:T" blend of the sparkline 0 -> 1; they move for ~300 ms after a refresh
+    glide: GlideAnim,
+    /// a glide is in flight: `draw` is re-recorded every frame with the eased numbers (the data comes every few minutes, so this is rare)
+    moving: bool,
 }
 
 pub fn register(r: &mut Registry) {
@@ -224,14 +230,14 @@ fn badge(cx: &Cx, c: Pt, r: f32, ticker: &str) {
     cx.text(Rect::new(c.0 - r, c.1 - r, r * 2.0, r * 2.0), &ch, Style::new(r * 1.15, 700).center(), WHITE);
 }
 
-fn flat_or_spark(cx: &Cx, r: Rect, row: &Row) {
-    if row.spark.len() >= 2 {
-        let col = match row.change {
+fn flat_or_spark(cx: &Cx, r: Rect, spark: &[f32], change: Option<f64>) {
+    if spark.len() >= 2 {
+        let col = match change {
             Some(c) if c < -0.004 => RED,
             Some(c) if c > 0.004 => GREEN,
             _ => DIM,
         };
-        cx.sparkline(r, &row.spark, col);
+        cx.sparkline(r, spark, col);
     } else {
         cx.line((r.x, r.cy()), (r.right(), r.cy()), 1.2, FILL);
     }
@@ -245,12 +251,45 @@ impl Crypto {
             .map(|t| {
                 let q = self.quotes.get(t);
                 let h = self.hist.get(t).map(|h| h.as_slice()).unwrap_or(&[]);
-                Row { ticker: t.clone(), price: q.map(|q| q.0), change: q.map(|q| q.1), spark: spark(h, 48) }
+                Row { ticker: t.clone(), price: q.map(|q| q.0), change: q.map(|q| q.1), spark: spark(h, 48), spark_from: Vec::new() }
             })
             .collect();
         if self.sel >= self.rows.len() {
             self.sel = 0;
         }
+    }
+
+    /// `rebuild` + point the glides at the new rows: a coin that was on screen eases from its old price / change / sparkline.
+    fn rebuild_anim(&mut self, cx: &Cx) {
+        let old = std::mem::take(&mut self.rows);
+        self.rebuild();
+        for row in &mut self.rows {
+            let t = &row.ticker;
+            if let Some(p) = row.price {
+                self.glide.set(&format!("p:{t}"), p as f32, cx);
+            }
+            if let Some(c) = row.change {
+                self.glide.set(&format!("c:{t}"), c as f32, cx);
+            }
+            if let Some(o) = old.iter().find(|o| o.ticker == *t).filter(|o| o.spark.len() == row.spark.len() && o.spark != row.spark) {
+                row.spark_from = o.spark.clone();
+                self.glide.start(&format!("s:{t}"), 0.0, 1.0, cx);
+            }
+        }
+    }
+    /// What a row shows now: the real number, or its eased value while a refresh glides in.
+    fn price_of(&self, row: &Row) -> Option<f64> {
+        row.price.map(|p| if self.moving { self.glide.or(&format!("p:{}", row.ticker), p as f32) as f64 } else { p })
+    }
+    fn change_of(&self, row: &Row) -> Option<f64> {
+        row.change.map(|c| if self.moving { self.glide.or(&format!("c:{}", row.ticker), c as f32) as f64 } else { c })
+    }
+    fn spark_of(&self, row: &Row) -> Vec<f32> {
+        if !self.moving || row.spark_from.len() != row.spark.len() {
+            return row.spark.clone();
+        }
+        let k = self.glide.or(&format!("s:{}", row.ticker), 1.0);
+        row.spark_from.iter().zip(&row.spark).map(|(a, b)| a + (b - a) * k).collect()
     }
 
     fn start_job(&mut self, cx: &Cx, now: i64) {
@@ -260,7 +299,7 @@ impl Crypto {
         self.job = Some(cx.spawn(move || net::http_get_json(&url, 8000).ok().map(|v| parse_quotes(&v, vs)).filter(|q| !q.is_empty())));
     }
 
-    fn apply(&mut self, q: Option<Quotes>, now: i64) {
+    fn apply(&mut self, q: Option<Quotes>, now: i64, cx: &Cx) {
         match q {
             Some(q) => {
                 for (t, (p, _)) in &q {
@@ -273,7 +312,7 @@ impl Crypto {
             }
             None => self.stale = true,
         }
-        self.rebuild();
+        self.rebuild_anim(cx);
     }
 
     fn price_text(&self, cx: &Cx, p: Option<f64>) -> String {
@@ -306,14 +345,14 @@ impl Crypto {
                 cx.circle((x, c.y + 10.0), 2.5, if i == self.sel { TEXT } else { FAINT });
             }
         }
-        let pt = self.price_text(cx, row.price);
+        let pt = self.price_text(cx, self.price_of(row));
         cx.text(Rect::new(c.x, c.y + 26.0, c.w, 46.0), &pt, self.fit_price(cx, &pt, c.w, 36.0, 20.0, 300).ellipsis(), TEXT);
         let line = Rect::new(c.x, c.y + 76.0, c.w, 22.0);
-        change_pill(cx, line, row.change, 12.0, false);
+        change_pill(cx, line, self.change_of(row), 12.0, false);
         if self.stale {
             cx.text(line, cx.t("нет сети", "offline"), Style::CAPTION.right(), FAINT);
         }
-        flat_or_spark(cx, Rect::new(c.x, c.y + 102.0, c.w, 36.0), row);
+        flat_or_spark(cx, Rect::new(c.x, c.y + 102.0, c.w, 36.0), &self.spark_of(row), row.change);
     }
 
     fn draw_rows(&self, cx: &Cx, area: Rect, n: usize) {
@@ -326,9 +365,9 @@ impl Crypto {
             }
             badge(cx, (r.x + 11.0, r.cy()), 10.0, &row.ticker);
             cx.text(Rect::new(r.x + 28.0, r.y, 56.0, r.h), &row.ticker, Style::TITLE.ellipsis(), TEXT);
-            flat_or_spark(cx, Rect::new(r.x + 88.0, r.y + 8.0, 66.0, r.h - 16.0), row);
-            change_pill(cx, Rect::new(r.x, r.y, r.w, r.h), row.change, 11.0, true);
-            let pt = self.price_text(cx, row.price);
+            flat_or_spark(cx, Rect::new(r.x + 88.0, r.y + 8.0, 66.0, r.h - 16.0), &self.spark_of(row), row.change);
+            change_pill(cx, Rect::new(r.x, r.y, r.w, r.h), self.change_of(row), 11.0, true);
+            let pt = self.price_text(cx, self.price_of(row));
             let pw = r.w - 164.0 - 76.0;
             cx.text(Rect::new(r.x + 164.0, r.y, pw, r.h), &pt, self.fit_price(cx, &pt, pw, 15.0, 11.0, 500).right().ellipsis(), TEXT);
         }
@@ -344,11 +383,11 @@ impl Crypto {
             badge(cx, (r.x + 14.0, r.cy()), 14.0, &row.ticker);
             cx.text(Rect::new(r.x + 38.0, r.y + 5.0, 80.0, 18.0), &row.ticker, Style::TITLE.ellipsis(), TEXT);
             cx.text(Rect::new(r.x + 38.0, r.y + 23.0, 80.0, 16.0), coin_info(&row.ticker).0, Style::CAPTION.ellipsis(), DIM);
-            flat_or_spark(cx, Rect::new(r.x + 124.0, r.y + 9.0, 78.0, r.h - 18.0), row);
-            let pt = self.price_text(cx, row.price);
+            flat_or_spark(cx, Rect::new(r.x + 124.0, r.y + 9.0, 78.0, r.h - 18.0), &self.spark_of(row), row.change);
+            let pt = self.price_text(cx, self.price_of(row));
             let pw = r.w - 214.0;
             cx.text(Rect::new(r.x + 214.0, r.y + 3.0, pw, 20.0), &pt, self.fit_price(cx, &pt, pw, 15.0, 11.0, 500).right().ellipsis(), TEXT);
-            change_pill(cx, Rect::new(r.x + 214.0, r.y + 24.0, pw, 18.0), row.change, 11.0, true);
+            change_pill(cx, Rect::new(r.x + 214.0, r.y + 24.0, pw, 18.0), self.change_of(row), 11.0, true);
         }
     }
 }
@@ -407,7 +446,7 @@ impl Widget for Crypto {
                 self.have_data = true;
                 self.stale = true; // until the first refresh succeeds
             }
-            self.rebuild();
+            self.rebuild_anim(cx);
             self.ver += 1;
         }
         if cx.preview {
@@ -421,7 +460,7 @@ impl Widget for Crypto {
                     self.sel = 0;
                     self.save_coins = true;
                     self.last_try = 0; // refetch now
-                    self.rebuild();
+                    self.rebuild_anim(cx);
                     self.ver += 1;
                 }
             } else if !p.busy() {
@@ -431,13 +470,21 @@ impl Widget for Crypto {
         if let Some(p) = &self.job {
             if let Some(q) = p.take() {
                 self.job = None;
-                self.apply(q, now);
+                self.apply(q, now, cx);
                 self.ver += 1;
             } else if !p.busy() {
                 self.job = None; // the worker died: treat as offline
                 self.stale = true;
                 self.ver += 1;
             }
+        }
+        let busy = self.glide.step(cx);
+        if busy || self.moving {
+            self.ver += 1; // `draw` takes the numbers again, with the eased values (and once more with the final ones)
+        }
+        self.moving = busy;
+        if busy {
+            return Tick::Fps(60); // the prices, changes and sparklines glide to the refreshed data
         }
         let interval = if self.stale { RETRY_SECS } else { REFRESH_SECS };
         if self.job.is_none() && now - self.last_try >= interval {

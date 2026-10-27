@@ -169,8 +169,94 @@ struct Processes {
     list: Vec<Entry>,
     /// the rows on screen for the current sort
     view: Vec<Entry>,
+    /// `view` plus the next `HIDDEN` ranks: they wait below the card and rows glide through them when the order changes
+    hid: Vec<Entry>,
+    /// the sort `view` was built for (the numbers' unit while a sort change is still gliding)
+    view_ram: bool,
     ready: bool,
     ver: u64,
+    /// per process (lower-case name): "y:" row slot, "a:" opacity, "f:" bar fraction, "n:" number (CPU % or RAM bytes)
+    glide: GlideAnim,
+    /// per process: "f:" bar fraction, "n:" number (these follow their value, they are not moves)
+    vals: GlideAnim,
+    /// rows that left the top list: drawn sliding down and fading out until they are gone
+    ghosts: Vec<Ghost>,
+}
+
+/// A row on its way out: what it showed when it left.
+struct Ghost {
+    key: String,
+    label: String,
+    text: String,
+}
+
+/// Which names enter and which leave between two row lists (lower-case keys).
+fn diff_rows(old: &[String], new: &[String]) -> (Vec<String>, Vec<String>) {
+    let entering = new.iter().filter(|k| !old.contains(k)).cloned().collect();
+    let leaving = old.iter().filter(|k| !new.contains(k)).cloned().collect();
+    (entering, leaving)
+}
+
+/// `sorted` (best first) re-ordered so that processes of nearly equal load keep the order they had in `prev`: a row only overtakes another
+/// when it is clearly bigger (25 % and a real difference), so the low rows no longer trade places at every sample.
+fn sticky(mut sorted: Vec<Entry>, prev: &[String], by_ram: bool) -> Vec<Entry> {
+    let pos = |e: &Entry| prev.iter().position(|k| *k == rkey(e));
+    let eps = if by_ram { (64u64 << 20) as f32 } else { 0.3 };
+    for _ in 0..sorted.len() {
+        let mut swapped = false;
+        for i in 1..sorted.len() {
+            let (a, b) = (&sorted[i - 1], &sorted[i]);
+            if let (Some(pa), Some(pb)) = (pos(a), pos(b)) {
+                if pa > pb && metric(a, by_ram) <= metric(b, by_ram) * 1.25 + eps {
+                    sorted.swap(i - 1, i); // `b` was above `a` and `a` did not clearly overtake it
+                    swapped = true;
+                }
+            }
+        }
+        if !swapped {
+            break;
+        }
+    }
+    sorted
+}
+
+/// Ranks kept below the card: a row that falls out of the top slides down through them instead of vanishing on the spot.
+const HIDDEN: usize = 3;
+
+/// Opacity of a row at the (fractional) slot `y` on a card of `rows` slots: full on the card, fading out over the bottom 0.7 of the last slot.
+fn edge_fade(y: f32, rows: f32) -> f32 {
+    let last = rows - 1.0;
+    if y <= last {
+        1.0
+    } else {
+        1.0 - crate::motion::smooth((y - last) / 0.7)
+    }
+}
+
+fn rkey(e: &Entry) -> String {
+    e.name.to_lowercase()
+}
+fn label(e: &Entry) -> String {
+    if e.count > 1 {
+        format!("{} ×{}", e.name, e.count)
+    } else {
+        e.name.clone()
+    }
+}
+fn metric(e: &Entry, by_ram: bool) -> f32 {
+    if by_ram {
+        e.ram as f32
+    } else {
+        e.cpu
+    }
+}
+/// The number column of a row: `v` is CPU % or RAM bytes.
+fn cell_text(v: f32, by_ram: bool, lang: Lang) -> String {
+    if by_ram {
+        fmt_size(v.max(0.0) as u64, lang)
+    } else {
+        fmt_cpu(v)
+    }
 }
 
 fn sample_list() -> Vec<Entry> {
@@ -199,14 +285,72 @@ impl Processes {
             4
         }
     }
+    /// The longest bar's value: the bars are relative to it (so a change of it moves every bar; the fractions glide).
+    fn peak(&self) -> f32 {
+        self.view.iter().map(|e| metric(e, self.by_ram)).fold(0.0, f32::max).max(if self.by_ram { 1.0 } else { 5.0 })
+    }
+    /// New order: every row glides to its rank (the ranks below the card are real slots too, so a process that drops out of the top
+    /// slides down and fades at the bottom edge, one that climbs in slides up from below). A process that vanished entirely becomes a ghost.
     fn rebuild(&mut self, cx: &Cx) {
-        self.view = top(&self.list, self.by_ram, self.rows(cx));
+        let rows = self.rows(cx);
+        let old = std::mem::take(&mut self.hid);
+        let old_k: Vec<String> = old.iter().map(rkey).collect();
+        // the unit changed (CPU <-> RAM): the old order means nothing for the new one
+        let prev = if self.view_ram == self.by_ram { old_k.clone() } else { Vec::new() };
+        self.hid = sticky(top(&self.list, self.by_ram, rows + HIDDEN + 4), &prev, self.by_ram);
+        self.hid.truncate(rows + HIDDEN);
+        self.view = self.hid.iter().take(rows).cloned().collect();
+        let new_k: Vec<String> = self.hid.iter().map(rkey).collect();
+        let (entering, leaving) = diff_rows(&old_k, &new_k);
+        let anim = !cx.preview && !reduced_motion();
+        if anim {
+            for e in old.iter().take(rows).filter(|e| leaving.contains(&rkey(e))) {
+                let k = rkey(e);
+                let text = cell_text(self.vals.or(&format!("n:{k}"), metric(e, self.view_ram)), self.view_ram, cx.lang);
+                self.ghosts.retain(|g| g.key != k);
+                self.ghosts.push(Ghost { key: k.clone(), label: label(e), text });
+                self.glide.set(&format!("y:{k}"), (rows + HIDDEN) as f32, cx);
+            }
+        }
+        if self.view_ram != self.by_ram {
+            self.vals.retain(|k| !k.starts_with("n:")); // CPU % and RAM bytes do not glide into each other: the numbers start at the new unit
+            self.view_ram = self.by_ram;
+        }
+        let peak = self.peak();
+        for (i, e) in self.hid.iter().enumerate() {
+            let k = rkey(e);
+            self.ghosts.retain(|g| g.key != k); // a row that came back
+            let (y, a) = (format!("y:{k}"), format!("a:{k}"));
+            if anim && !old.is_empty() && entering.contains(&k) && i < rows {
+                self.glide.set_from(&y, i as f32 + 1.0, i as f32, cx); // a brand new process: up from below, fading in
+                self.glide.set_from(&a, 0.0, 1.0, cx);
+            } else {
+                self.glide.set(&y, i as f32, cx);
+                self.glide.set(&a, 1.0, cx);
+            }
+            let m = metric(e, self.by_ram);
+            self.vals.set(&format!("f:{k}"), m / peak, cx);
+            self.vals.set(&format!("n:{k}"), m, cx);
+        }
+    }
+    /// Drop what has finished: ghosts that slid below the card, glides of processes that are no longer tracked.
+    fn tidy(&mut self, busy: bool, rows: usize) {
+        if busy {
+            let g = &self.glide;
+            self.ghosts.retain(|x| g.or(&format!("y:{}", x.key), 0.0) < rows as f32);
+        } else {
+            self.ghosts.clear();
+        }
+        let keep: Vec<String> = self.hid.iter().map(rkey).chain(self.ghosts.iter().map(|g| g.key.clone())).collect();
+        self.glide.retain(|k| k.split_once(':').is_some_and(|(_, n)| keep.iter().any(|x| x == n)));
+        self.vals.retain(|k| k.split_once(':').is_some_and(|(_, n)| keep.iter().any(|x| x == n)));
     }
     fn start(&mut self, cx: &Cx) {
         if self.started {
             return;
         }
         self.started = true;
+        self.glide = GlideAnim::smooth(0.6); // rows change places: a soft start and end over 0.6 s, not the quick exponential of a bar
         self.by_ram = cx.cfg_str("sort") == Some("ram");
         if cx.preview {
             self.list = sample_list();
@@ -226,10 +370,20 @@ impl Processes {
     }
     /// Row `i`: y and height.
     fn row(cx: &Cx, i: usize) -> Rect {
+        Self::row_at(cx, i as f32)
+    }
+    /// Row at the (fractional, while it glides) slot `i`.
+    fn row_at(cx: &Cx, i: f32) -> Rect {
         let c = cx.content();
         let (top, rows) = if cx.size == Size::L { (c.y + 30.0, 8.0) } else { (c.y + 22.0, 4.0) };
         let h = (c.bottom() - top) / rows;
-        Rect::new(c.x, top + i as f32 * h, c.w, h)
+        Rect::new(c.x, top + i * h, c.w, h)
+    }
+    /// One row: name, relative bar, value.
+    fn paint_row(cx: &Cx, r: Rect, name: &str, frac: f32, text: &str, color: Color) {
+        cx.text(Rect::new(r.x, r.y, 128.0, r.h), name, Style::BODY.ellipsis(), TEXT);
+        cx.bar(Rect::new(r.x + 136.0, r.cy() - 3.0, r.w - 136.0 - 70.0, 6.0), frac, color);
+        cx.text(Rect::new(r.right() - 62.0, r.y, 62.0, r.h), text, Style::MONO.right(), DIM);
     }
 }
 
@@ -271,16 +425,30 @@ impl Widget for Processes {
             cx.text(cx.content().cut_top(30.0).1, msg, Style::BODY.center(), DIM);
             return Ok(());
         }
-        let peak = self.view.iter().map(|e| if self.by_ram { e.ram as f64 } else { e.cpu as f64 }).fold(0.0, f64::max).max(if self.by_ram { 1.0 } else { 5.0 });
+        let peak = self.peak();
         let color = if self.by_ram { TEAL } else { accent() };
-        for (i, e) in self.view.iter().enumerate() {
-            let r = Self::row(cx, i);
-            let name = if e.count > 1 { format!("{} ×{}", e.name, e.count) } else { e.name.clone() };
-            let (v, frac, text) = if self.by_ram { (e.ram as f64, e.ram as f64 / peak, fmt_size(e.ram, lang)) } else { (e.cpu as f64, e.cpu as f64 / peak, fmt_cpu(e.cpu)) };
-            let _ = v;
-            cx.text(Rect::new(r.x, r.y, 128.0, r.h), &name, Style::BODY.ellipsis(), TEXT);
-            cx.bar(Rect::new(r.x + 136.0, r.cy() - 3.0, r.w - 136.0 - 70.0, 6.0), frac as f32, color);
-            cx.text(Rect::new(r.right() - 62.0, r.y, 62.0, r.h), &text, Style::MONO.right(), DIM);
+        let (g, v) = (&self.glide, &self.vals);
+        let rows = self.rows(cx) as f32;
+        for (i, e) in self.hid.iter().enumerate() {
+            let k = rkey(e);
+            let y = g.or(&format!("y:{k}"), i as f32);
+            let a = g.or(&format!("a:{k}"), 1.0) * edge_fade(y, rows);
+            if a <= 0.0 {
+                continue; // waiting below the card
+            }
+            let m = metric(e, self.by_ram);
+            let text = cell_text(v.or(&format!("n:{k}"), m), self.by_ram, lang);
+            let r = Self::row_at(cx, y);
+            cx.with_opacity(a, |c| Self::paint_row(c, r, &label(e), v.or(&format!("f:{k}"), m / peak), &text, color));
+        }
+        // processes that left the list entirely: sliding down and fading out at the bottom edge
+        for x in &self.ghosts {
+            let y = g.or(&format!("y:{}", x.key), 0.0);
+            let a = edge_fade(y, rows);
+            if a > 0.0 {
+                let r = Self::row_at(cx, y);
+                cx.with_opacity(a, |c| Self::paint_row(c, r, &x.label, v.or(&format!("f:{}", x.key), 0.0), &x.text, color));
+            }
         }
         Ok(())
     }
@@ -310,6 +478,10 @@ impl Widget for Processes {
                 None => {}
             }
         }
+        let (moving, changing) = (self.glide.step(cx), self.vals.step(cx));
+        let busy = moving || changing;
+        let rows = self.rows(cx);
+        self.tidy(busy, rows);
         let gap = if self.samples < 2 { Duration::from_millis(500) } else { Duration::from_millis(1900) };
         if self.job.is_none() && self.last.map_or(true, |t| t.elapsed() >= gap) {
             if let Some(mut s) = self.sampler.take() {
@@ -320,6 +492,9 @@ impl Widget for Processes {
                 }));
             }
         }
+        if busy {
+            return Tick::Fps(60); // rows glide to their new slots, bars and numbers to their new values
+        }
         Tick::Every(if self.samples < 2 { Duration::from_millis(600) } else { Duration::from_secs(2) })
     }
 
@@ -328,6 +503,7 @@ impl Widget for Processes {
         if ev.clicked(strip) {
             self.by_ram = !self.by_ram;
             self.rebuild(cx);
+            cx.waker().wake(); // a click does not call `tick`: poke it so the rows start to glide now
             self.ver += 1;
             cx.cfg_set("sort", json!(if self.by_ram { "ram" } else { "cpu" }));
             return true;
@@ -374,6 +550,61 @@ mod tests {
         assert_eq!(top(&list, false, 1)[0].name, "chrome");
         assert_eq!(top(&list, true, 1)[0].name, "Code");
         assert_eq!(top(&list, true, 8).len(), 2);
+    }
+
+    #[test]
+    fn rows_enter_and_leave() {
+        let k = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (enter, leave) = diff_rows(&k(&["a", "b", "c"]), &k(&["b", "d", "a"]));
+        assert_eq!((enter, leave), (k(&["d"]), k(&["c"])));
+        assert_eq!(diff_rows(&[], &k(&["a"])), (k(&["a"]), vec![])); // the very first list: all "enter" (the caller skips the animation then)
+        assert_eq!(diff_rows(&k(&["a"]), &k(&["a"])), (vec![], vec![]));
+    }
+
+    #[test]
+    fn reordered_rows_glide_between_their_slots() {
+        use crate::motion::Glide;
+        let mut g = Glide::default();
+        g.set("y:a", 0.0);
+        g.set("y:b", 1.0);
+        g.set("y:a", 1.0); // a and b swap
+        g.set("y:b", 0.0);
+        g.set_from("y:new", 4.7, 3.0); // slides in from below its slot
+        g.set("y:gone", 2.0);
+        g.set("y:gone", 2.7); // slides down
+        g.step(0.06);
+        let (a, b, n, o) = (g.get("y:a").unwrap(), g.get("y:b").unwrap(), g.get("y:new").unwrap(), g.get("y:gone").unwrap());
+        assert!(a > 0.0 && a < 1.0 && b > 0.0 && b < 1.0 && (a + b - 1.0).abs() < 1e-4);
+        assert!(n < 4.7 && n > 3.0 && o > 2.0 && o < 2.7);
+        while g.step(0.016) {}
+        assert_eq!((g.get("y:a"), g.get("y:b"), g.get("y:new")), (Some(1.0), Some(0.0), Some(3.0)));
+    }
+
+    #[test]
+    fn near_equal_rows_keep_their_order() {
+        let e = |n: &str, cpu: f32| Entry { name: n.into(), count: 1, cpu, ram: 0 };
+        let prev: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let names = |v: Vec<Entry>| v.iter().map(|x| x.name.clone()).collect::<Vec<_>>();
+        // b and c are a hair above their predecessors: nothing moves
+        assert_eq!(names(sticky(vec![e("b", 3.1), e("a", 3.0), e("c", 0.2)], &prev, false)), ["a", "b", "c"]);
+        // a clear overtake goes through, and a new process is never held back
+        assert_eq!(names(sticky(vec![e("c", 9.0), e("a", 3.0), e("b", 2.0)], &prev, false)), ["c", "a", "b"]);
+        assert_eq!(names(sticky(vec![e("n", 8.0), e("a", 3.0)], &prev, false)), ["n", "a"]);
+    }
+
+    #[test]
+    fn rows_fade_out_over_the_bottom_edge() {
+        assert_eq!((edge_fade(0.0, 4.0), edge_fade(3.0, 4.0)), (1.0, 1.0)); // on the card
+        let mid = edge_fade(3.35, 4.0);
+        assert!(mid > 0.2 && mid < 0.8, "{mid}");
+        assert_eq!((edge_fade(3.7, 4.0), edge_fade(6.0, 4.0)), (0.0, 0.0)); // below it
+    }
+
+    #[test]
+    fn cell_text_units() {
+        assert_eq!(cell_text(24.6, false, Lang::En), "25%");
+        assert_eq!(cell_text(3.14, false, Lang::En), "3,1%");
+        assert_eq!(cell_text(2.0 * 1073741824.0, true, Lang::En), fmt_size(2 * 1073741824, Lang::En));
     }
 
     #[test]
