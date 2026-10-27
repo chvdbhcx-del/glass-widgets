@@ -188,6 +188,8 @@ pub struct CardView {
     due: Option<Instant>,
     hover: Option<Pt>,
     tshadow: ID2D1Effect,
+    /// the text shadow of the recorded content, rendered once (see `TextShadow`)
+    tsh: TextShadow,
     lum: f32,
     lum_known: bool,
     err_logged: bool,
@@ -208,6 +210,24 @@ struct SizeMorph {
     old_shadow: ID2D1Effect,
     /// every card rectangle (canvas px) the morph can touch, with the spring overshoot
     cover: RECT,
+}
+
+/// The soft text shadow is a blur of the whole recorded content: its pixels do not depend on the backdrop, only its alpha (the luminance weight)
+/// does. It is rendered by the same effect into a layer-sized bitmap for one (content, ink, alpha) and redrawn as a plain copy until one of them
+/// changes; the alpha follows the 2 Hz luminance probe, not the 15 Hz backdrop updates. `MSWIDGETS_NO_GLASS_CACHE=1` keeps the effect on the
+/// per-redraw path.
+struct TextShadow {
+    /// `glass::cache_enabled()` when the card was created
+    enabled: bool,
+    /// reused in place (one allocation per card), re-created when the layer size changed
+    bmp: Option<ID2D1Bitmap1>,
+    /// (ink 0 dark / 1 light, bits of the alpha) the bitmap holds; None = stale (the content was re-recorded)
+    key: Option<(usize, u32)>,
+}
+impl TextShadow {
+    fn new() -> TextShadow {
+        TextShadow { enabled: crate::glass::cache_enabled(), bmp: None, key: None }
+    }
 }
 
 /// A glass-only surface (no widget): the gallery panel, the settings strip and the text prompt. Drawn by the host between the cards and its own UI.
@@ -275,6 +295,8 @@ struct Probe {
     out: ID2D1Image,
     tgt: ID2D1Bitmap1,
     cpu: ID2D1Bitmap1,
+    /// target + staging bitmap of `colors` (kept between its calls: the wallpaper accent asks every few seconds)
+    col: std::cell::RefCell<Option<(u32, u32, ID2D1Bitmap1, ID2D1Bitmap1)>>,
 }
 
 /// Run `f` with a `Cx` for this card; panics inside the widget are caught (needs panic=unwind, set in Cargo.toml).
@@ -471,6 +493,36 @@ unsafe fn draw_content(dc: &ID2D1DeviceContext, tshadow: &ID2D1Effect, content: 
     }
 }
 
+/// Render the text shadow of `c.content[ink]` at `alpha` into the card's reused bitmap (own draw session: the effect plays the recorded content,
+/// and a command list that holds layers must not be played as an effect input and directly inside one session, D2D then reports
+/// D2DERR_LAYER_ALREADY_IN_USE).
+fn build_text_shadow(gfx: &Gfx, c: &mut CardView, ink: usize, alpha: f32, s: f32, lw: u32, lh: u32) -> Result<()> {
+    let Some(cl) = c.content[ink].clone() else { return Ok(()) };
+    let bmp = match c.tsh.bmp.take() {
+        Some(b) if unsafe { b.GetPixelSize() } == (D2D_SIZE_U { width: lw, height: lh }) => b,
+        _ => gfx.target(lw, lh)?,
+    };
+    c.tsh.key = None;
+    let dc = &gfx.dc;
+    unsafe {
+        dc.SetTarget(&bmp);
+        dc.BeginDraw();
+        dc.SetTransform(&mat(1.0, 0.0, 0.0));
+        dc.Clear(None);
+        c.tshadow.SetInput(0, &cl, true);
+        let _ = fx_vec4(&c.tshadow, 1, [0.0, 0.0, 0.0, alpha]);
+        if let Ok(o) = c.tshadow.GetOutput() {
+            dc.DrawImage(&o, Some(&pt(0.0, s)), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+        }
+        let e = dc.EndDraw(None, None);
+        dc.SetTarget(None::<&ID2D1Image>);
+        c.tsh.bmp = Some(bmp);
+        e?;
+    }
+    c.tsh.key = Some((ink, alpha.to_bits()));
+    Ok(())
+}
+
 impl Scene {
     /// An empty scene on a `w` x `h` px canvas over `backdrop` (canvas-sized).
     pub fn empty(gfx: &Gfx, w: i32, h: i32, s: f32, glass_g: f32, backdrop: &ID2D1Bitmap1, env: &SceneEnv) -> Result<Scene> {
@@ -554,6 +606,13 @@ impl Scene {
     }
     pub fn lum(&self, i: usize) -> f32 {
         self.cards[i].lum
+    }
+    /// Benches: pretend the luminance probe measured `d` more (a moving backdrop changes the shadow weights and the text shadow alpha).
+    #[cfg(test)]
+    pub fn nudge_lum(&mut self, d: f32) {
+        for c in &mut self.cards {
+            c.lum += d;
+        }
     }
     pub fn type_id(&self, i: usize) -> &str {
         &self.cards[i].type_id
@@ -640,6 +699,7 @@ impl Scene {
             due: None,
             hover: None,
             tshadow,
+            tsh: TextShadow::new(),
             lum: 0.2,
             lum_known: false,
             err_logged: false,
@@ -774,7 +834,9 @@ impl Scene {
         self.params = *p;
         for i in 0..self.cards.len() {
             let (size, x, y, w, h) = (self.cards[i].size, self.cards[i].x, self.cards[i].y, self.cards[i].w, self.cards[i].h);
-            self.cards[i].glass = self.new_glass(gfx, size, x, y, w, h)?;
+            let glass = self.new_glass(gfx, size, x, y, w, h)?;
+            glass.adopt_cache(&self.cards[i].glass);
+            self.cards[i].glass = glass;
             self.cards[i].scratch_ok = false;
         }
         self.update_merge();
@@ -855,6 +917,7 @@ impl Scene {
         if let Ok(cells) = self.probe.measure(gfx, (p.x, p.y, p.w, p.h)) {
             p.lum = cells.iter().sum::<f32>() / 64.0;
         }
+        let _ = p.glass.prepare(gfx, &Fx::new(p.lum));
         let dc = &gfx.dc;
         unsafe {
             dc.SetTarget(&p.layer);
@@ -1281,22 +1344,67 @@ impl Scene {
                 }
             }
             c.key = key;
+            c.tsh.key = None;
         }
         let blur_max = motion::BLUR_MAX;
         let base_blur = self.params.blur;
+        let m_px = self.m;
         let c = &mut self.cards[i];
         c.scratch_ok = false;
         c.layer_stale = false;
         let k = c.look.clamp(0.0, 1.0);
         let blur = if c.xf.blur > 0.002 { base_blur + (blur_max - base_blur) * c.xf.blur } else { 0.0 };
+        let ink = if k >= 0.5 { 1 } else { 0 };
+        let fx = Fx { lum: c.lum, k, blur };
+        // the cached parts of the glass and of the text shadow are brought up to date in draw sessions of their own, before the layer's
+        let _ = c.glass.prepare(gfx, &fx);
+        let alpha = (0.10 + 0.25 * c.lum) * (1.0 - k) + 0.03 * k;
+        if c.tsh.enabled && c.content[ink].is_some() && c.tsh.key != Some((ink, alpha.to_bits())) {
+            if let Err(e) = build_text_shadow(gfx, c, ink, alpha, s, (c.w + 2 * m_px) as u32, (c.h + 2 * m_px) as u32) {
+                c.tsh.key = None;
+                eprintln!("mswidgets: text shadow cache: {e}");
+            }
+        }
         let dc = &gfx.dc;
         unsafe {
             dc.SetTarget(&c.layer);
             dc.BeginDraw();
             dc.SetTransform(&mat(1.0, 0.0, 0.0));
-            let r = c.glass.draw(dc, &Fx { lum: c.lum, k, blur });
+            let r = c.glass.draw(dc, &fx);
             if r.is_ok() {
-                draw_content(dc, &c.tshadow, &c.content, k, c.lum, s, 1.0);
+                // subtle text shadow, stronger over a bright backdrop (CSS: text-shadow 0 1px 8px); nearly none under dark ink
+                if let Some(cl) = &c.content[ink] {
+                    match (&c.tsh.bmp, c.tsh.key == Some((ink, alpha.to_bits()))) {
+                        (Some(b), true) => {
+                            let lr = rf(0.0, 0.0, (c.w + 2 * m_px) as f32, (c.h + 2 * m_px) as f32);
+                            dc.DrawBitmap(b, Some(&lr), 1.0, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, Some(&lr), None);
+                        }
+                        _ => {
+                            c.tshadow.SetInput(0, cl, true);
+                            let _ = fx_vec4(&c.tshadow, 1, [0.0, 0.0, 0.0, alpha]);
+                            if let Ok(o) = c.tshadow.GetOutput() {
+                                dc.DrawImage(&o, Some(&pt(0.0, s)), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                            }
+                        }
+                    }
+                }
+                // the content of the two inks cross-fades while the appearance changes
+                for l in 0..2 {
+                    let a = if l == 0 { 1.0 - k } else { k };
+                    if a < 0.002 {
+                        continue;
+                    }
+                    if let Some(cl) = &c.content[l] {
+                        let part = a < 0.998;
+                        if part {
+                            push_opacity(dc, a);
+                        }
+                        dc.DrawImage(cl, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                        if part {
+                            dc.PopLayer();
+                        }
+                    }
+                }
             }
             let e = dc.EndDraw(None, None);
             dc.SetTarget(None::<&ID2D1Image>);
@@ -1753,7 +1861,7 @@ impl Probe {
             scale.SetInput(0, backdrop, true);
             fx_vec2(&scale, 1, [0.0, 0.0])?; // centre point
             fx_u32(&scale, 2, 5)?; // HIGH_QUALITY_CUBIC (prefiltered when shrinking)
-            Ok(Probe { out: scale.GetOutput()?, scale, tgt: gfx.target(8, 8)?, cpu: gfx.cpu_read(8, 8)? })
+            Ok(Probe { out: scale.GetOutput()?, scale, tgt: gfx.target(8, 8)?, cpu: gfx.cpu_read(8, 8)?, col: Default::default() })
         }
     }
 
@@ -1761,10 +1869,14 @@ impl Probe {
     fn colors(&self, gfx: &Gfx, (bw, bh): (i32, i32), w: u32, h: u32) -> Result<Vec<u8>> {
         let (sx, sy) = (w as f32 / bw.max(1) as f32, h as f32 / bh.max(1) as f32);
         fx_vec2(&self.scale, 0, [sx, sy])?;
-        let (tgt, cpu) = (gfx.target(w, h)?, gfx.cpu_read(w, h)?);
+        let mut bufs = self.col.borrow_mut();
+        if bufs.as_ref().is_none_or(|b| (b.0, b.1) != (w, h)) {
+            *bufs = Some((w, h, gfx.target(w, h)?, gfx.cpu_read(w, h)?));
+        }
+        let Some((_, _, tgt, cpu)) = bufs.as_ref() else { return Err(windows::core::Error::empty()) };
         let dc = &gfx.dc;
         unsafe {
-            dc.SetTarget(&tgt);
+            dc.SetTarget(tgt);
             dc.BeginDraw();
             dc.SetTransform(&mat(1.0, 0.0, 0.0));
             dc.Clear(None);
@@ -1774,7 +1886,7 @@ impl Probe {
             e?;
         }
         let mut px = Vec::with_capacity((w * h * 4) as usize);
-        gfx.read_rect(&tgt, &cpu, RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }, |_, row| px.extend_from_slice(row))?;
+        gfx.read_rect(tgt, cpu, RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }, |_, row| px.extend_from_slice(row))?;
         Ok(px)
     }
 
@@ -2105,5 +2217,34 @@ mod tests {
         sc.remove_card(0);
         assert_eq!(sc.len(), 0);
         assert!(sc.index_of_uid(uid).is_none());
+    }
+
+    /// A card whose recorded content holds layers (the music cover clip) can be redrawn any number of times: its text shadow effect plays that
+    /// content in a draw session of its own. (As an effect input and directly inside ONE session D2D fails the third redraw with
+    /// D2DERR_LAYER_ALREADY_IN_USE; `MSWIDGETS_NO_GLASS_CACHE=1` keeps that old behaviour.) The luminance changes between the redraws.
+    #[test]
+    fn layered_content_survives_repeated_redraws() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        if !crate::glass::cache_enabled() {
+            return;
+        }
+        let gfx = Gfx::new(None).unwrap();
+        let bd = PlainBackdrop::new(&gfx, 1400, 800).unwrap();
+        let env = SceneEnv { preview: true, hwnd: 0, lang: Lang::Ru, utc_off: 0 };
+        let items = crate::layout::parse_cards("calendar:s@0,0;reminders:s@1,0;music:s@2,0;sysmon:s@3,0;weather:m@0,1;network:s@2,1;controls:m@3,1;music:l@5,0").unwrap();
+        let mut sc = Scene::new(&gfx, 1400, 800, 1.0, 0.5, bd.bitmap(), &specs(&items, 1.0), &env).unwrap();
+        let now = Now::sample();
+        for i in 0..sc.len() {
+            sc.tick_card(&gfx, i, &now);
+        }
+        sc.measure_lum(&gfx, 255, false).unwrap();
+        for n in 0..12 {
+            sc.nudge_lum(0.01 * (n % 3) as f32);
+            for i in 0..sc.len() {
+                sc.render_card(&gfx, i, &now).unwrap_or_else(|e| panic!("redraw {n} of card {i}: {e}"));
+            }
+        }
     }
 }

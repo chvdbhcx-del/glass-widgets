@@ -15,6 +15,7 @@
 //! the defaults were fitted against the Apple reference screenshots by `mswidgets --calib` (see NATIVE.md, "Glass calibration").
 use crate::gfx::*;
 use serde_json::{json, Value};
+use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
 use std::sync::OnceLock;
 use windows::core::{Interface, Result};
@@ -594,6 +595,37 @@ pub struct Glass {
     sweep: ID2D1RadialGradientBrush,
     /// the hover light spot (a wide, soft white fall-off)
     lamp: ID2D1RadialGradientBrush,
+    /// rendered copies of the shadows / the inner glow (see `GlassCache`); None = the effects are drawn on every redraw, as before 0.5.13
+    cache: Option<RefCell<GlassCache>>,
+    /// bits of the (lens brightness, lens sigma) last written into the effects: an unchanged value is not written again
+    lens_set: Cell<Option<(u32, u32)>>,
+}
+
+// ---------------------------------------------------------------- cached backdrop-independent images
+
+/// `MSWIDGETS_NO_GLASS_CACHE=1` switches the glass bitmap cache off (every redraw re-runs the shadow / glow effects, as before 0.5.13).
+pub fn cache_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    #[cfg(test)]
+    if FORCE_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    *ON.get_or_init(|| std::env::var_os("MSWIDGETS_NO_GLASS_CACHE").is_none_or(|v| v.is_empty() || v == "0"))
+}
+/// Tests / benches: build the following glasses without the cache.
+#[cfg(test)]
+pub(crate) static FORCE_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What a redraw would otherwise recompute from effects although the backdrop is not an input of it: the inner glow (constant) and the two
+/// shadows (they depend on the luminance weight only). Each is rendered by the very same effects into a layer-sized 8-bit bitmap (so a copy of
+/// it is bit-identical to drawing the effect) and redrawn as a plain bitmap copy until its key changes: for the shadows the weight `a`, which
+/// follows the 2 Hz luminance probe and not the 15 Hz backdrop updates.
+#[derive(Default)]
+struct GlassCache {
+    glow: Option<ID2D1Bitmap1>,
+    shadow: Option<ID2D1Bitmap1>,
+    /// bits of the shadow weight `shadow` was rendered for
+    shadow_key: Option<u32>,
 }
 
 unsafe fn white_stops(gfx: &Gfx, stops: &[(f32, f32)]) -> Result<ID2D1GradientStopCollection1> {
@@ -602,6 +634,76 @@ unsafe fn white_stops(gfx: &Gfx, stops: &[(f32, f32)]) -> Result<ID2D1GradientSt
 }
 
 impl Glass {
+    /// Shadow weight of a redraw (the alpha of the big shadow; the small one is `a * sh_ratio`).
+    fn shadow_weight(&self, fx: &Fx) -> f32 {
+        let (p, k) = (&self.p, fx.k.clamp(0.0, 1.0));
+        (p.sh_a + p.sh_dark * (1.0 - fx.lum)) * lerp(1.0, p.light_shadow, k)
+    }
+
+    /// Render `img` (drawn at `off`) into `bmp`: Clear, then exactly what `draw` would put on the cleared layer.
+    unsafe fn render_into(gfx: &Gfx, bmp: &ID2D1Bitmap1, f: impl FnOnce(&ID2D1DeviceContext)) -> Result<()> {
+        let dc = &gfx.dc;
+        dc.SetTarget(bmp);
+        dc.BeginDraw();
+        dc.SetTransform(&mat(1.0, 0.0, 0.0));
+        dc.Clear(None);
+        f(dc);
+        let e = dc.EndDraw(None, None);
+        dc.SetTarget(None::<&ID2D1Image>);
+        e
+    }
+
+    /// Bring the cached shadow / glow up to date for the redraw `fx` (call it BEFORE `BeginDraw` of the layer: it draws into the cache bitmaps
+    /// in sessions of their own). Safe to skip or to fail: `draw` falls back to the effects whenever the cache does not match.
+    pub fn prepare(&self, gfx: &Gfx, fx: &Fx) -> Result<()> {
+        let Some(cache) = &self.cache else { return Ok(()) };
+        let mut c = cache.borrow_mut();
+        let (s, p) = (self.s, &self.p);
+        let (lw, lh) = ((self.w as i32 + 2 * self.m) as u32, (self.h as i32 + 2 * self.m) as u32);
+        unsafe {
+            if c.glow.is_none() {
+                let bmp = gfx.target(lw, lh)?;
+                Self::render_into(gfx, &bmp, |dc| dc.DrawImage(&self.glow_out, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER))?;
+                c.glow = Some(bmp);
+            }
+            let a = self.shadow_weight(fx);
+            if c.shadow_key != Some(a.to_bits()) {
+                let bmp = match c.shadow.take() {
+                    Some(b) => b,
+                    None => gfx.target(lw, lh)?,
+                };
+                c.shadow_key = None;
+                fx_vec4(&self.sh_a, 1, [0.0, 0.0, 0.0, a])?;
+                fx_vec4(&self.sh_b, 1, [0.0, 0.0, 0.0, a * p.sh_ratio])?;
+                let r = Self::render_into(gfx, &bmp, |dc| {
+                    dc.DrawImage(&self.sh_b_out, Some(&pt(0.0, p.sh_b_dy * s)), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                    dc.DrawImage(&self.sh_a_out, Some(&pt(0.0, p.sh_dy * s)), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                });
+                c.shadow = Some(bmp);
+                r?;
+                c.shadow_key = Some(a.to_bits());
+            }
+        }
+        Ok(())
+    }
+
+    /// Take over the cache bitmaps of `old`, the glass this one replaces, when whatever they are made of is unchanged (the look sliders move the
+    /// lens, tint and highlights far more often than the shadows and the glow): a slider drag then allocates nothing.
+    pub fn adopt_cache(&self, old: &Glass) {
+        let (Some(new), Some(prev)) = (&self.cache, &old.cache) else { return };
+        let shape = |g: &Glass| (g.w.to_bits(), g.h.to_bits(), g.m, g.s.to_bits(), g.r.to_bits());
+        let look = |p: &GlassParams| [p.sh_blur, p.sh_b_blur, p.sh_dy, p.sh_b_dy, p.glow, p.glow_sigma];
+        if shape(self) == shape(old) && look(&self.p) == look(&old.p) {
+            *new.borrow_mut() = std::mem::take(&mut *prev.borrow_mut());
+        }
+    }
+
+    /// A cached bitmap over the whole layer (a 1:1 copy).
+    unsafe fn draw_cached(&self, dc: &ID2D1DeviceContext, b: &ID2D1Bitmap1) {
+        let (lw, lh) = (self.w + 2.0 * self.m as f32, self.h + 2.0 * self.m as f32);
+        dc.DrawBitmap(b, Some(&rf(0.0, 0.0, lw, lh)), 1.0, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, Some(&rf(0.0, 0.0, lw, lh)), None);
+    }
+
     /// The displacement map of a w x h px card (the card sits MAP_PAD px inside); identical for every card of that size,
     /// so scenes build one per (size, radius) and share it instead of one window-sized map per card.
     pub fn make_map(gfx: &Gfx, w: i32, h: i32, s: f32, radius: f32, p: &GlassParams) -> Result<ID2D1Bitmap1> {
@@ -766,6 +868,8 @@ impl Glass {
                 dc.CreateRadialGradientBrush(&D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES { center: pt(0.0, 0.0), gradientOriginOffset: pt(0.0, 0.0), radiusX: rad, radiusY: rad }, None, &coll)?
             };
 
+            let cache = cache_enabled().then(RefCell::default);
+
             Ok(Glass {
                 s,
                 g,
@@ -807,6 +911,8 @@ impl Glass {
                 spot,
                 sweep,
                 lamp,
+                cache,
+                lens_set: Cell::new(None),
             })
         }
     }
@@ -819,16 +925,28 @@ impl Glass {
             let k = fx.k.clamp(0.0, 1.0);
             let lum = fx.lum;
             dc.Clear(None);
-            let a = (p.sh_a + p.sh_dark * (1.0 - lum)) * lerp(1.0, p.light_shadow, k);
-            fx_vec4(&self.sh_a, 1, [0.0, 0.0, 0.0, a])?;
-            fx_vec4(&self.sh_b, 1, [0.0, 0.0, 0.0, a * p.sh_ratio])?;
-            dc.DrawImage(&self.sh_b_out, Some(&pt(0.0, p.sh_b_dy * s)), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
-            dc.DrawImage(&self.sh_a_out, Some(&pt(0.0, p.sh_dy * s)), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+            let a = self.shadow_weight(fx);
+            let cache = self.cache.as_ref().map(|c| c.borrow());
+            match cache.as_ref().filter(|c| c.shadow_key == Some(a.to_bits())).and_then(|c| c.shadow.as_ref()) {
+                Some(b) => self.draw_cached(dc, b),
+                None => {
+                    fx_vec4(&self.sh_a, 1, [0.0, 0.0, 0.0, a])?;
+                    fx_vec4(&self.sh_b, 1, [0.0, 0.0, 0.0, a * p.sh_ratio])?;
+                    dc.DrawImage(&self.sh_b_out, Some(&pt(0.0, p.sh_b_dy * s)), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                    dc.DrawImage(&self.sh_a_out, Some(&pt(0.0, p.sh_dy * s)), None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                }
+            }
 
-            // lens colour (appearance dependent brightness) and blur (materialise animates the sigma)
-            fx_mat5x4(&self.mx, 0, lens_matrix(p.sat, p.bright * lerp(1.0, p.light_bright, k)))?;
+            // lens colour (appearance dependent brightness) and blur (materialise animates the sigma); a value that is already set is not
+            // written again (every write makes D2D re-validate the effect graph)
+            let bright = p.bright * lerp(1.0, p.light_bright, k);
             let sigma = if fx.blur > 0.0 { fx.blur } else { self.blur_sigma };
-            fx_f32(&self.blur, 0, sigma * s)?;
+            let want = (bright.to_bits(), (sigma * s).to_bits());
+            if self.cache.is_none() || self.lens_set.get() != Some(want) {
+                fx_mat5x4(&self.mx, 0, lens_matrix(p.sat, bright))?;
+                fx_f32(&self.blur, 0, sigma * s)?;
+                self.lens_set.set(Some(want));
+            }
 
             let mut lp = D2D1_LAYER_PARAMETERS1 {
                 contentBounds: rf(-3.0e38, -3.0e38, 3.0e38, 3.0e38),
@@ -857,7 +975,10 @@ impl Glass {
             if let Some(v) = &self.veil {
                 dc.FillRoundedRectangle(&self.rrect, v);
             }
-            dc.DrawImage(&self.glow_out, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+            match cache.as_ref().and_then(|c| c.glow.as_ref()) {
+                Some(b) => self.draw_cached(dc, b),
+                None => dc.DrawImage(&self.glow_out, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER),
+            }
             self.sheen.SetOpacity(lerp(1.0, 0.8, k));
             dc.FillRoundedRectangle(&self.rrect, &self.sheen);
             dc.PopLayer();
@@ -1102,6 +1223,173 @@ mod tests {
                 assert!((got[k] as f32 - want).abs() <= 3.0, "alpha {a}: channel {k} = {} want {want}", got[k]);
             }
         }
+    }
+
+    /// The cached shadow / glow must reproduce the effect path bit for bit, for dark, light and in-between looks and after the weight changed.
+    #[test]
+    fn cached_glass_is_bit_identical_to_the_effects() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !cache_enabled() {
+            return; // the escape hatch is on: there is no cache to compare
+        }
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        let gfx = Gfx::new(None).unwrap();
+        let px: Vec<u8> = (0..400 * 300).flat_map(|i| [(i % 400 * 255 / 400) as u8, (i / 400 * 255 / 300) as u8, 90, 255]).collect();
+        let bd = gfx.from_bgra(400, 300, &px).unwrap();
+        let p = GlassParams::default();
+        let map = Glass::make_map(&gfx, 170, 170, 1.5, 28.0, &p).unwrap();
+        let (cached, plain) = {
+            FORCE_OFF.store(false, Relaxed);
+            let a = Glass::new(&gfx, &bd, 60, 50, 170, 170, 1.5, 72, 0.5, 28.0, &map, &p).unwrap();
+            FORCE_OFF.store(true, Relaxed);
+            let b = Glass::new(&gfx, &bd, 60, 50, 170, 170, 1.5, 72, 0.5, 28.0, &map, &p).unwrap();
+            FORCE_OFF.store(false, Relaxed);
+            (a, b)
+        };
+        assert!(cached.cache.is_some() && plain.cache.is_none());
+        let (lw, lh) = (170 + 144, 170 + 144);
+        let (t1, t2) = (gfx.target(lw, lh).unwrap(), gfx.target(lw, lh).unwrap());
+        let cpu = gfx.cpu_read(lw, lh).unwrap();
+        let full = windows::Win32::Foundation::RECT { left: 0, top: 0, right: lw as i32, bottom: lh as i32 };
+        let shot = |g: &Glass, t: &ID2D1Bitmap1, fx: &Fx, prep: bool| -> Vec<u8> {
+            if prep {
+                g.prepare(&gfx, fx).unwrap();
+            }
+            unsafe {
+                gfx.dc.SetTarget(t);
+                gfx.dc.BeginDraw();
+                gfx.dc.SetTransform(&mat(1.0, 0.0, 0.0));
+                g.draw(&gfx.dc, fx).unwrap();
+                gfx.dc.EndDraw(None, None).unwrap();
+                gfx.dc.SetTarget(None::<&ID2D1Image>);
+            }
+            let mut out = Vec::new();
+            gfx.read_rect(t, &cpu, full, |_, row| out.extend_from_slice(row)).unwrap();
+            out
+        };
+        for (lum, k, blur) in [(0.2, 0.0, 0.0), (0.7, 0.0, 0.0), (0.4, 1.0, 0.0), (0.55, 0.37, 0.0), (0.3, 0.0, 12.0), (0.31, 0.0, 0.0)] {
+            let fx = Fx { lum, k, blur };
+            let (a, b) = (shot(&cached, &t1, &fx, true), shot(&plain, &t2, &fx, true));
+            assert_eq!(a, b, "lum {lum} k {k} blur {blur}: the cached layer differs from the effect layer");
+            // drawing again without a new prepare (same key) still matches
+            assert_eq!(shot(&cached, &t1, &fx, false), b);
+        }
+        // a draw without prepare after the weight changed falls back to the effects instead of showing a stale shadow
+        let fx = Fx { lum: 0.9, k: 0.0, blur: 0.0 };
+        assert_eq!(shot(&cached, &t1, &fx, false), shot(&plain, &t2, &fx, false));
+
+        // a look slider that only moves the lens: the successor takes the bitmaps over and still draws exactly what the effects draw
+        let fx = Fx { lum: 0.33, k: 0.2, blur: 0.0 };
+        shot(&cached, &t1, &fx, true);
+        let mut p2 = p;
+        p2.blur = 9.0;
+        p2.sat = 1.3;
+        FORCE_OFF.store(false, Relaxed);
+        let next = Glass::new(&gfx, &bd, 60, 50, 170, 170, 1.5, 72, 0.5, 28.0, &map, &p2).unwrap();
+        next.adopt_cache(&cached);
+        assert!(next.cache.as_ref().unwrap().borrow().glow.is_some(), "the glow bitmap was adopted");
+        assert!(cached.cache.as_ref().unwrap().borrow().glow.is_none(), "and left the old glass");
+        FORCE_OFF.store(true, Relaxed);
+        let next_plain = Glass::new(&gfx, &bd, 60, 50, 170, 170, 1.5, 72, 0.5, 28.0, &map, &p2).unwrap();
+        FORCE_OFF.store(false, Relaxed);
+        assert_eq!(shot(&next, &t1, &fx, true), shot(&next_plain, &t2, &fx, true));
+        // a slider that changes the shadow does not hand the old bitmaps over
+        let mut p3 = p;
+        p3.sh_blur = 12.0;
+        let other = Glass::new(&gfx, &bd, 60, 50, 170, 170, 1.5, 72, 0.5, 28.0, &map, &p3).unwrap();
+        other.adopt_cache(&next);
+        assert!(other.cache.as_ref().unwrap().borrow().shadow.is_none());
+    }
+
+    /// Thread CPU time (user + kernel) in ms.
+    fn thread_cpu_ms() -> f64 {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+        let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        unsafe {
+            let _ = GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u);
+        }
+        let t = |f: FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) as f64 / 10_000.0;
+        t(k) + t(u)
+    }
+
+    /// A/B timing of the "backdrop changed" path on the user's desk, interleaved in one process: render_card of every card + compose + readback of
+    /// the dirty rectangle, with the glass cache on / off. `cargo test --release bench_card_redraw -- --ignored --nocapture`;
+    /// MSW_BENCH_BD = backdrop png, MSW_BENCH_N = iterations per round.
+    #[test]
+    #[ignore]
+    fn bench_card_redraw() {
+        use crate::cards::{specs, Scene, SceneEnv};
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Foundation::RECT;
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        let gfx = Gfx::new(None).unwrap();
+        let (w, h) = (1920u32, 1080u32);
+        let bd = match std::env::var("MSW_BENCH_BD") {
+            Ok(p) => gfx.from_bgra(w, h, &gfx.load_png(&p, w, h).unwrap()).unwrap(),
+            Err(_) => gfx.from_bgra(w, h, &vec![90u8; (w * h * 4) as usize]).unwrap(),
+        };
+        let items = crate::layout::parse_cards("calendar:s@0,0;reminders:s@1,0;clock:s@2,0;sysmon:s@3,0;weather:m@0,1;network:s@2,1;controls:m@3,1;shortcuts:s@0,2").unwrap();
+        let env = SceneEnv { preview: true, hwnd: 0, lang: crate::widget::Lang::Ru, utc_off: 0 };
+        let now = crate::widget::Now::sample();
+        let mk = |off: bool| {
+            FORCE_OFF.store(off, Relaxed);
+            let mut sc = Scene::new(&gfx, w as i32, h as i32, 1.0, 0.5, &bd, &specs(&items, 1.0), &env).unwrap();
+            for i in 0..sc.len() {
+                sc.tick_card(&gfx, i, &now);
+            }
+            sc.measure_lum(&gfx, (1u64 << sc.len()) - 1, false).unwrap();
+            sc
+        };
+        let (mut on, mut off) = (mk(false), mk(true));
+        let n = on.len();
+        let mut dirty = RECT { left: i32::MAX, top: i32::MAX, right: 0, bottom: 0 };
+        for i in 0..n {
+            let r = on.layer_rect_ext(i, 0);
+            dirty = RECT { left: dirty.left.min(r.left), top: dirty.top.min(r.top), right: dirty.right.max(r.right), bottom: dirty.bottom.max(r.bottom) };
+        }
+        let one = RECT { left: dirty.left, top: dirty.top, right: dirty.left + 1, bottom: dirty.top + 1 };
+        let iters: usize = std::env::var("MSW_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+        // (label, render the cards, compose + read the dirty rectangle, a luminance probe result every 7th redraw = 2 Hz at 15 fps)
+        for (label, cards, comp, drift) in [
+            ("render_card x8 (+1px sync)", true, false, false),
+            ("compose + readback only", false, true, false),
+            ("render_card x8 + compose + readback", true, true, false),
+            ("same, luminance changes every 7th redraw", true, true, true),
+        ] {
+            let mut res = [(f64::MAX, 0.0f64); 2];
+            for round in 0..12 {
+                for (v, sc) in [(0usize, &mut on), (1, &mut off)] {
+                    let (t0, c0) = (std::time::Instant::now(), thread_cpu_ms());
+                    for it in 0..iters {
+                        if drift && it % 7 == 0 {
+                            sc.nudge_lum(0.0005);
+                        }
+                        if cards {
+                            for i in 0..n {
+                                sc.render_card(&gfx, i, &now).unwrap();
+                            }
+                        }
+                        if comp {
+                            sc.composite(&gfx, dirty, None, &now).unwrap();
+                            sc.read_rect(&gfx, dirty, |_, _| {}).unwrap();
+                        } else {
+                            sc.read_rect(&gfx, one, |_, _| {}).unwrap();
+                        }
+                    }
+                    if round > 1 {
+                        res[v].0 = res[v].0.min(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+                        res[v].1 += (thread_cpu_ms() - c0) / iters as f64 / 10.0;
+                    }
+                }
+            }
+            println!("{label:40}  cache ON  best {:6.3} ms (avg cpu {:6.3})   cache OFF best {:6.3} ms (avg cpu {:6.3})   [{n} cards]", res[0].0, res[0].1, res[1].0, res[1].1);
+        }
+        FORCE_OFF.store(false, Relaxed);
     }
 
     #[test]
