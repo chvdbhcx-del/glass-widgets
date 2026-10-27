@@ -115,7 +115,7 @@ Services:
 | `cx.invalidate()` | re-record `draw` on the next frame |
 | `cx.request_frame()` | one overlay frame soon even if `tick` is `Never` |
 | `cx.save_cfg()`, `cx.cfg_set(key, json!(v))` | persist settings (section 7); read with `cx.cfg_str/f64/bool(key)` or `cx.cfg` |
-| `cx.spawn(\|\| -> T)` returns `Pending<T>` | run on a worker thread; `pending.take()` in `tick` yields the result once; `pending.busy()` |
+| `cx.spawn(\|\| -> T)` returns `Pending<T>` | run on a pool worker (4 permanent threads, extras only while jobs block; jobs start in submission order); `pending.take()` in `tick` yields the result once; `pending.busy()` |
 | `cx.waker()` | `Waker` (Copy, Send): `.wake()` from your own thread makes the framework call `tick` |
 | `cx.invoke_system(Action)` | `Open(url_or_path)`, `Run(exe, args)` (hidden), `Power(Lock/Sleep/Restart/Shutdown/SignOut)`, `Media(PlayPause/Next/Prev/Stop/VolUp/VolDown/Mute)`; no-op in preview |
 | `cx.t("ru", "en")` | string by UI language; also `weekday_name`, `month_name`, `month_genitive`, `plural(n, one, few, many)` |
@@ -289,7 +289,7 @@ Reference implementations here: `clock.rs`, `calendar.rs`. Product contract: `..
 * Do not call `invalidate()` per frame: every re-record re-renders the glass layer. Bump `version()` only when the displayed value really changed (compare, then bump).
 * Hover / press easing inside a widget: `HoverAnim` (widget.rs). `set(cell, cx)` from `mouse` (it pokes `tick` for you), `if hv.step(cx) { Tick::Fps(60) } else { <idle schedule> }` in `tick`, `hv.get(cell)` 0..1 in `overlay`. It requests the last frame itself, so a settled widget costs nothing. A value that must change look for ~150 ms (a toggle, a month change) is left out of `draw` meanwhile and painted by `overlay` (old and new look at complementary opacity: `cx.with_opacity(k, ..)`, `cx.scaled(c, k, ..)`), then `version()` is bumped once to bring it back. Honour `reduced_motion()` (the system's "show animations" switch): jump to the end value.
 * `overlay` must not allocate bitmaps, create fonts or parse anything; precompute in `tick` / `draw`. Typical budget: far under 1 ms.
-* No unbounded growth (histories are fixed-length ring buffers), no polling loops, no `sleep` on the UI thread; `cx.spawn` threads end by themselves.
+* No unbounded growth (histories are fixed-length ring buffers), no polling loops, no `sleep` on the UI thread; `cx.spawn` jobs run on the shared worker pool (a job that blocks for good only costs one extra worker).
 * A panic in `draw` / `overlay` / `tick` / `mouse` is caught per call (release profile `panic = "unwind"`): the card keeps its last picture and the process lives, but still: no `unwrap()` on I/O results, parse defensively, `.get()` instead of indexing.
 * Colours and sizes are logical: never multiply by `cx.scale` yourself.
 
@@ -335,6 +335,8 @@ linear-gradient stroke along the LIGHT AXIS (bright and thin at the lit extreme,
 **Parameters.** `GlassParams` (glass.rs) holds every constant (blur, refraction strength / band / exponent, chromatic split, saturation / brightness, tint, veils, sheen, glow, rim, edge line, specular,
 glint, light angle, light-appearance multipliers, shadow). Override with `--glass-params file.json` or `%APPDATA%\macshell\glass.json` (absent = built-in defaults; unknown keys are reported and ignored).
 `mswidgets --calib defaults` prints the defaults as JSON (`calib/glass_defaults.json`).
+
+**Redraw cache** (`glass.rs` `GlassCache` + `cards.rs` `TextShadow`; the frame rate is untouched, a redraw just does less). A backdrop update re-runs only what depends on the backdrop (the lens: displace x3, blur, colour matrix). The two blurred shadows, the inner glow and the text shadow of the recorded content are rendered by the same effects into layer-sized 8-bit bitmaps and then redrawn as plain copies, so the result is bit-identical (compared on `--dump` / `--sheet` / `--dump-ui` renders: max difference 0). A cached shadow is keyed by its weight (it follows the 2 Hz luminance probe), the glow is constant, the text shadow is keyed by (content, ink, alpha); a changed key renders it again in a draw session of its own, `Glass::prepare` before `BeginDraw` (without it `draw` falls back to the effects). The lens only gets its colour matrix / sigma written when they changed. Sliders that do not touch the shadows or the glow hand the bitmaps to the new effect graph (`adopt_cache`). `MSWIDGETS_NO_GLASS_CACHE=1` turns all of it off (the old path, byte for byte). Measure: `MSW_BENCH_BD=bd.png cargo test --release bench_card_redraw -- --ignored --nocapture` (8 cards: render + compose + readback, cache on / off in one process).
 
 **Light.** Default direction `light_angle` = 315 deg (from the upper left). While a card is dragged or springs into its cell its light is pushed against the card velocity and relaxes back with a spring
 (~400 ms, `LightSpring`); only that card's rectangle is repainted.

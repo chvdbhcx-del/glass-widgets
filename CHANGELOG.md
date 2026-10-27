@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- Less work per redraw, same frame rates. When the wallpaper moves, a card now recomputes only the lens (the part that depends on the backdrop): the two blurred shadows, the inner glow and the soft text shadow of the card content are kept as bitmaps and redrawn as plain copies (the shadows follow the 2 Hz luminance probe, not the 15 Hz capture). Pixel-identical to before (checked on the headless renders), about a third less CPU per redraw of the whole desk (8 cards: 3.2 -> 2.1 ms, 3.3 -> 2.4 ms while the luminance changes every 7th redraw). `MSWIDGETS_NO_GLASS_CACHE=1` returns to the old path.
+- Background jobs (`cx.spawn`: weather, rates, volume, PowerShell, file scans) run on a small worker pool (4 threads, a few more only while a job blocks) instead of a new OS thread per job; the NVIDIA driver kept a small object for every thread ever created. Same API, same wake-ups, jobs start in submission order.
+- The lens colour matrix and blur sigma are written only when they changed; the wallpaper-colour probe keeps its bitmaps between calls.
+
+### Fixed
+- A card whose content holds clipped layers (the music cover) could stop redrawing with `D2DERR_LAYER_ALREADY_IN_USE` after a few backdrop updates (seen in a preview desk with the sample cover): the text shadow effect and the direct drawing of the same recorded content shared one draw session. The cached text shadow is rendered in its own session.
+
 ## [0.5.12] - 2026-10-27
 
 ### Added
