@@ -657,6 +657,28 @@ pub struct Res {
     coll: Option<IDWriteFontCollection>,
     fmts: RefCell<HashMap<FmtKey, IDWriteTextFormat>>,
     glyphs: RefCell<HashMap<Glyph, Rc<Vec<(ID2D1PathGeometry, icons::Paint)>>>>,
+    /// text layouts by (string, style, box): an overlay that repaints 60 times a second with unchanged text reuses them
+    lays: RefCell<HashMap<u64, LayEntry>>,
+    /// sparkline area gradients by (top, bottom, inked colour)
+    grads: RefCell<Vec<([u32; 6], ID2D1LinearGradientBrush)>>,
+}
+/// More than this many cached layouts / gradients: start over (bounded memory; a miss only costs one rebuild).
+const LAYOUT_CACHE: usize = 1024;
+const GRADIENT_CACHE: usize = 32;
+struct LayEntry {
+    s: String,
+    st: Style,
+    w: f32,
+    h: f32,
+    lay: IDWriteTextLayout,
+}
+/// Hash of everything a text layout depends on; `LayEntry` compares the real values, so a collision only costs a rebuild.
+fn lay_key(s: &str, st: Style, w: f32, h: f32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut k = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut k);
+    (st.size.to_bits(), st.weight, st.align as u8, st.valign as u8, st.mono, st.ellipsis, st.wrap, st.track.to_bits(), w.to_bits(), h.to_bits()).hash(&mut k);
+    k.finish()
 }
 
 /// The installed optical-size cut of Segoe UI Variable (Small / Text / Display), else plain Segoe UI.
@@ -790,6 +812,8 @@ impl Res {
                 coll,
                 fmts: RefCell::new(HashMap::new()),
                 glyphs: RefCell::new(HashMap::new()),
+                lays: RefCell::new(HashMap::new()),
+                grads: RefCell::new(Vec::new()),
             })
         }
     }
@@ -1473,11 +1497,28 @@ impl<'a> Cx<'a> {
         unsafe { self.dc.SetTransform(&m) };
     }
 
+    /// The (cached) layout of `s`; callers must not modify it.
     fn layout(&self, s: &str, st: Style, w: f32, h: f32) -> Result<IDWriteTextLayout> {
+        let (w, h) = (w.max(0.0), h.max(0.0));
+        let key = lay_key(s, st, w, h);
+        if let Some(e) = self.res.lays.borrow().get(&key) {
+            if e.s == s && e.st == st && e.w == w && e.h == h {
+                return Ok(e.lay.clone());
+            }
+        }
+        let lay = self.build_layout(s, st, w, h)?;
+        let mut m = self.res.lays.borrow_mut();
+        if m.len() >= LAYOUT_CACHE {
+            m.clear();
+        }
+        m.insert(key, LayEntry { s: s.to_string(), st, w, h, lay: lay.clone() });
+        Ok(lay)
+    }
+    fn build_layout(&self, s: &str, st: Style, w: f32, h: f32) -> Result<IDWriteTextLayout> {
         let f = self.res.format(self.gfx, st)?;
         let wide: Vec<u16> = s.encode_utf16().collect();
         unsafe {
-            let lay = self.gfx.dw.CreateTextLayout(&wide, &f, w.max(0.0), h.max(0.0))?;
+            let lay = self.gfx.dw.CreateTextLayout(&wide, &f, w, h)?;
             let range = DWRITE_TEXT_RANGE { startPosition: 0, length: wide.len() as u32 };
             let track = if st.track != 0.0 { st.track } else { auto_track(st.size) };
             if track != 0.0 {
@@ -1663,6 +1704,21 @@ impl<'a> Cx<'a> {
         self.spark_geom(r, pts.len(), color, |i| (r.x + r.w * pts[i].0, r.bottom() - r.h * ((pts[i].1 - lo) / (hi - lo)).clamp(0.0, 1.0)));
         self.pop_clip();
     }
+    /// The fade under a sparkline, cached: it only depends on the rect's top / bottom and the colour, not on the moving points.
+    fn spark_gradient(&self, r: Rect, color: Color) -> Option<ID2D1LinearGradientBrush> {
+        let c = self.ink(color.fade(0.35));
+        let key = [r.y.to_bits(), r.bottom().to_bits(), c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()];
+        if let Some((_, b)) = self.res.grads.borrow().iter().find(|(k, _)| *k == key) {
+            return Some(b.clone());
+        }
+        let b = self.gradient((0.0, r.y), (0.0, r.bottom()), &[(0.0, color.fade(0.35)), (1.0, color.fade(0.0))])?;
+        let mut g = self.res.grads.borrow_mut();
+        if g.len() >= GRADIENT_CACHE {
+            g.clear();
+        }
+        g.push((key, b.clone()));
+        Some(b)
+    }
     /// The line + the soft area under it through the `n` points `p(0..n)` (card px).
     fn spark_geom(&self, r: Rect, n: usize, color: Color, p: impl Fn(usize) -> (f32, f32)) {
         unsafe {
@@ -1683,7 +1739,7 @@ impl<'a> Cx<'a> {
             if sl.Close().is_err() || sa.Close().is_err() {
                 return;
             }
-            if let Some(b) = self.gradient((0.0, r.y), (0.0, r.bottom()), &[(0.0, color.fade(0.35)), (1.0, color.fade(0.0))]) {
+            if let Some(b) = self.spark_gradient(r, color) {
                 self.dc.FillGeometry(&area, &b, None::<&ID2D1Brush>);
             }
             self.dc.DrawGeometry(&line, self.brush(color), 1.6, &self.res.round);
@@ -1825,5 +1881,20 @@ impl<'a> Cx<'a> {
             self.pop_clip();
         }
         self.set_tf(self.base);
+    }
+}
+
+#[cfg(test)]
+mod layout_cache_tests {
+    use super::*;
+
+    #[test]
+    fn layout_key_follows_every_input() {
+        let st = Style::CAPTION;
+        let k = lay_key("12%", st, 40.0, 14.0);
+        assert_eq!(k, lay_key("12%", st, 40.0, 14.0));
+        for other in [lay_key("13%", st, 40.0, 14.0), lay_key("12%", st.size(12.0), 40.0, 14.0), lay_key("12%", st.center(), 40.0, 14.0), lay_key("12%", st.mono(), 40.0, 14.0), lay_key("12%", st, 41.0, 14.0), lay_key("12%", st, 40.0, 15.0)] {
+            assert_ne!(k, other);
+        }
     }
 }

@@ -29,6 +29,8 @@ cargo build --target-dir <repo>\target-<yourname>          # debug, a few second
 cargo build --release --target-dir ...                                           # must stay ZERO warnings
 ```
 
+`tools\clean-targets.ps1 [-WhatIf]` deletes every `target-*` dir next to Cargo.toml except `target-agent`.
+
 Never run live mode (`mswidgets.exe` without `--dump/--sheet`) and never `--bench`: the lead does that. Everything below is headless,
 needs no window and no network, and renders in well under a second.
 
@@ -297,6 +299,16 @@ Reference implementations here: `clock.rs`, `calendar.rs`. Product contract: `..
 * No unbounded growth (histories are fixed-length ring buffers), no polling loops, no `sleep` on the UI thread; `cx.spawn` jobs run on the shared worker pool (a job that blocks for good only costs one extra worker).
 * A panic in `draw` / `overlay` / `tick` / `mouse` is caught per call (release profile `panic = "unwind"`): the card keeps its last picture and the process lives, but still: no `unwrap()` on I/O results, parse defensively, `.get()` instead of indexing.
 * Colours and sizes are logical: never multiply by `cx.scale` yourself.
+
+## Animation
+
+Three tools, all fed by real elapsed time (`dt`), never by a frame count. `GlideAnim` (widget.rs) wraps `motion::Glide` for widgets: `set` targets in `tick`, `step(cx)`, read in `overlay`.
+
+* `Glide::new(tau)` (`GlideAnim::default()` = tau 0.09): exponential approach, ~95 % in 3 tau (~300 ms), snaps to the target so it really ends. Use for values that follow data: ring fractions, bars, the number beside them. Retargeting mid-move is seamless; a first-seen key starts at its target.
+* `Glide::smooth(secs)` (`GlideAnim::smooth`): fixed-time smoothstep from where the value is now. Starts gently, so use it for things that change place (list rows by rank, `set_from` for a row sliding in, `start` for a 0 -> 1 blend between two pictures).
+* `motion::flow_points(values, visible, p, &mut out)` + `motion::flow_phase(since_sample, period)` + `Cx::sparkline_flow`: a current-edge scrolling graph. The right edge always shows the newest sample (no lag, spikes are not smeared); between samples the line slides left by `p` of a step. Use for sparklines fed by periodic samples; reuse the `out` Vec between frames.
+
+Rule: never lower a rate (tick, frame, capture, refresh) to save CPU. Make a frame cheaper instead: keep static layers in `draw`, animate only in `overlay`, skip geometry that did not change. Motion that finished must stop asking for frames (`step` returns false), so a settled widget costs nothing. Previews and `reduced_motion()` jump to the end value.
 
 ## 11. Known limits
 

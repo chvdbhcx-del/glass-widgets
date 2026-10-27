@@ -1,0 +1,18 @@
+# Template only: copy to .github/workflows/ci.yml with a token that has the `workflow` scope.
+name: ci
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      # headless sheet render (needs a D2D/WARP device on the runner: unverified, so non-blocking), then lint the log
+      - continue-on-error: true
+        run: |
+          $env:MSW_TEXT_LINT = '1'
+          target\release\mswidgets.exe --sheet out\sheet.png --scale 1 2> lint.log
+          python tools/text-lint.py lint.log
