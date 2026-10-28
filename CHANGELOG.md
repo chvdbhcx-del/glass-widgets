@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.15] - 2026-10-28
 
 ### Changed
 - Typeface: Medeo Sans (bundled, SIL OFL, Latin + Cyrillic) replaces Inter in all widgets and the text prompt. `MSW_FONT=nunito` and `MSW_FONT=system` still work. The five static weights are subset from Medeo 1.0.0-rc.4.1 (hinting removed; the exe grows by about 0.7 MB).
