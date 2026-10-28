@@ -79,6 +79,7 @@ See the [changelog](CHANGELOG.md) for everything else (0.5.11: idle CPU with a v
 | **Quick Actions** | volume and brightness sliders, Wi-Fi / Bluetooth / theme / mute, lock, sleep, restart, shut down (second click to confirm) | glyph left of the sliders opens Sound / Display settings |
 | **Agents** | Claude Code / Codex sessions from the Pill island hooks: project, working or waiting, count (reads `%APPDATA%\pill\agents`, read-only) | - |
 | **Tasks** | a plain checklist: open count and next task (S), up to 5 tasks with checkboxes (M); stored locally in `tasks.json` | `+` adds, click ticks, right click deletes |
+| **Ping** | round-trip time to 1.1.1.1, your gateway and hosts you add, with loss and a 60-sample sparkline (ICMP through the Windows API; a live card on the desk is the opt-in, previews send nothing) | `+` adds a host, right click removes one |
 
 Cards snap to a grid, can be dragged, resized from the right-click menu and merge when they touch.
 

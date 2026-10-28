@@ -18,6 +18,7 @@ pub mod network;
 pub mod nextevent;
 pub mod notes;
 pub mod photos;
+pub mod ping;
 pub mod processes;
 pub mod quote;
 pub mod rates;
@@ -54,6 +55,7 @@ pub fn register_all(r: &mut Registry) {
     crypto::register(r);
     controls::register(r);
     agents::register(r);
+    ping::register(r);
     tasks::register(r);
     dev::register(r); // hidden developer tool (id starts with '_')
 }
