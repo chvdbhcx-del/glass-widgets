@@ -24,6 +24,7 @@ pub mod rates;
 pub mod reminders;
 pub mod shortcuts;
 pub mod sysmon;
+pub mod tasks;
 pub mod timer;
 pub mod weather;
 pub mod worldclock;
@@ -53,6 +54,7 @@ pub fn register_all(r: &mut Registry) {
     crypto::register(r);
     controls::register(r);
     agents::register(r);
+    tasks::register(r);
     dev::register(r); // hidden developer tool (id starts with '_')
 }
 
