@@ -31,6 +31,8 @@ cargo build --release --target-dir ...                                          
 
 `tools\clean-targets.ps1 [-WhatIf]` deletes every `target-*` dir next to Cargo.toml except `target-agent`.
 
+**Proving a refactor changed no pixel:** render one sheet per widget before and after into two scratch dirs (`for id in <ids>; do for ap in dark light; do mswidgets --sheet <dir>\${id}_$ap.png --backdrop outd_sunset2.png --only $id --scale 2 --appearance $ap --time "2026-10-24 10:08:35"; done; done`; build the old commit in a temporary `git worktree` into the same private target dir, and `touch src/main.rs` after switching worktrees, because cargo may call the other tree fresh), then `python tools/snapshot-diff.py before after [--tol 2]`: per image the number of differing pixels and the largest channel delta, exit 1 over the tolerance. Previews are static, so live-only paths (flowing graphs) are not covered. `shortcuts` differs by at most 2 levels between two runs of the same build, so use `--tol 2`.
+
 Never run live mode (`mswidgets.exe` without `--dump/--sheet`) and never `--bench`: the lead does that. Everything below is headless,
 needs no window and no network, and renders in well under a second.
 
