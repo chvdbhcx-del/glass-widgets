@@ -1,5 +1,6 @@
 //! Win32 window helpers of the host: no `App` state, only arguments (split out of host.rs).
 use super::*;
+use windows::core::PWSTR;
 
 pub(super) fn same_rect(a: &RECT, b: &RECT) -> bool {
     (a.left, a.top, a.right, a.bottom) == (b.left, b.top, b.right, b.bottom)
@@ -162,4 +163,74 @@ pub(super) unsafe fn foreground_is_fullscreen(me: HWND, ours: &RECT) -> bool {
         return false;
     }
     r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+}
+
+/// Lower-case exe file name of the process that owns `hwnd` (`chrome.exe`); None when it cannot be opened (a protected process).
+unsafe fn exe_name_of(hwnd: HWND) -> Option<String> {
+    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+    let mut buf = [0u16; 520];
+    let mut len = buf.len() as u32;
+    let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+    let _ = CloseHandle(h);
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    ok.then(|| path.rsplit(['\\', '/']).next().unwrap_or("").to_lowercase()).filter(|n| !n.is_empty())
+}
+
+/// What the scenes see of the foreground window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Fg {
+    /// an ordinary app: its exe name
+    Exe(String),
+    /// the desktop itself (no program in front)
+    Desktop,
+    /// us, the taskbar / start menu / a popup, nothing, or a program that cannot be read: the previous answer stands
+    Keep,
+}
+
+/// The program in front. `cache` = (hwnd, exe) of the last lookup: the process is opened only when the foreground window changed.
+pub(super) unsafe fn foreground_program(me: HWND, cache: &mut (isize, Option<String>)) -> Fg {
+    let hwnd = GetForegroundWindow();
+    if !app_in_front(me) {
+        let mut buf = [0u16; 32];
+        let n = GetClassNameW(hwnd, &mut buf);
+        return if !hwnd.0.is_null() && matches!(String::from_utf16_lossy(&buf[..n.max(0) as usize]).as_str(), "Progman" | "WorkerW") { Fg::Desktop } else { Fg::Keep };
+    }
+    if cache.0 != hwnd.0 as isize {
+        *cache = (hwnd.0 as isize, exe_name_of(hwnd));
+    }
+    cache.1.clone().map_or(Fg::Keep, Fg::Exe)
+}
+
+unsafe extern "system" fn programs_cb(h: HWND, lp: LPARAM) -> BOOL {
+    let (me_pid, out) = &mut *(lp.0 as *mut (u32, Vec<String>));
+    if !IsWindowVisible(h).as_bool() || GetWindowTextLengthW(h) == 0 || !GetWindow(h, GW_OWNER).unwrap_or_default().0.is_null() {
+        return BOOL(1);
+    }
+    if GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0 {
+        return BOOL(1);
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(h, Some(&mut pid));
+    let mut cloaked = 0u32;
+    if pid == *me_pid || windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(h, windows::Win32::Graphics::Dwm::DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut _, 4).is_ok() && cloaked != 0 {
+        return BOOL(1);
+    }
+    if let Some(n) = exe_name_of(h) {
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    BOOL(1)
+}
+
+/// The programs with a visible top-level window right now (not us, no tool windows, no hidden virtual-desktop ones), sorted: the picker of the
+/// scene rules in the tray menu.
+pub(super) unsafe fn running_programs() -> Vec<String> {
+    let mut st = (windows::Win32::System::Threading::GetCurrentProcessId(), Vec::<String>::new());
+    let _ = EnumWindows(Some(programs_cb), LPARAM(&mut st as *mut _ as isize));
+    st.1.sort();
+    st.1
 }

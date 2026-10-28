@@ -24,6 +24,11 @@ pub enum TrayCmd {
     DeleteProfile,
     /// "Monitor" submenu: move the desk to the n-th monitor (display order, the list in `MenuState::monitors`)
     Monitor(usize),
+    /// "Scenes" submenu: remove rule n / a rule for the n-th running program with profile m / for a typed exe name with profile m / for a time range with profile m
+    SceneRemove(usize),
+    SceneProgram(usize, usize),
+    SceneTyped(usize),
+    SceneTime(usize),
     Quit,
 }
 
@@ -39,6 +44,9 @@ pub struct MenuState {
     /// the connected monitors in display order ("1 (основной)", "2", ...) and the one the desk is on; the submenu appears with 2 or more
     pub monitors: Vec<String>,
     pub monitor: usize,
+    /// scene rules as menu lines, and the programs with a window open right now
+    pub scene_rules: Vec<String>,
+    pub scene_programs: Vec<String>,
 }
 
 /// The id of the broadcast Explorer sends after it (re)creates the taskbar: the icon must be added again.
@@ -83,15 +91,74 @@ const C_LAYOUTS: usize = 8;
 const C_DELETE_PROFILE: usize = 7;
 /// the "Monitor" submenu entry of the main menu (a popup)
 const C_MONITORS: usize = 9;
+/// the "Scenes" submenu entry of the main menu (a popup)
+const C_SCENES: usize = 10;
 /// + the index of the profile; at most `MAX_PROFILES` are listed
 const C_PROFILE: usize = 100;
 const MAX_PROFILES: usize = 40;
 /// + the display position of the monitor; at most `MAX_MONITORS` are listed
 const C_MONITOR: usize = 200;
 const MAX_MONITORS: usize = 16;
+/// "Scenes": + the rule index / the profile index (typed exe, time range) / program * MAX_PROFILES + profile
+const C_SC_REMOVE: usize = 1000;
+const MAX_RULES: usize = 30;
+const C_SC_TYPED: usize = 1100;
+const C_SC_TIME: usize = 1200;
+const C_SC_PROG: usize = 2000;
+const MAX_PROGRAMS: usize = 20;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
+}
+
+/// Append `label` as a submenu `sub` (greyed when `on` is false).
+unsafe fn append_popup(menu: HMENU, sub: HMENU, label: &str, on: bool) {
+    let _ = AppendMenuW(menu, MF_POPUP | if on { MF_ENABLED } else { MF_GRAYED }, sub.0 as usize, PCWSTR(wide(label).as_ptr()));
+}
+
+/// A popup with one entry per name, command ids `base + index`.
+unsafe fn list_popup(base: usize, names: &[String], max: usize) -> Option<HMENU> {
+    let sub = CreatePopupMenu().ok()?;
+    for (i, n) in names.iter().take(max).enumerate() {
+        let _ = AppendMenuW(sub, MF_STRING, base + i, PCWSTR(wide(&n.replace('&', "&&")).as_ptr()));
+    }
+    Some(sub)
+}
+
+/// The "Scenes" submenu: the rules, then the ways to add one (a running program, a typed exe name, a time range; each asks for the profile) and remove one.
+unsafe fn scenes_popup(st: &MenuState) -> Option<HMENU> {
+    let t = |ru: &'static str, en: &'static str| st.lang.pick(ru, en);
+    let sub = CreatePopupMenu().ok()?;
+    if st.scene_rules.is_empty() {
+        let _ = AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, PCWSTR(wide(t("Правил нет", "No rules")).as_ptr()));
+    }
+    for r in st.scene_rules.iter().take(MAX_RULES) {
+        let _ = AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, PCWSTR(wide(&r.replace('&', "&&")).as_ptr()));
+    }
+    let _ = AppendMenuW(sub, MF_SEPARATOR, 0, PCWSTR::null());
+    let has_profiles = !st.profiles.is_empty();
+    // a program in front: one popup per running program, each lists the profiles
+    if let Ok(progs) = CreatePopupMenu() {
+        for (i, p) in st.scene_programs.iter().take(MAX_PROGRAMS).enumerate() {
+            if let Some(pm) = list_popup(C_SC_PROG + i * MAX_PROFILES, &st.profiles, MAX_PROFILES) {
+                append_popup(progs, pm, &p.replace('&', "&&"), true);
+            }
+        }
+        if !st.scene_programs.is_empty() {
+            let _ = AppendMenuW(progs, MF_SEPARATOR, 0, PCWSTR::null());
+        }
+        if let Some(pm) = list_popup(C_SC_TYPED, &st.profiles, MAX_PROFILES) {
+            append_popup(progs, pm, t("Другая программа…", "Other program…"), true);
+        }
+        append_popup(sub, progs, t("Если впереди программа", "When a program is in front"), has_profiles);
+    }
+    if let Some(pm) = list_popup(C_SC_TIME, &st.profiles, MAX_PROFILES) {
+        append_popup(sub, pm, t("В интервале времени…", "During a time range…"), has_profiles);
+    }
+    if let Some(pm) = list_popup(C_SC_REMOVE, &st.scene_rules, MAX_RULES) {
+        append_popup(sub, pm, t("Удалить правило", "Remove a rule"), !st.scene_rules.is_empty());
+    }
+    Some(sub)
 }
 
 /// The right-click menu (modal: call it with the App NOT borrowed). `foreground` makes `hwnd` the foreground window first, which
@@ -121,11 +188,13 @@ pub unsafe fn run_menu(hwnd: HWND, st: &MenuState, foreground: impl Fn(HWND)) ->
             let _ = AppendMenuW(sub, flags, C_MONITOR + i, PCWSTR(wide(&name.replace('&', "&&")).as_ptr()));
         }
     }
+    let scenes = scenes_popup(st);
     let items = [
         (C_SETTINGS, t("Настройки…", "Settings…"), false),
         (C_EDIT, if st.editing { t("Готово", "Done") } else { t("Изменить виджеты…", "Edit Widgets…") }, false),
         (C_VISIBLE, if st.hidden { t("Показать виджеты", "Show Widgets") } else { t("Скрыть виджеты", "Hide Widgets") }, false),
         (C_LAYOUTS, t("Макеты", "Layouts"), false),
+        (C_SCENES, t("Сцены", "Scenes"), false),
         (C_MONITORS, t("Монитор", "Monitor"), false),
         (0, Vec::new(), false),
         (C_AUTOSTART, t("Запускать вместе с Windows", "Start with Windows"), st.autostart),
@@ -137,6 +206,10 @@ pub unsafe fn run_menu(hwnd: HWND, st: &MenuState, foreground: impl Fn(HWND)) ->
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         } else if *id == C_LAYOUTS {
             if let Some(sub) = layouts {
+                let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(label.as_ptr()));
+            }
+        } else if *id == C_SCENES {
+            if let Some(sub) = scenes {
                 let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(label.as_ptr()));
             }
         } else if *id == C_MONITORS {
@@ -165,6 +238,10 @@ pub unsafe fn run_menu(hwnd: HWND, st: &MenuState, foreground: impl Fn(HWND)) ->
         C_QUIT => TrayCmd::Quit,
         c if (C_PROFILE..C_PROFILE + MAX_PROFILES).contains(&c) => TrayCmd::Profile(c - C_PROFILE),
         c if (C_MONITOR..C_MONITOR + MAX_MONITORS).contains(&c) => TrayCmd::Monitor(c - C_MONITOR),
+        c if (C_SC_REMOVE..C_SC_REMOVE + MAX_RULES).contains(&c) => TrayCmd::SceneRemove(c - C_SC_REMOVE),
+        c if (C_SC_TYPED..C_SC_TYPED + MAX_PROFILES).contains(&c) => TrayCmd::SceneTyped(c - C_SC_TYPED),
+        c if (C_SC_TIME..C_SC_TIME + MAX_PROFILES).contains(&c) => TrayCmd::SceneTime(c - C_SC_TIME),
+        c if (C_SC_PROG..C_SC_PROG + MAX_PROGRAMS * MAX_PROFILES).contains(&c) => TrayCmd::SceneProgram((c - C_SC_PROG) / MAX_PROFILES, (c - C_SC_PROG) % MAX_PROFILES),
         _ => TrayCmd::None,
     }
 }

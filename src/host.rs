@@ -46,6 +46,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 mod modal;
+mod scene;
 mod winutil;
 use winutil::*;
 
@@ -57,6 +58,8 @@ const WM_MENU: u32 = WM_APP + 3;
 const WM_PROMPT: u32 = WM_APP + 21;
 /// posted by the "Save current layout as..." prompt thread when the user typed a name (the name waits in `PROFILE_NAME`)
 const WM_PROFILE_NAME: u32 = WM_APP + 20;
+/// posted by the scene-rule prompt thread (an exe name or a time range was typed; the text waits in `scene::SCENE_REQ`)
+const WM_SCENE_TEXT: u32 = WM_APP + 23;
 /// the longest layout name
 const PROFILE_NAME_MAX: usize = 40;
 /// posted by the "Click action > Custom…" prompt thread with a validated target (it waits in `CLICK_CUSTOM` with the card's uid)
@@ -316,6 +319,14 @@ struct App {
     menu_period: u32,
     menu_last: Instant,
     menu_shown: Option<RECT>,
+    /// scenes (scenes.rs): the rules, their state machine, the last evaluation, the foreground lookup cache (hwnd, exe), the last program seen in front
+    /// (None = the desktop) and what the evaluation reads from config.json
+    scene_rules: Vec<crate::scenes::Rule>,
+    scenes: crate::scenes::Auto,
+    scene_t: Instant,
+    scene_fg: (isize, Option<String>),
+    scene_prog: Option<String>,
+    scene_cfg: scene::Cfg,
 }
 
 thread_local! { static APP: RefCell<Option<App>> = const { RefCell::new(None) }; }
@@ -665,6 +676,12 @@ unsafe fn setup(o: &Opts) -> Result<()> {
         menu_period: 0,
         menu_last: Instant::now(),
         menu_shown: None,
+        scene_rules: if o.no_config { Vec::new() } else { crate::scenes::rules_from_value(&layout::read_config()) },
+        scenes: crate::scenes::Auto::default(),
+        scene_t: Instant::now(),
+        scene_fg: (0, None),
+        scene_prog: None,
+        scene_cfg: scene::Cfg::default(),
     };
     // First frame is drawn BEFORE the capture thread exists (probe staging and layers get created while the GPU is quiet: the very first
     // luminance probe racing the first full-texture copy of the duplication thread used to wedge the start). Then the capture starts,
@@ -806,6 +823,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_PROFILE_NAME => {
             with_app(|app| app.profile_named());
+            LRESULT(0)
+        }
+        WM_SCENE_TEXT => {
+            with_app(|app| app.scene_text_named());
             LRESULT(0)
         }
         WM_CLICK_CUSTOM => {
@@ -2631,11 +2652,15 @@ impl App {
     fn tray_state(&self) -> tray::MenuState {
         let root = layout::read_config();
         let profiles = layout::profile_names(&root);
-        let active = layout::active_profile(&root).and_then(|a| profiles.iter().position(|p| *p == a));
+        let active = layout::active_profile_for(&root, self.slot.as_deref()).and_then(|a| profiles.iter().position(|p| *p == a));
         let list = monitors::enumerate();
         let monitor = monitors::pick(&list).map_or(0, |i| monitors::position(&list, i));
         let monitors = (0..list.len()).map(|p| monitors::label(&list, p, self.ui.lang)).collect();
-        tray::MenuState { lang: self.ui.lang, editing: self.editing, hidden: self.user_hidden, autostart: crate::autostart::enabled(), profiles, active, monitors, monitor }
+        let scene_programs = unsafe { running_programs() };
+        if let Ok(mut g) = scene::SCENE_PROGRAMS.lock() {
+            g.clone_from(&scene_programs);
+        }
+        tray::MenuState { lang: self.ui.lang, editing: self.editing, hidden: self.user_hidden, autostart: crate::autostart::enabled(), profiles, active, monitors, monitor, scene_rules: self.scene_menu_lines(), scene_programs }
     }
 
     /// A tray click / menu choice.
@@ -2667,6 +2692,10 @@ impl App {
             TrayCmd::SaveProfile => self.ask_profile_name(),
             TrayCmd::DeleteProfile => self.delete_profile(),
             TrayCmd::Monitor(i) => self.set_monitor(i),
+            TrayCmd::SceneRemove(i) => self.scene_remove(i),
+            TrayCmd::SceneProgram(prog, prof) => self.scene_add_program(prog, prof),
+            TrayCmd::SceneTyped(prof) => self.ask_scene_text(false, prof),
+            TrayCmd::SceneTime(prof) => self.ask_scene_text(true, prof),
             TrayCmd::Quit => {
                 let _ = DestroyWindow(self.hwnd);
             }
@@ -3401,6 +3430,7 @@ impl App {
                 monitors::set_choice(choice);
                 self.replace_monitor();
             }
+            self.scenes_reload(&root);
         }
         // `widgetsLook` edited behind our back (the sliders of the Tauri app / by hand)
         let look = layout::read_look();
@@ -3535,6 +3565,7 @@ impl App {
             self.set_pause(autopause::HIDDEN, false);
         } else if self.visible {
             self.guard_n += 1;
+            self.scenes_tick();
             if self.guard_n % 8 == 0 && !self.ui.edit && self.ui.prompt.is_none() && self.ui.menu.is_none() {
                 place_above_desktop(self.hwnd); // explorer restarts / shell re-stacks
             }
@@ -3759,11 +3790,16 @@ impl App {
     unsafe fn switch_profile(&mut self, i: usize) {
         let names = layout::profile_names(&layout::read_config());
         let Some(name) = names.get(i).cloned() else { return };
+        self.switch_profile_named(&name);
+    }
+
+    /// Load profile `name` (the tray's choice and the scenes' automatic switch share this path).
+    unsafe fn switch_profile_named(&mut self, name: &str) {
         if self.drag.is_some() {
             self.end_drag();
         }
         let stash = self.ui.lang.pick("Без имени", "Unsaved");
-        if let Err(e) = layout::profile_op(|r| layout::profile_switch(r, &name, stash)) {
+        if let Err(e) = layout::profile_op(|r| layout::profile_switch(r, name, stash)) {
             return self.notify(format!("{}: {e}", self.ui.lang.pick("Макет не загружен", "Layout not loaded")));
         }
         self.note_own_write();
