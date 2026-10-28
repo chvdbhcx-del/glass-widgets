@@ -4,7 +4,7 @@ Planning only, no code moved. `src/host.rs` is 4553 lines. Line numbers are thos
 In every case `host.rs` gets `mod <name>;` (file `src/host/<name>.rs`); a child module sees the private items of `host`, so `App`'s
 fields, the `T_*` / `WM_*` consts and the free helpers need no visibility changes. `use super::*;` at the top of the new file.
 
-## 1. Win32 window helpers (cleanest: free functions, no `App`)
+## 1. Win32 window helpers (cleanest: free functions, no `App`) - DONE in src/host/winutil.rs (the moved fns are `pub(super)`)
 
 * Lines: 4325-4335 (`same_rect`, `step_toward`), 4337-4344 (`cpu_time_100ns`), 4346-4486 (`place_above_desktop`, `app_in_front`,
   `input_desktop_open`, `Cover` + `cover_cb`, `covering_windows`, `foreground_is_fullscreen`); optionally also 972-981 `force_foreground`
