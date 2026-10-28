@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+- Agents widget: a project folder with a very long path (over 260 characters) shows its real name instead of a cut-off one.
+
+### Internal
+- `host.rs` is split: window helpers in `host/winutil.rs`, the canvas prompt and card menu in `host/modal.rs` (no behaviour change).
+- `tools/snapshot-diff.py` compares two render folders pixel by pixel; the layout cache was checked with it against 0.5.12 (identical).
+
 ## [0.5.13] - 2026-10-27
 
 ### Added
