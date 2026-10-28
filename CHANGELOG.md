@@ -7,6 +7,11 @@
 - Ping widget: latency, loss and a sparkline for 1.1.1.1, the default gateway and up to 2 more hosts (ICMP via `IcmpSendEcho`, every 2 s, 1.5 s timeout; nothing is sent by previews).
 - Disk health widget: Healthy / Warning / Unhealthy per physical disk, plus temperature, wear and power-on hours when available (read-only, no elevation, refreshed every 60 s).
 - Downloads widget: unfinished browser downloads in the Downloads folder with size and speed (read-only, no subfolders, at most 200 entries per scan, every 2 s while visible).
+- Scenes: layouts that switch themselves. Tray menu > Scenes: "When a program is in front" (pick from the programs with a window open, or type an exe name) and "During a time range" (for example 22:00-06:00, it may cross midnight), each with the layout to switch to; "Remove a rule" deletes one. A program rule wins over a time rule, which wins over your own layout; when no rule holds any more your layout comes back. The check runs once a second (the foreground window and the clock only) and a new situation must hold for two checks, so alt-tabbing through a window does not rebuild the desk. Picking a layout yourself pauses the rules until the situation changes. Nothing is evaluated without rules, or while you are editing the desk. Stored as `sceneRules` in config.json. Needs an active layout (Layouts > Save current layout as...).
+- Agents widget: a click on the card opens the Agents tab of Pill (`%LOCALAPPDATA%\Pill\pill.exe --open agents`, started without a window). Nothing happens when Pill is not installed.
+
+### Changed
+- Monitors: each monitor keeps its own widgets by its hardware identity (model code + output + resolution) instead of the Windows output name `\\.\DISPLAYn`, which renumbers when a monitor is plugged in. Old configs are converted on start (the primary monitor's layout stays where it was, nothing is lost); a changed resolution or a cable moved to another output keeps the layout; making another monitor the primary one trades the two layouts instead of showing one monitor's widgets on the other. The desk still lives on one monitor at a time (Settings > Monitor).
 
 ## [0.5.15] - 2026-10-28
 

@@ -34,6 +34,7 @@ mod motion;
 mod net;
 mod prompt;
 mod registry;
+mod scenes;
 mod sha256;
 mod spectrum;
 mod sys;

@@ -523,6 +523,13 @@ pub fn active_profile(root: &Value) -> Option<String> {
     root.get("profiles")?.get(a).is_some().then(|| a.to_string())
 }
 
+/// The active profile of monitor `slot` (None = the primary monitor's `activeProfile`, Some(name) = `monitorProfiles[name]`), when that profile still exists.
+pub fn active_profile_for(root: &Value, slot: Option<&str>) -> Option<String> {
+    let Some(name) = slot else { return active_profile(root) };
+    let a = root.get("monitorProfiles")?.get(name)?.as_str()?;
+    root.get("profiles")?.get(a).is_some().then(|| a.to_string())
+}
+
 /// The current layout + look as one profile entry.
 fn snapshot(root: &Value) -> Value {
     json!({ "items": root.get("widgetsLayout").filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([])), "look": look_from_value(root) })
@@ -606,6 +613,14 @@ pub fn profile_op_at(p: &std::path::Path, slot: Option<&str>, f: impl FnOnce(&mu
     let mut root = read_root(p)?;
     with_slot(&mut root, slot, f)??;
     write_root(p, &root)
+}
+
+/// Bring the monitor keys of config.json up to date with the connected monitors (`monitors::migrate`). Written only when something changed; an
+/// unparsable file is never touched. Returns the migrated config when it was written.
+pub fn migrate_monitors(list: &[crate::monitors::MonInfo]) -> Option<Value> {
+    let p = config_path()?;
+    let mut root = read_root(&p).ok()?;
+    (crate::monitors::migrate(&mut root, list) && write_root(&p, &root).is_ok()).then_some(root)
 }
 
 /// config.json as parsed JSON, None when it cannot be read or parsed (a missing file is `{}`): for decisions that must not act on a broken file.
@@ -867,6 +882,15 @@ mod tests {
             "widgetsLook": {"blur": 9.0},
             "other": {"keep": [1, 2]}
         })
+    }
+
+    #[test]
+    fn active_profile_follows_the_monitor_slot() {
+        let v = json!({"profiles": {"A": {}, "B": {}}, "activeProfile": "A", "monitorProfiles": {D2: "B", r"\\.\DISPLAY3": "Gone"}});
+        assert_eq!(active_profile_for(&v, None).as_deref(), Some("A"));
+        assert_eq!(active_profile_for(&v, Some(D2)).as_deref(), Some("B"));
+        assert_eq!(active_profile_for(&v, Some(r"\\.\DISPLAY3")), None); // dangling
+        assert_eq!(active_profile_for(&v, Some(r"\\.\DISPLAY9")), None);
     }
 
     /// save -> the first profile is created from the desk and becomes active; the live keys are untouched.
