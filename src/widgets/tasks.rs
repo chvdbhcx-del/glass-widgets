@@ -220,7 +220,8 @@ impl Widget for Tasks {
                     } else {
                         cx.circle_stroke(ctr, BOX_R - 0.75, 1.5, DIM);
                     }
-                    let tr = Rect::new(r.x + 24.0, r.y, r.w - 24.0, r.h);
+                    let more = if i == 4 && list.len() > 5 { 28.0 } else { 0.0 }; // room for the "+n" mark
+                    let tr = Rect::new(r.x + 24.0, r.y, r.w - 24.0 - more, r.h);
                     cx.text(tr, &t.text, Style::BODY.ellipsis(), if t.done { DIM } else { TEXT });
                     if t.done {
                         let w = cx.measure(&t.text, Style::BODY, 0.0).0.min(tr.w);
