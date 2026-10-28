@@ -1,4 +1,4 @@
-//! Agents: the user's coding-agent sessions (Claude Code, Codex) as seen by the Pill island. S up to 3 rows, M up to 4: a dot (amber =
+//! Agents: the user's coding-agent sessions (Claude Code, Codex) as seen by the Pill island. S and M up to 4 rows (M adds a state word): a dot (amber =
 //! waiting for the user, accent = working), the project (last folder of the session's cwd) and a count badge. Waiting sessions come first.
 //! Data: the Pill's hook helper `agent-hook.ps1` writes one small JSON file per session into `%APPDATA%\pill\agents\`
 //! (`{tool, session, state, title, cwd, transcript, ts}`); this widget only READS that directory, like Pill's agents.rs does: at most 64
@@ -219,7 +219,7 @@ impl Widget for Agents {
         let badge = Rect::new(head.right() - 26.0, head.y + 1.0, 26.0, 18.0);
         cx.pill(badge, col.fade(0.22));
         cx.text(badge, &self.rows.len().to_string(), Style::new(11.0, 600).mono().center(), col);
-        let max = if cx.size == Size::M { 4 } else { 3 };
+        let max = 4; // 20 (title) + 6 + 4 x 26 fits the 138 px content height of both sizes
         for (i, row) in self.rows.iter().take(max).enumerate() {
             let r = Rect::new(rest.x, rest.y + 6.0 + i as f32 * ROW_H, rest.w, ROW_H);
             cx.circle((r.x + 5.0, r.cy()), 4.5, if row.waiting { ORANGE } else { accent() });
