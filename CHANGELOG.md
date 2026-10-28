@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.14] - 2026-10-28
 
 ### Fixed
 - Agents widget: a project folder with a very long path (over 260 characters) shows its real name instead of a cut-off one.
