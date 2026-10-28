@@ -14,7 +14,7 @@ fields, the `T_*` / `WM_*` consts and the free helpers need no visibility change
   re-export with `use winutil::*;` in host.rs so the call sites stay unchanged.
 * Module name: `winutil` (`src/host/winutil.rs`). About 170 lines out.
 
-## 2. Canvas text prompt and canvas context menu (largest, still one `impl App`)
+## 2. Canvas text prompt and canvas context menu (largest, still one `impl App`) - DONE in src/host/modal.rs (the 13 methods host.rs calls are `pub(super)`; `run_menu` and the clipboard readers stayed)
 
 * Lines: 3823-4125 (prompt: `on_prompt_request`, `prompt_tick`, `finish_prompt`, `modal_begin`, `apply_act`, key / char handlers) and
   4127-4323 (menu: `show_menu`, `menu_tick`, `menu_act`, `finish_menu`, `abort_menu`, `menu_key`). The two share `modal_begin` and the
