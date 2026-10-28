@@ -3,6 +3,7 @@
 use crate::registry::Registry;
 use crate::widget::*;
 
+pub mod agents;
 pub mod batteries;
 pub mod calendar;
 pub mod clipboard;
@@ -51,6 +52,7 @@ pub fn register_all(r: &mut Registry) {
     countdown::register(r);
     crypto::register(r);
     controls::register(r);
+    agents::register(r);
     dev::register(r); // hidden developer tool (id starts with '_')
 }
 

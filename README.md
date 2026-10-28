@@ -77,6 +77,7 @@ See the [changelog](CHANGELOG.md) for everything else (0.5.11: idle CPU with a v
 | **Crypto** | coin prices and 24 h change | cycle coins / edit the list |
 | **Quote of the Day** | a short saying from a built-in list (works offline) | next quote |
 | **Quick Actions** | volume and brightness sliders, Wi-Fi / Bluetooth / theme / mute, lock, sleep, restart, shut down (second click to confirm) | glyph left of the sliders opens Sound / Display settings |
+| **Agents** | Claude Code / Codex sessions from the Pill island hooks: project, working or waiting, count (reads `%APPDATA%\pill\agents`, read-only) | - |
 
 Cards snap to a grid, can be dragged, resized from the right-click menu and merge when they touch.
 
