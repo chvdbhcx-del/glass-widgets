@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.1] - 2026-10-29
+
+### Fixed
+- The 0.5.15 and 0.6.0 installers carried the program file of 0.5.14 (a packaging mistake in the release script): the Medeo typeface, the new widgets, scenes and monitor layouts were missing from them. This installer has the right program inside.
+
 ## [0.6.0] - 2026-10-29
 
 ### Added
