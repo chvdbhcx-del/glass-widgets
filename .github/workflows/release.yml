@@ -1,0 +1,65 @@
+# Builds the Glass Widgets installer on GitHub's runner and publishes the release v<version from Cargo.toml>.
+# Run it by hand: GitHub -> Actions -> Release -> Run workflow (also works from the GitHub mobile app).
+# Notes: the field below, or the newest CHANGELOG.md section when left empty. Bump Cargo.toml + CHANGELOG and push first.
+# Manual trigger only (no tag trigger): tools/release.ps1 / release-all create the tag themselves.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: Release notes (empty = the newest CHANGELOG.md section)
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tests
+        run: cargo test --locked
+        env:
+          CI: 'true' # skips the one bit-exact Direct2D test that needs a real GPU
+
+      - name: NSIS
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue)) { choco install nsis -y --no-progress }
+          $dir = 'C:\Program Files (x86)\NSIS'
+          if (Test-Path $dir) { $dir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8 }
+
+      - name: Notes
+        shell: pwsh
+        env:
+          INPUT_NOTES: ${{ github.event.inputs.notes }}
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $notes = $env:INPUT_NOTES
+          if (-not $notes) {
+            $cl = Get-Content CHANGELOG.md -Raw
+            if ($cl -match "(?ms)^## \[$([regex]::Escape($ver))\][^\r\n]*\r?\n(.*?)(?=^## |\z)") { $notes = $Matches[1].Trim() }
+          }
+          if (-not $notes) { $notes = "Glass Widgets $ver" }
+          [IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'notes.md'), $notes, (New-Object Text.UTF8Encoding($false)))
+          "VER=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build, package and publish
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/release.ps1 -Notes (Get-Content (Join-Path $env:RUNNER_TEMP 'notes.md') -Raw -Encoding UTF8)
+          if ($LASTEXITCODE -ne 0) { throw 'release failed' }
