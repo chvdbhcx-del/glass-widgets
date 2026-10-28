@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.6.0] - 2026-10-29
 
 ### Added
 - Tasks widget: a simple checklist without dates (S: count and next task, M: up to 5 tasks with checkboxes), stored in `tasks.json`.
