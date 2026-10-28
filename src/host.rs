@@ -483,6 +483,9 @@ unsafe fn make_backdrop(gfx: &Gfx, mon: &Monitor, w: i32, h: i32, live: bool, ra
 
 unsafe fn setup(o: &Opts) -> Result<()> {
     // `widgetsMonitor`: which monitor the desk lives on (a headless / --no-config run always uses the primary one)
+    if !o.no_config {
+        layout::migrate_monitors(&monitors::enumerate()); // old device-name keys / a new primary monitor, before anything reads the layout
+    }
     monitors::set_choice(if o.no_config { monitors::Choice::Primary } else { monitors::Choice::from_value(&layout::read_config()) });
     let mon = monitor();
     layout::set_slot(mon.slot.clone());
@@ -3309,6 +3312,11 @@ impl App {
     /// the one we sit on, or its geometry / DPI changed, everything is re-placed. An unplugged monitor falls back to the primary one, and the desk
     /// returns when it comes back.
     unsafe fn replace_monitor(&mut self) {
+        // monitors came or went, changed resolution or became the primary one: the stored keys follow the hardware first
+        if let Some(root) = layout::migrate_monitors(&monitors::enumerate()) {
+            self.note_own_write();
+            monitors::set_choice(monitors::Choice::from_value(&root));
+        }
         let cur = monitor();
         let wa = cur.work.bottom == self.work.bottom && cur.work.top == self.work.top;
         let (count, pos) = (self.ui.mon_count, self.ui.mon_sel);

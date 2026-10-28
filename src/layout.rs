@@ -615,6 +615,14 @@ pub fn profile_op_at(p: &std::path::Path, slot: Option<&str>, f: impl FnOnce(&mu
     write_root(p, &root)
 }
 
+/// Bring the monitor keys of config.json up to date with the connected monitors (`monitors::migrate`). Written only when something changed; an
+/// unparsable file is never touched. Returns the migrated config when it was written.
+pub fn migrate_monitors(list: &[crate::monitors::MonInfo]) -> Option<Value> {
+    let p = config_path()?;
+    let mut root = read_root(&p).ok()?;
+    (crate::monitors::migrate(&mut root, list) && write_root(&p, &root).is_ok()).then_some(root)
+}
+
 /// config.json as parsed JSON, None when it cannot be read or parsed (a missing file is `{}`): for decisions that must not act on a broken file.
 pub fn try_read_config() -> Option<Value> {
     config_path().and_then(|p| read_root(&p).ok())
