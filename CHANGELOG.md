@@ -5,6 +5,7 @@
 ### Added
 - Tasks widget: a simple checklist without dates (S: count and next task, M: up to 5 tasks with checkboxes), stored in `tasks.json`.
 - Ping widget: latency, loss and a sparkline for 1.1.1.1, the default gateway and up to 2 more hosts (ICMP via `IcmpSendEcho`, every 2 s, 1.5 s timeout; nothing is sent by previews).
+- Disk health widget: Healthy / Warning / Unhealthy per physical disk, plus temperature, wear and power-on hours when available (read-only, no elevation, refreshed every 60 s).
 
 ## [0.5.15] - 2026-10-28
 
