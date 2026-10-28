@@ -89,7 +89,7 @@ fn parse_session(bytes: &[u8], mtime: i64, now: i64) -> Option<Session> {
         _ => "other".to_string(),
     };
     let ts = o.get("ts").and_then(|v| v.as_i64()).filter(|t| *t > 0 && *t <= now + 300_000).unwrap_or(mtime);
-    Some(Session { tool, session, state, cwd: clean_text(st("cwd"), 260), ts, transcript: st("transcript").chars().take(260).collect() })
+    Some(Session { tool, session, state, cwd: clean_text(st("cwd"), 2048), ts, transcript: st("transcript").chars().take(260).collect() })
 }
 
 /// A waiting session whose transcript changed after the mark is working again.
@@ -297,9 +297,10 @@ mod tests {
         assert!(parse(r#"{"session":5,"state":["working"],"cwd":{}}"#).is_none());
         let big = format!(r#"{{"session":"s","state":"working","cwd":"{}"}}"#, "a".repeat(5000));
         assert!(parse(&big).is_none());
-        // a long cwd inside the cap is cut, control characters are gone
-        let s = parse(&format!(r#"{{"session":"s","state":"working","cwd":"{}\n\u0007x"}}"#, "b".repeat(300))).unwrap();
-        assert!(s.cwd.chars().count() <= 260 && !s.cwd.chars().any(|c| c.is_control()));
+        // control characters are gone; a path longer than MAX_PATH still ends in its real last folder (the cap is far above 260)
+        let s = parse(&format!(r#"{{"session":"s","state":"working","cwd":"C:\\{}\\pro\u0007j"}}"#, "b".repeat(300))).unwrap();
+        assert!(!s.cwd.chars().any(|c| c.is_control()));
+        assert_eq!(project_name(&s.cwd), "pro j");
     }
 
     #[test]
