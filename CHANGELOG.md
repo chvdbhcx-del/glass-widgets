@@ -4,7 +4,11 @@
 
 ## [0.5.13] - 2026-10-27
 
+### Added
+- Agents widget (S, M): your Claude Code / Codex sessions from the Pill hook files, with the project name, a waiting / working dot and a count; waiting sessions come first. Read-only, no network.
+
 ### Changed
+- Text layouts and the sparkline fade are cached between frames, so cards that only scroll a graph rebuild far fewer drawing objects (frame rates are untouched).
 - Smooth data everywhere: rings, bars and numbers glide to each new reading instead of jumping (System, Disks, Batteries, Processes, Network, Crypto, Rates, Weather). Reduced motion and previews jump as before; a settled card costs nothing.
 - Processes: rows move to their new rank (a process that falls out of the top slides down and fades at the bottom edge, one that climbs slides up from below); near-equal low rows keep their order, a row overtakes another only when it is clearly bigger.
 - Network: the big speeds show the mean of the last ~4 s; the graph is current (its right edge is the newest sample) and scrolls continuously between samples. System graphs scroll the same way.
