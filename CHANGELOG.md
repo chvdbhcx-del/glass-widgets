@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Agents widget: a click on the card opens the Agents tab of Pill (`%LOCALAPPDATA%\Pill\pill.exe --open agents`, started without a window). Nothing happens when Pill is not installed.
+
 ## [0.5.15] - 2026-10-28
 
 ### Changed

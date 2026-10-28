@@ -203,6 +203,20 @@ impl Agents {
 
 const ROW_H: f32 = 26.0;
 
+/// `<local app data>\Pill\pill.exe`, only when that file exists (Pill is a separate app and may not be installed).
+fn pill_exe(local_app_data: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let p = PathBuf::from(local_app_data?).join("Pill").join("pill.exe");
+    p.is_file().then_some(p)
+}
+
+/// A click on the card: Pill forwards `--open agents` to the running island and shows its Agents tab. Worker thread (the existence check
+/// is a file access); nothing happens, and nothing is shown, when Pill is not installed.
+fn open_pill() {
+    if let Some(p) = pill_exe(std::env::var_os("LOCALAPPDATA").as_deref()) {
+        crate::sys::spawn_hidden(&p.to_string_lossy(), &["--open", "agents"]);
+    }
+}
+
 impl Widget for Agents {
     fn draw(&mut self, cx: &mut Cx) -> Result<()> {
         self.ensure_preview(cx);
@@ -259,6 +273,13 @@ impl Widget for Agents {
         Tick::Poll(Duration::from_secs(2))
     }
 
+    fn mouse(&mut self, ev: &MouseEv, cx: &mut Cx) -> bool {
+        if ev.clicked(cx.bounds()) {
+            let _ = cx.spawn(open_pill); // no-op in previews; the host sends no click while editing or after a drag
+        }
+        false
+    }
+
     fn version(&self) -> u64 {
         self.ver
     }
@@ -267,6 +288,21 @@ impl Widget for Agents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pill_exe_only_when_the_file_exists() {
+        let dir = std::env::temp_dir().join(format!("mswidgets-pill-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(pill_exe(None), None);
+        assert_eq!(pill_exe(Some(dir.as_os_str())), None); // no such folder
+        std::fs::create_dir_all(dir.join("Pill").join("pill.exe")).unwrap();
+        assert_eq!(pill_exe(Some(dir.as_os_str())), None); // a folder of that name is not the program
+        std::fs::remove_dir_all(dir.join("Pill")).unwrap();
+        std::fs::create_dir_all(dir.join("Pill")).unwrap();
+        std::fs::write(dir.join("Pill").join("pill.exe"), b"MZ").unwrap();
+        assert_eq!(pill_exe(Some(dir.as_os_str())), Some(dir.join("Pill").join("pill.exe")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     const NOW: i64 = 1_800_000_000_000;
 
