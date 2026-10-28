@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod dev;
 pub mod diskhealth;
 pub mod disks;
+pub mod downloads;
 pub mod music;
 pub mod network;
 pub mod nextevent;
@@ -56,6 +57,7 @@ pub fn register_all(r: &mut Registry) {
     crypto::register(r);
     controls::register(r);
     agents::register(r);
+    downloads::register(r);
     diskhealth::register(r);
     ping::register(r);
     tasks::register(r);
