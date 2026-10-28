@@ -37,7 +37,7 @@ See the [changelog](CHANGELOG.md) for everything else (0.5.11: idle CPU with a v
 
 - **Real glass.** Each card refracts and blurs the wallpaper behind it, with a chromatic fringe, a specular highlight that follows the light and a
   soft materialise animation. Cards that touch merge into one liquid blob.
-- **Dark, light or automatic glass**, crisp Inter typography (bundled, SIL OFL), a hover light that follows the pointer.
+- **Dark, light or automatic glass**, crisp Medeo Sans typography (bundled, SIL OFL), a hover light that follows the pointer.
 - **Live wallpapers work.** The glass reads the wallpaper window itself (Windows Graphics Capture), so it follows videos and animated wallpapers.
 - **Visible to screenshots and screen recorders**: the layer never captures itself.
 - **Light on resources.** About 8-9 % of one CPU core and about 145 MB of RAM with a video wallpaper (measured on 0.5.11 / 0.5.12). The desk sleeps by itself
