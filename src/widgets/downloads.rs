@@ -6,6 +6,7 @@
 //! difference between two scans (2 s apart, a worker does the scan while the card is visible). A browser does not tell the total size,
 //! so there is no percentage.
 use super::sysmon::{fmt_rate_parts, fmt_size};
+use super::tasks::{diff_ids, edge_fade};
 use crate::registry::{Registry, WidgetDef};
 use crate::widget::*;
 use std::collections::HashMap;
@@ -139,6 +140,11 @@ fn scan() -> Option<(Instant, Vec<Entry>)> {
 
 // ================================================================ widget
 
+/// The top of the speed bars: the fastest file, at least 1 MiB/s (so a trickle does not fill a bar).
+fn bar_scale(items: &[Item]) -> f32 {
+    items.iter().map(|i| i.speed as f32).fold(1_048_576.0, f32::max)
+}
+
 #[derive(Default)]
 struct Downloads {
     items: Vec<Item>,
@@ -150,6 +156,17 @@ struct Downloads {
     last: Option<Instant>,
     ver: u64,
     started: bool,
+    /// per file: "y:" slot, "a:" opacity (a download starts / finishes), "s:" the S card's fade when the fastest file changes
+    slots: GlideAnim,
+    /// per file: "n:" speed, "z:" size, "f:" bar fraction; "tot" the total speed, "top" the S bar (against the fastest total seen)
+    vals: GlideAnim,
+    keys: Vec<String>,
+    /// finished files fading out in their slot
+    ghosts: Vec<Item>,
+    /// the fastest total speed seen while the card lives: the S bar's scale
+    peak: f32,
+    primed: bool,
+    moving: bool,
 }
 
 fn sample() -> Vec<Item> {
@@ -167,6 +184,8 @@ fn speed_text(cx: &Cx, bps: f64) -> String {
     format!("{n} {u}")
 }
 
+const ROW_H: f32 = 38.0;
+
 impl Downloads {
     fn init(&mut self, cx: &Cx) {
         if self.started {
@@ -174,8 +193,116 @@ impl Downloads {
         }
         self.started = true;
         self.ver += 1;
+        self.slots = GlideAnim::smooth(0.4);
         if cx.preview {
             self.items = sample();
+        }
+        self.retarget(cx, Vec::new());
+    }
+
+    /// Aim the glides at the current list; `old` = the previous list (what a finished file looked like).
+    fn retarget(&mut self, cx: &Cx, old: Vec<Item>) {
+        let new_keys: Vec<String> = self.items.iter().map(|i| i.file.clone()).collect();
+        let anim = self.primed && !cx.preview && !reduced_motion();
+        let (entering, leaving) = diff_ids(&self.keys, &new_keys);
+        for k in leaving {
+            if let Some(it) = old.iter().find(|i| i.file == k).filter(|_| anim) {
+                self.ghosts.retain(|g| g.file != k);
+                self.ghosts.push(it.clone());
+                self.slots.set(&format!("a:{k}"), 0.0, cx);
+            }
+        }
+        let scale = bar_scale(&self.items);
+        let total: f32 = self.items.iter().map(|i| i.speed as f32).sum();
+        self.peak = self.peak.max(total).max(1_048_576.0);
+        for (i, it) in self.items.iter().enumerate() {
+            let k = &it.file;
+            self.ghosts.retain(|g| g.file != *k);
+            let (y, a) = (format!("y:{k}"), format!("a:{k}"));
+            if anim && entering.contains(k) {
+                self.slots.set_from(&y, i as f32 + 0.8, i as f32, cx);
+                self.slots.set_from(&a, 0.0, 1.0, cx);
+            } else {
+                self.slots.set(&y, i as f32, cx);
+                self.slots.set(&a, 1.0, cx);
+            }
+            self.vals.set(&format!("n:{k}"), it.speed as f32, cx);
+            self.vals.set(&format!("z:{k}"), it.size as f32, cx);
+            self.vals.set(&format!("f:{k}"), it.speed as f32 / scale, cx);
+        }
+        if anim && new_keys.first() != self.keys.first() {
+            if let Some(k) = new_keys.first() {
+                self.slots.start(&format!("s:{k}"), 0.0, 1.0, cx);
+            }
+        }
+        self.vals.set("tot", total, cx);
+        self.vals.set("top", total / self.peak, cx);
+        self.keys = new_keys;
+        self.primed = true;
+        cx.waker().wake();
+    }
+
+    fn paint_m_row(&self, cx: &Cx, c: Rect, it: &Item, y: f32, a: f32) {
+        let a = a * edge_fade(y, SHOWN);
+        if a <= 0.0 {
+            return;
+        }
+        let row = Rect::new(c.x, c.y + 24.0 + y * ROW_H, c.w, 36.0);
+        let g = |p: &str, d: f32| self.vals.or(&format!("{p}:{}", it.file), d);
+        cx.with_opacity(a, |cx| {
+            cx.text(Rect::new(row.x, row.y, row.w - 86.0, 18.0), &it.name, Style::BODY.ellipsis(), TEXT);
+            cx.text(Rect::new(row.right() - 84.0, row.y, 84.0, 18.0), &speed_text(cx, g("n", it.speed as f32) as f64), Style::new(12.0, 500).mono().right().ellipsis(), accent());
+            let size = fmt_size(g("z", it.size as f32) as u64, cx.lang);
+            cx.text(Rect::new(row.x, row.y + 18.0, 64.0, 16.0), &size, Style::CAPTION.ellipsis(), DIM);
+            let bar = Rect::new(row.x + 70.0, row.y + 24.0, row.w - 70.0, 4.0);
+            cx.pill(bar, FILL);
+            cx.bar_fill(bar, g("f", 0.0), accent());
+        });
+    }
+
+    /// Everything that changes. `draw` calls it when nothing moves, `overlay` while something does.
+    fn paint(&self, cx: &Cx) {
+        let c = cx.content();
+        let Some(top) = self.items.first() else {
+            let msg = if self.unreadable { cx.t("Папка недоступна", "Folder unavailable") } else { cx.t("Нет активных загрузок", "No active downloads") };
+            cx.icon(Glyph::NetDown, Rect::new(c.cx() - 18.0, c.y + 40.0, 36.0, 36.0), FAINT);
+            cx.text(Rect::new(c.x, c.y + 84.0, c.w, 20.0), msg, Style::BODY.center().ellipsis(), DIM);
+            return;
+        };
+        let total = self.vals.or("tot", self.items.iter().map(|i| i.speed as f32).sum());
+        match cx.size {
+            Size::M => {
+                cx.text(Rect::new(c.x + 80.0, c.y - 1.0, c.w - 80.0, 20.0), &speed_text(cx, total as f64), Style::new(12.0, 500).mono().right(), TEXT);
+                for (i, it) in self.items.iter().enumerate() {
+                    let g = |p: &str, d: f32| self.slots.or(&format!("{p}:{}", it.file), d);
+                    self.paint_m_row(cx, c, it, g("y", i as f32), g("a", 1.0));
+                }
+                for it in &self.ghosts {
+                    let g = |p: &str, d: f32| self.slots.or(&format!("{p}:{}", it.file), d);
+                    self.paint_m_row(cx, c, it, g("y", 0.0), g("a", 0.0));
+                }
+                if self.items.len() > SHOWN {
+                    cx.text(Rect::new(c.right() - 60.0, c.bottom() - 12.0, 60.0, 12.0), &format!("+{}", self.items.len() - SHOWN), Style::CAPTION.right().mono(), FAINT);
+                }
+            }
+            _ => {
+                let (n, u) = fmt_rate_parts(total as f64, cx.lang);
+                let big = Style::new(34.0, 300).mono();
+                cx.text(Rect::new(c.x, c.y + 20.0, c.w, 42.0), &n, big, TEXT);
+                let nw = cx.measure(&n, big, 0.0).0;
+                cx.text(Rect::new(c.x + nw + 5.0, c.y + 40.0, (c.w - nw - 5.0).max(10.0), 16.0), u, Style::CAPTION.ellipsis(), DIM);
+                let k = self.items.len() as u32;
+                cx.text(Rect::new(c.x, c.y + 64.0, c.w, 16.0), &format!("{k} {}", plural(k, cx.t("файл", "file"), cx.t("файла", "files"), cx.t("файлов", "files"))), Style::CAPTION, DIM);
+                let f = self.slots.or(&format!("s:{}", top.file), 1.0); // a new fastest file fades in
+                cx.with_opacity(f, |cx| {
+                    cx.text(Rect::new(c.x, c.y + 88.0, c.w, 18.0), &top.name, Style::BODY.ellipsis(), TEXT);
+                    let size = fmt_size(self.vals.or(&format!("z:{}", top.file), top.size as f32) as u64, cx.lang);
+                    cx.text(Rect::new(c.x, c.y + 108.0, c.w, 16.0), &size, Style::CAPTION.ellipsis(), DIM);
+                });
+                let bar = Rect::new(c.x, c.y + 130.0, c.w, 4.0);
+                cx.pill(bar, FILL);
+                cx.bar_fill(bar, self.vals.or("top", 0.0), accent());
+            }
         }
     }
 }
@@ -185,38 +312,16 @@ impl Widget for Downloads {
         self.init(cx);
         let c = cx.content();
         cx.text(Rect::new(c.x, c.y - 1.0, c.w - 24.0, 20.0), cx.t("Загрузки", "Downloads"), Style::TITLE.ellipsis(), accent());
-        let Some(top) = self.items.first() else {
-            let msg = if self.unreadable { cx.t("Папка недоступна", "Folder unavailable") } else { cx.t("Нет активных загрузок", "No active downloads") };
-            cx.icon(Glyph::NetDown, Rect::new(c.cx() - 18.0, c.y + 40.0, 36.0, 36.0), FAINT);
-            cx.text(Rect::new(c.x, c.y + 84.0, c.w, 20.0), msg, Style::BODY.center().ellipsis(), DIM);
-            return Ok(());
-        };
-        let total: f64 = self.items.iter().map(|i| i.speed).sum();
-        match cx.size {
-            Size::M => {
-                let (n, u) = fmt_rate_parts(total, cx.lang);
-                cx.text(Rect::new(c.x + 80.0, c.y - 1.0, c.w - 80.0, 20.0), &format!("{n} {u}"), Style::new(12.0, 500).mono().right(), TEXT);
-                for (i, it) in self.items.iter().take(SHOWN).enumerate() {
-                    let row = Rect::new(c.x, c.y + 24.0 + i as f32 * 38.0, c.w, 36.0);
-                    cx.text(Rect::new(row.x, row.y, row.w - 86.0, 18.0), &it.name, Style::BODY.ellipsis(), TEXT);
-                    cx.text(Rect::new(row.right() - 84.0, row.y, 84.0, 18.0), &speed_text(cx, it.speed), Style::new(12.0, 500).mono().right().ellipsis(), accent());
-                    cx.text(Rect::new(row.x, row.y + 18.0, row.w, 16.0), &fmt_size(it.size, cx.lang), Style::CAPTION.ellipsis(), DIM);
-                }
-                if self.items.len() > SHOWN {
-                    cx.text(Rect::new(c.right() - 60.0, c.bottom() - 12.0, 60.0, 12.0), &format!("+{}", self.items.len() - SHOWN), Style::CAPTION.right().mono(), FAINT);
-                }
-            }
-            _ => {
-                let (n, u) = fmt_rate_parts(total, cx.lang);
-                let big = Style::new(34.0, 300).mono();
-                cx.text(Rect::new(c.x, c.y + 20.0, c.w, 42.0), &n, big, TEXT);
-                let nw = cx.measure(&n, big, 0.0).0;
-                cx.text(Rect::new(c.x + nw + 5.0, c.y + 40.0, (c.w - nw - 5.0).max(10.0), 16.0), u, Style::CAPTION.ellipsis(), DIM);
-                let k = self.items.len() as u32;
-                cx.text(Rect::new(c.x, c.y + 64.0, c.w, 16.0), &format!("{k} {}", plural(k, cx.t("файл", "file"), cx.t("файла", "files"), cx.t("файлов", "files"))), Style::CAPTION, DIM);
-                cx.text(Rect::new(c.x, c.y + 88.0, c.w, 18.0), &top.name, Style::BODY.ellipsis(), TEXT);
-                cx.text(Rect::new(c.x, c.y + 108.0, c.w, 16.0), &fmt_size(top.size, cx.lang), Style::CAPTION.ellipsis(), DIM);
-            }
+        if !self.moving {
+            self.paint(cx);
+        }
+        Ok(())
+    }
+
+    /// The moving part: numbers and bars on their way, rows entering and leaving.
+    fn overlay(&mut self, cx: &mut Cx) -> Result<()> {
+        if self.moving {
+            self.paint(cx);
         }
         Ok(())
     }
@@ -237,7 +342,12 @@ impl Widget for Downloads {
                     if items != self.items || unreadable != self.unreadable {
                         self.ver += 1;
                     }
-                    (self.items, self.at, self.unreadable) = (items, at, unreadable);
+                    self.at = at;
+                    self.unreadable = unreadable;
+                    if items != self.items {
+                        let old = std::mem::replace(&mut self.items, items);
+                        self.retarget(cx, old);
+                    }
                 }
                 None if !j.busy() => self.job = None,
                 None => {}
@@ -246,6 +356,22 @@ impl Widget for Downloads {
         if self.job.is_none() && self.last.map_or(true, |t| t.elapsed() >= Duration::from_millis(1900)) {
             self.last = Some(Instant::now());
             self.job = Some(cx.spawn(scan));
+        }
+        let busy = self.slots.step(cx) | self.vals.step(cx);
+        if busy != self.moving {
+            self.moving = busy;
+            self.ver += 1; // `draw` takes the dynamic parts over again (or hands them to `overlay`)
+        }
+        if !busy && !self.ghosts.is_empty() {
+            self.ghosts.clear();
+            let keep = self.keys.clone();
+            let alive = |k: &str| !k.contains(':') || k.split_once(':').is_some_and(|(_, n)| keep.iter().any(|x| x == n));
+            self.slots.retain(alive);
+            self.vals.retain(alive);
+            self.ver += 1;
+        }
+        if busy {
+            return Tick::Fps(60); // numbers and bars glide, rows slide in and fade out
         }
         Tick::Poll(Duration::from_secs(2))
     }
@@ -320,5 +446,40 @@ mod tests {
     fn downloads_live() {
         println!("{:?}", downloads_dir());
         println!("{:?}", scan().map(|(_, v)| v));
+    }
+
+    #[test]
+    fn bar_scale_has_a_floor() {
+        assert_eq!(bar_scale(&[]), 1_048_576.0);
+        assert_eq!(bar_scale(&[item("a.part", 0, 1_000.0)]), 1_048_576.0); // a trickle does not fill the bar
+        assert_eq!(bar_scale(&[item("a.part", 0, 5_000_000.0), item("b.part", 0, 9_000_000.0)]), 9_000_000.0);
+    }
+
+    #[test]
+    fn numbers_and_bars_glide_then_stop_exactly() {
+        use crate::motion::Glide;
+        let mut g = Glide::default();
+        g.set("n:a", 1.0e6);
+        g.set("f:a", 0.2);
+        g.set("n:a", 9.0e6);
+        g.set("f:a", 0.9);
+        let mut mid = false;
+        let mut n = 0;
+        while g.step(1.0 / 60.0) {
+            let v = g.get("n:a").unwrap();
+            mid |= v > 2.0e6 && v < 8.0e6;
+            assert!(v >= 1.0e6 && v <= 9.0e6, "no overshoot");
+            n += 1;
+            assert!(n < 120);
+        }
+        assert!(mid);
+        assert_eq!((g.get("n:a"), g.get("f:a")), (Some(9.0e6), Some(0.9)));
+        // a new download: from below and transparent; a finished one fades to 0 and can then be forgotten
+        let mut s = Glide::smooth(0.4);
+        s.set_from("a:new", 0.0, 1.0);
+        s.set("a:old", 1.0);
+        s.set("a:old", 0.0);
+        while s.step(1.0 / 60.0) {}
+        assert_eq!((s.get("a:new"), s.get("a:old")), (Some(1.0), Some(0.0)));
     }
 }
