@@ -130,6 +130,14 @@ impl Default for Auto {
 }
 
 impl Auto {
+    /// The rule whose profile is on screen right now (the tray marks it); None when no rule is applied or the user took over by hand.
+    pub fn applied_rule(&self) -> Option<&Rule> {
+        match &self.st {
+            St::Active { applied, .. } => self.eff.as_ref().filter(|r| r.profile == *applied),
+            _ => None,
+        }
+    }
+
     /// Nothing applied, nothing paused, no candidate: with no rules there is nothing left to evaluate.
     pub fn idle(&self) -> bool {
         self.st == St::Idle && self.eff.is_none()
@@ -196,6 +204,19 @@ mod tests {
     }
     fn time(f: &str, t: &str, profile: &str) -> Rule {
         Rule { when: When::Time { from: parse_hm(f).unwrap(), to: parse_hm(t).unwrap() }, profile: profile.into() }
+    }
+
+    #[test]
+    fn the_applied_rule_is_reported_for_the_tray() {
+        let (a, b) = (prog("game.exe", "Games"), time("09:00", "17:00", "Work"));
+        let mut auto = Auto::default();
+        assert!(auto.applied_rule().is_none());
+        assert_eq!(auto.step(Some(&a), Some("Home"), ALL), None); // held once: not yet
+        assert_eq!(auto.step(Some(&a), Some("Home"), ALL).as_deref(), Some("Games"));
+        assert_eq!(auto.applied_rule(), Some(&a));
+        assert_eq!(auto.step(Some(&a), Some("Other"), ALL), None); // the user switched by hand: nothing is marked
+        assert!(auto.applied_rule().is_none());
+        let _ = b;
     }
 
     #[test]

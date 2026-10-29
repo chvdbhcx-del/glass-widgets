@@ -2663,7 +2663,7 @@ impl App {
         if let Ok(mut g) = scene::SCENE_PROGRAMS.lock() {
             g.clone_from(&scene_programs);
         }
-        tray::MenuState { lang: self.ui.lang, editing: self.editing, hidden: self.user_hidden, autostart: crate::autostart::enabled(), profiles, active, monitors, monitor, scene_rules: self.scene_menu_lines(), scene_programs }
+        tray::MenuState { lang: self.ui.lang, editing: self.editing, hidden: self.user_hidden, autostart: crate::autostart::enabled(), profiles, active, monitors, monitor, scene_rules: self.scene_menu_lines(), scene_programs, scene_active: self.scenes.applied_rule().and_then(|a| self.scene_rules.iter().position(|r| r == a)) }
     }
 
     /// A tray click / menu choice.

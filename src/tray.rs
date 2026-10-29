@@ -47,6 +47,8 @@ pub struct MenuState {
     /// scene rules as menu lines, and the programs with a window open right now
     pub scene_rules: Vec<String>,
     pub scene_programs: Vec<String>,
+    /// the rule whose profile is on screen (index into `scene_rules`): it gets a check mark
+    pub scene_active: Option<usize>,
 }
 
 /// The id of the broadcast Explorer sends after it (re)creates the taskbar: the icon must be added again.
@@ -132,8 +134,8 @@ unsafe fn scenes_popup(st: &MenuState) -> Option<HMENU> {
     if st.scene_rules.is_empty() {
         let _ = AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, PCWSTR(wide(t("Правил нет", "No rules")).as_ptr()));
     }
-    for r in st.scene_rules.iter().take(MAX_RULES) {
-        let _ = AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, PCWSTR(wide(&r.replace('&', "&&")).as_ptr()));
+    for (i, r) in st.scene_rules.iter().take(MAX_RULES).enumerate() {
+        let _ = AppendMenuW(sub, MF_STRING | MF_GRAYED | if st.scene_active == Some(i) { MF_CHECKED } else { MF_UNCHECKED }, 0, PCWSTR(wide(&r.replace('&', "&&")).as_ptr()));
     }
     let _ = AppendMenuW(sub, MF_SEPARATOR, 0, PCWSTR::null());
     let has_profiles = !st.profiles.is_empty();
