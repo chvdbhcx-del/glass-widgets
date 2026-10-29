@@ -5,6 +5,7 @@
 //! regular `.json` files of at most 4 KB, anything unparsable is skipped, `done` and stale (no update for 30 min) sessions are hidden.
 //! A session marked waiting whose transcript was written afterwards is working again (Claude Code has no "resumed" hook).
 //! The scan runs on a worker every 2 s (`Tick::Poll`, no animation); the card is static between changes: `draw` + `version()`.
+use super::tasks::{diff_ids, edge_fade, unique_keys};
 use crate::registry::{Registry, WidgetDef};
 use crate::widget::*;
 use std::collections::HashSet;
@@ -182,13 +183,40 @@ fn sample() -> Vec<Row> {
     vec![r("island-replica", true), r("macshell", false), r("local-ai-telegram-bot", false), r("kadr", false), r("catcode", false)]
 }
 
-#[derive(Default)]
+/// A session that left the list: it fades out in its slot.
+struct Ghost {
+    key: String,
+    row: Row,
+}
+
 struct Agents {
     rows: Vec<Row>,
     loaded: bool,
     job: Option<Pending<Vec<Row>>>,
     last: Option<Instant>,
     ver: u64,
+    /// per row key: "y:" slot, "a:" opacity (a session appears / ends), "c:" 0 working .. 1 waiting (the dot cross-fades)
+    slots: GlideAnim,
+    /// "b" the count badge pop, "bc" the badge colour (0 accent .. 1 amber)
+    vals: GlideAnim,
+    keys: Vec<String>,
+    ghosts: Vec<Ghost>,
+    count: usize,
+    primed: bool,
+    /// something glides or a dot pulses: `draw` leaves the dynamic parts out and `overlay` paints them
+    moving: bool,
+    born: Instant,
+}
+
+impl Default for Agents {
+    fn default() -> Agents {
+        Agents { rows: Vec::new(), loaded: false, job: None, last: None, ver: 0, slots: GlideAnim::smooth(0.4), vals: GlideAnim::default(), keys: Vec::new(), ghosts: Vec::new(), count: 0, primed: false, moving: false, born: Instant::now() }
+    }
+}
+
+/// The gentle pulse of a working dot: 0..1, one breath every 2.4 s.
+fn breath(t: f32) -> f32 {
+    0.5 - 0.5 * (t * std::f32::consts::TAU / 2.4).cos()
 }
 
 impl Agents {
@@ -197,6 +225,101 @@ impl Agents {
             self.loaded = true;
             self.rows = sample();
             self.ver += 1;
+        }
+        if !self.primed {
+            self.retarget(cx, Vec::new());
+        }
+    }
+
+    /// Aim the glides at the current rows; `old` = the previous rows (what an ended session looked like). New sessions slide in, ended ones
+    /// fade out, the rest glide to their slot, a dot that changes state cross-fades, the badge pops when the count changes.
+    fn retarget(&mut self, cx: &Cx, old: Vec<Row>) {
+        let new_keys = unique_keys(self.rows.iter().map(|r| r.project.as_str()));
+        let anim = self.primed && !cx.preview && !reduced_motion();
+        let (entering, leaving) = diff_ids(&self.keys, &new_keys);
+        for k in &leaving {
+            if let Some(r) = self.keys.iter().position(|x| x == k).and_then(|i| old.get(i)).filter(|_| anim) {
+                self.ghosts.retain(|g| g.key != *k);
+                self.ghosts.push(Ghost { key: k.clone(), row: r.clone() });
+                self.slots.set(&format!("a:{k}"), 0.0, cx);
+            }
+        }
+        for (i, (k, r)) in new_keys.iter().zip(&self.rows).enumerate() {
+            self.ghosts.retain(|g| g.key != *k);
+            let (y, a) = (format!("y:{k}"), format!("a:{k}"));
+            if anim && entering.contains(k) {
+                self.slots.set_from(&y, i as f32 + 0.8, i as f32, cx);
+                self.slots.set_from(&a, 0.0, 1.0, cx);
+            } else {
+                self.slots.set(&y, i as f32, cx);
+                self.slots.set(&a, 1.0, cx);
+            }
+            self.slots.set(&format!("c:{k}"), if r.waiting { 1.0 } else { 0.0 }, cx);
+        }
+        if self.primed && self.rows.len() != self.count {
+            self.vals.start("b", 0.0, 1.0, cx); // the badge pops
+        }
+        self.vals.set("bc", if self.rows.iter().any(|r| r.waiting) { 1.0 } else { 0.0 }, cx);
+        self.count = self.rows.len();
+        self.keys = new_keys;
+        self.primed = true;
+        cx.waker().wake();
+    }
+
+    /// A dot pulses while a session works (not in previews, not with reduced motion).
+    fn pulsing(&self, cx: &Cx) -> bool {
+        !cx.preview && !reduced_motion() && self.rows.iter().any(|r| !r.waiting)
+    }
+
+    fn paint_row(&self, cx: &Cx, rest: Rect, key: &str, row: &Row, y: f32, a: f32, pulse: f32) {
+        let a = a * edge_fade(y, 4);
+        if a <= 0.0 {
+            return;
+        }
+        let r = Rect::new(rest.x, rest.y + 6.0 + y * ROW_H, rest.w, ROW_H);
+        let c = self.slots.or(&format!("c:{key}"), if row.waiting { 1.0 } else { 0.0 }); // 0 working .. 1 waiting
+        let col = accent().mix(ORANGE, c);
+        cx.with_opacity(a, |cx| {
+            let ctr = (r.x + 5.0, r.cy());
+            if c < 0.5 && pulse > 0.0 {
+                cx.circle_stroke(ctr, 4.5 + 3.5 * pulse, 1.3, col.fade(0.45 * (1.0 - pulse) * (1.0 - c * 2.0))); // a working dot breathes out a faint ring
+            }
+            cx.circle(ctr, 4.5 + 0.5 * pulse * (1.0 - c), col);
+            let label_w = if cx.size == Size::M { 96.0 } else { 0.0 };
+            cx.text(Rect::new(r.x + 18.0, r.y, r.w - 18.0 - label_w, r.h), &row.project, Style::BODY.ellipsis(), SUBTLE.mix(TEXT, c));
+            if label_w > 0.0 {
+                let state = if row.waiting { cx.t("ждёт", "waiting") } else { cx.t("работает", "working") };
+                cx.text(Rect::new(r.right() - label_w, r.y, label_w, r.h), state, Style::CAPTION.right().ellipsis(), DIM);
+            }
+        });
+    }
+
+    /// Everything that moves. `draw` calls it when nothing moves, `overlay` while something does.
+    fn paint(&self, cx: &Cx) {
+        let (head, rest) = cx.content().cut_top(20.0);
+        if self.rows.is_empty() && self.ghosts.is_empty() {
+            cx.icon(Glyph::Bolt, rest.centered(32.0, 32.0).offset(0.0, -8.0), FAINT);
+            let msg = if self.loaded { cx.t("Нет активных сессий", "No active sessions") } else { cx.t("Загрузка…", "Loading…") };
+            cx.text(rest.cut_bottom(18.0).1, msg, Style::CAPTION.center().ellipsis(), DIM);
+            return;
+        }
+        // the count badge: amber while anything waits for the user; it pops when the count changes
+        let col = accent().mix(ORANGE, self.vals.or("bc", 0.0));
+        let badge = Rect::new(head.right() - 26.0, head.y + 1.0, 26.0, 18.0);
+        let pop = self.vals.or("b", 1.0);
+        let k = 1.0 + 0.3 * (pop * std::f32::consts::PI).sin();
+        cx.scaled((badge.cx(), badge.cy()), k, |cx| {
+            cx.pill(badge, col.fade(0.22));
+            cx.text(badge, &self.rows.len().to_string(), Style::new(11.0, 600).mono().center(), col);
+        });
+        let pulse = if self.pulsing(cx) { breath(self.born.elapsed().as_secs_f32()) } else { 0.0 };
+        for (i, (k, r)) in self.keys.iter().zip(&self.rows).enumerate() {
+            let g = |p: &str, d: f32| self.slots.or(&format!("{p}:{k}"), d);
+            self.paint_row(cx, rest, k, r, g("y", i as f32), g("a", 1.0), pulse);
+        }
+        for gh in &self.ghosts {
+            let g = |p: &str, d: f32| self.slots.or(&format!("{p}:{}", gh.key), d);
+            self.paint_row(cx, rest, &gh.key, &gh.row, g("y", 0.0), g("a", 0.0), 0.0);
         }
     }
 }
@@ -220,36 +343,25 @@ fn open_pill() {
 impl Widget for Agents {
     fn draw(&mut self, cx: &mut Cx) -> Result<()> {
         self.ensure_preview(cx);
-        let (head, rest) = cx.content().cut_top(20.0);
+        let head = cx.content().cut_top(20.0).0;
         cx.text(Rect::new(head.x, head.y, head.w - 34.0, head.h), cx.t("Агенты", "Agents"), Style::TITLE.ellipsis(), SUBTLE);
-        if self.rows.is_empty() {
-            cx.icon(Glyph::Bolt, rest.centered(32.0, 32.0).offset(0.0, -8.0), FAINT);
-            let msg = if self.loaded { cx.t("Нет активных сессий", "No active sessions") } else { cx.t("Загрузка…", "Loading…") };
-            cx.text(rest.cut_bottom(18.0).1, msg, Style::CAPTION.center().ellipsis(), DIM);
-            return Ok(());
+        if !self.moving {
+            self.paint(cx);
         }
-        // the count badge: amber while anything waits for the user
-        let col = if self.rows.iter().any(|r| r.waiting) { ORANGE } else { accent() };
-        let badge = Rect::new(head.right() - 26.0, head.y + 1.0, 26.0, 18.0);
-        cx.pill(badge, col.fade(0.22));
-        cx.text(badge, &self.rows.len().to_string(), Style::new(11.0, 600).mono().center(), col);
-        let max = 4; // 20 (title) + 6 + 4 x 26 fits the 138 px content height of both sizes
-        for (i, row) in self.rows.iter().take(max).enumerate() {
-            let r = Rect::new(rest.x, rest.y + 6.0 + i as f32 * ROW_H, rest.w, ROW_H);
-            cx.circle((r.x + 5.0, r.cy()), 4.5, if row.waiting { ORANGE } else { accent() });
-            let label_w = if cx.size == Size::M { 96.0 } else { 0.0 };
-            cx.text(Rect::new(r.x + 18.0, r.y, r.w - 18.0 - label_w, r.h), &row.project, Style::BODY.ellipsis(), if row.waiting { TEXT } else { SUBTLE });
-            if label_w > 0.0 {
-                let state = if row.waiting { cx.t("ждёт", "waiting") } else { cx.t("работает", "working") };
-                cx.text(Rect::new(r.right() - label_w, r.y, label_w, r.h), state, Style::CAPTION.right().ellipsis(), DIM);
-            }
+        Ok(())
+    }
+
+    /// The moving part: rows gliding, dots breathing, the badge popping.
+    fn overlay(&mut self, cx: &mut Cx) -> Result<()> {
+        if self.moving {
+            self.paint(cx);
         }
         Ok(())
     }
 
     fn tick(&mut self, cx: &Cx) -> Tick {
+        self.ensure_preview(cx);
         if cx.preview {
-            self.ensure_preview(cx);
             return Tick::Never;
         }
         if let Some(j) = &self.job {
@@ -257,9 +369,10 @@ impl Widget for Agents {
                 Some(rows) => {
                     self.job = None;
                     if !self.loaded || rows != self.rows {
-                        self.rows = rows;
+                        let old = std::mem::replace(&mut self.rows, rows);
                         self.loaded = true;
                         self.ver += 1;
+                        self.retarget(cx, old);
                     }
                 }
                 None if !j.busy() => self.job = None, // the worker died, try again below
@@ -269,6 +382,22 @@ impl Widget for Agents {
         if self.job.is_none() && self.last.map_or(true, |t| t.elapsed() >= Duration::from_millis(1900)) {
             self.last = Some(Instant::now());
             self.job = Some(cx.spawn(scan));
+        }
+        let busy = self.slots.step(cx) | self.vals.step(cx);
+        let moving = busy || self.pulsing(cx);
+        if moving != self.moving {
+            self.moving = moving;
+            self.ver += 1; // `draw` takes the dynamic parts over again (or hands them to `overlay`)
+        }
+        if !busy && !self.ghosts.is_empty() {
+            self.ghosts.clear();
+            let keep = self.keys.clone();
+            let alive = |k: &str| !k.contains(':') || k.split_once(':').is_some_and(|(_, n)| keep.iter().any(|x| x == n));
+            self.slots.retain(alive);
+            self.ver += 1;
+        }
+        if moving {
+            return Tick::Fps(60); // rows glide, a working dot breathes
         }
         Tick::Poll(Duration::from_secs(2))
     }
@@ -379,5 +508,42 @@ mod tests {
         assert_eq!(w.ts, NOW - 10_000); // only waiting sessions are touched
         assert_eq!(transcript_mtime("C:/definitely/missing.jsonl"), None);
         assert_eq!(transcript_mtime("C:/Windows/notepad.exe"), None); // not a .jsonl: never stat-ed
+    }
+
+    #[test]
+    fn breath_is_a_smooth_loop() {
+        assert!(breath(0.0).abs() < 1e-6 && (breath(1.2) - 1.0).abs() < 1e-6 && breath(2.4).abs() < 1e-5);
+        assert!((0..48).all(|i| (0.0..=1.0).contains(&breath(i as f32 * 0.1))));
+    }
+
+    #[test]
+    fn a_session_changing_state_glides_up_and_the_badge_pops() {
+        use crate::motion::Glide;
+        let mut g = Glide::smooth(0.4);
+        // [a working, b working, c working] -> c starts waiting: it rises to slot 0, its dot turns amber
+        for (i, k) in ["a", "b", "c"].iter().enumerate() {
+            g.set(&format!("y:{k}"), i as f32);
+            g.set(&format!("c:{k}"), 0.0);
+        }
+        g.set("y:c", 0.0);
+        g.set("y:a", 1.0);
+        g.set("y:b", 2.0);
+        g.set("c:c", 1.0);
+        g.start("b", 0.0, 1.0);
+        let (mut mid_y, mut n) = (false, 0);
+        while g.step(1.0 / 60.0) {
+            let y = g.get("y:c").unwrap();
+            mid_y |= y > 0.3 && y < 1.7;
+            assert!((0.0..=2.0).contains(&y), "no overshoot");
+            n += 1;
+            assert!(n < 120);
+        }
+        assert!(mid_y);
+        assert_eq!((g.get("y:c"), g.get("y:a"), g.get("y:b"), g.get("c:c"), g.get("b")), (Some(0.0), Some(1.0), Some(2.0), Some(1.0), Some(1.0)));
+    }
+
+    #[test]
+    fn same_project_twice_gets_two_keys() {
+        assert_eq!(unique_keys(["kadr", "macshell", "kadr"]), vec!["kadr", "macshell", "kadr#2"]);
     }
 }

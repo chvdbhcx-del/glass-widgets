@@ -85,6 +85,23 @@ pub(crate) fn diff_ids<T: PartialEq + Clone>(old: &[T], new: &[T]) -> (Vec<T>, V
     (new.iter().filter(|i| !old.contains(i)).cloned().collect(), old.iter().filter(|i| !new.contains(i)).cloned().collect())
 }
 
+/// A unique glide key per name: the name itself, with "#2", "#3" for a second and third of the same name.
+pub(crate) fn unique_keys<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    names
+        .into_iter()
+        .map(|n| {
+            let c = seen.iter().filter(|s| **s == n).count();
+            seen.push(n);
+            if c == 0 {
+                n.to_string()
+            } else {
+                format!("{n}#{}", c + 1)
+            }
+        })
+        .collect()
+}
+
 /// Row opacity at the (fractional) slot `y`: rows that glide past the last visible slot fade out.
 pub(crate) fn edge_fade(y: f32, rows: usize) -> f32 {
     let last = rows as f32 - 1.0;

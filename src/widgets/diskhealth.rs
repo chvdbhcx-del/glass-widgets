@@ -5,7 +5,7 @@
 //! only the health verdict is real. Raw SMART attributes (DeviceIoControl) need admin and are NOT used.
 //! Nothing is drawn per frame: a new reading bumps `version()`; previews use sample data and start no process.
 use super::sysmon::fmt_size;
-use super::tasks::{diff_ids, edge_fade};
+use super::tasks::{diff_ids, edge_fade, unique_keys};
 use crate::registry::{Registry, WidgetDef};
 use crate::sys;
 use crate::widget::*;
@@ -113,19 +113,7 @@ fn grouped(n: u64) -> String {
 
 /// A unique glide key per disk: its name, with "#2", "#3" for a second and third disk of the same name.
 fn disk_keys(disks: &[Disk]) -> Vec<String> {
-    let mut seen: Vec<&str> = Vec::new();
-    disks
-        .iter()
-        .map(|d| {
-            let n = seen.iter().filter(|s| **s == d.name).count();
-            seen.push(&d.name);
-            if n == 0 {
-                d.name.clone()
-            } else {
-                format!("{}#{}", d.name, n + 1)
-            }
-        })
-        .collect()
+    unique_keys(disks.iter().map(|d| d.name.as_str()))
 }
 
 /// The verdict as a glidable number: healthy 0, warning 1, unhealthy 2, unknown 3.
