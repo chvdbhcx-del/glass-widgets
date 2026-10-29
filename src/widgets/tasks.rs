@@ -86,7 +86,7 @@ fn diff_ids(old: &[u64], new: &[u64]) -> (Vec<u64>, Vec<u64>) {
 }
 
 /// Row opacity at the (fractional) slot `y`: rows that glide past the last visible slot fade out.
-fn edge_fade(y: f32, rows: usize) -> f32 {
+pub(crate) fn edge_fade(y: f32, rows: usize) -> f32 {
     let last = rows as f32 - 1.0;
     if y <= last {
         1.0
