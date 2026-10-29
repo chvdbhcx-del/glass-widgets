@@ -81,8 +81,8 @@ fn shown(l: &[Task]) -> Vec<&Task> {
 // ================================================================ motion (pure plan)
 
 /// Which task ids enter and which leave between two lists.
-fn diff_ids(old: &[u64], new: &[u64]) -> (Vec<u64>, Vec<u64>) {
-    (new.iter().filter(|i| !old.contains(i)).copied().collect(), old.iter().filter(|i| !new.contains(i)).copied().collect())
+pub(crate) fn diff_ids<T: PartialEq + Clone>(old: &[T], new: &[T]) -> (Vec<T>, Vec<T>) {
+    (new.iter().filter(|i| !old.contains(i)).cloned().collect(), old.iter().filter(|i| !new.contains(i)).cloned().collect())
 }
 
 /// Row opacity at the (fractional) slot `y`: rows that glide past the last visible slot fade out.
