@@ -108,6 +108,15 @@ impl Gfx {
     /// Device on `adapter` (the GPU that owns the monitor we duplicate) or the default hardware adapter;
     /// falls back to WARP (software) when no hardware device can be created.
     pub fn new(adapter: Option<&IDXGIAdapter1>) -> Result<Gfx> {
+        Gfx::create(adapter, false)
+    }
+
+    /// A software (WARP) device: what the headless renderers and tests use, so they run the same on a machine without a GPU.
+    pub fn warp() -> Result<Gfx> {
+        Gfx::create(None, true)
+    }
+
+    fn create(adapter: Option<&IDXGIAdapter1>, warp_only: bool) -> Result<Gfx> {
         unsafe {
             let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
             let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0];
@@ -115,6 +124,7 @@ impl Gfx {
             let mut ctx: Option<ID3D11DeviceContext> = None;
             let mut warp = false;
             let hw = match adapter {
+                _ if warp_only => Err(windows::core::Error::empty()),
                 Some(a) => {
                     let a: IDXGIAdapter = a.cast()?;
                     D3D11CreateDevice(&a, D3D_DRIVER_TYPE_UNKNOWN, HMODULE::default(), flags, Some(&levels), D3D11_SDK_VERSION, Some(&mut dev), None, Some(&mut ctx))
@@ -122,7 +132,9 @@ impl Gfx {
                 None => D3D11CreateDevice(None::<&IDXGIAdapter>, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), flags, Some(&levels), D3D11_SDK_VERSION, Some(&mut dev), None, Some(&mut ctx)),
             };
             if hw.is_err() || dev.is_none() {
-                eprintln!("mswidgets: hardware D3D11 device failed ({:?}), using WARP", hw.err());
+                if !warp_only {
+                    eprintln!("mswidgets: hardware D3D11 device failed ({:?}), using WARP", hw.err());
+                }
                 warp = true;
                 dev = None;
                 ctx = None;

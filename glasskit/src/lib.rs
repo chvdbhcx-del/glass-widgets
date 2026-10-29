@@ -11,18 +11,29 @@
 //! Everything but `gfx`, `text::Res`, `icons::geometries`, `fonts`, `jobs` and the Win32 calls of `monitors` / `accent` is pure and unit-tested
 //! without a GPU. The crate has no dependency on the widgets app.
 pub mod accent;
+pub mod canvas;
 pub mod color;
+pub mod controls;
+pub mod ease;
+pub mod edit;
 pub mod fonts;
 pub mod geom;
 pub mod gfx;
 pub mod icons;
+pub mod input;
 pub mod jobs;
 pub mod lang;
+pub mod markdown;
 pub mod menu;
 pub mod monitors;
 pub mod motion;
+pub mod richtext;
+pub mod scroll;
+pub mod svgpath;
+pub mod testkit;
 pub mod text;
 pub mod textfield;
+pub mod theme;
 pub mod tz;
 
 pub use color::Color;
