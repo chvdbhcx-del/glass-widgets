@@ -78,7 +78,34 @@ fn shown(l: &[Task]) -> Vec<&Task> {
     v
 }
 
+// ================================================================ motion (pure plan)
+
+/// Which task ids enter and which leave between two lists.
+fn diff_ids(old: &[u64], new: &[u64]) -> (Vec<u64>, Vec<u64>) {
+    (new.iter().filter(|i| !old.contains(i)).copied().collect(), old.iter().filter(|i| !new.contains(i)).copied().collect())
+}
+
+/// Row opacity at the (fractional) slot `y`: rows that glide past the last visible slot fade out.
+fn edge_fade(y: f32, rows: usize) -> f32 {
+    let last = rows as f32 - 1.0;
+    if y <= last {
+        1.0
+    } else {
+        1.0 - crate::motion::smooth((y - last) / 0.7)
+    }
+}
+
+/// The id out of a glide key ("y:12" -> 12).
+fn key_id(k: &str) -> Option<u64> {
+    k.split_once(':')?.1.parse().ok()
+}
+
 // ================================================================ widget
+
+/// A deleted task on its way out: it keeps its slot and fades while the rows below glide up.
+struct Ghost {
+    task: Task,
+}
 
 #[derive(Default)]
 struct Tasks {
@@ -88,6 +115,19 @@ struct Tasks {
     started: bool,
     ver: u64,
     ask: Option<Pending<Option<String>>>,
+    /// per task id: "y:" slot (a task changing place glides), "a:" opacity (enters / leaves), "k:" done progress 0..1 (the circle
+    /// fills, the check draws itself, the line strikes the text), "s:" the S card's next-task fade
+    slots: GlideAnim,
+    /// "open" the count shown, "more" the opacity of the "+n" mark
+    vals: GlideAnim,
+    /// the order the glides were last aimed at (what a vanished task looked like is in `prev`)
+    prev: Vec<Task>,
+    ghosts: Vec<Ghost>,
+    s_next: Option<u64>,
+    /// a first order was set: from now on changes animate
+    primed: bool,
+    /// something is gliding: `draw` leaves the tasks out and `overlay` paints them (re-recorded when it starts and ends)
+    moving: bool,
 }
 
 fn sample() -> Vec<Task> {
@@ -104,6 +144,7 @@ fn sample() -> Vec<Task> {
 
 const ROW_H: f32 = 22.0;
 const BOX_R: f32 = 7.0;
+const ROWS: usize = 5;
 
 impl Tasks {
     fn init(&mut self, cx: &Cx) {
@@ -112,14 +153,62 @@ impl Tasks {
         }
         self.started = true;
         self.ver += 1;
+        self.slots = GlideAnim::smooth(0.4);
         if cx.preview {
             self.tasks = sample();
         } else {
-            self.reload();
+            self.reload(cx);
         }
+        self.retarget(cx);
     }
 
-    fn reload(&mut self) {
+    /// Aim every glide at the current list. The first call (and previews, reduced motion) jump; later calls animate: a new task enters,
+    /// a deleted one stays as a fading ghost, the others glide to their new rank, a ticked one draws its check and strikes its text.
+    fn retarget(&mut self, cx: &Cx) {
+        let view: Vec<Task> = shown(&self.tasks).into_iter().cloned().collect();
+        let (entering, leaving) = diff_ids(&self.prev.iter().map(|t| t.id).collect::<Vec<_>>(), &view.iter().map(|t| t.id).collect::<Vec<_>>());
+        let anim = self.primed && !cx.preview && !reduced_motion();
+        for id in &leaving {
+            self.ghosts.retain(|g| g.task.id != *id);
+            match self.prev.iter().find(|t| t.id == *id).filter(|_| anim) {
+                Some(t) => {
+                    self.ghosts.push(Ghost { task: t.clone() });
+                    self.slots.set(&format!("a:{id}"), 0.0, cx);
+                }
+                None => {
+                    for p in ["y", "a", "k", "s"] {
+                        self.slots.forget(&format!("{p}:{id}"));
+                    }
+                }
+            }
+        }
+        for (i, t) in view.iter().enumerate() {
+            self.ghosts.retain(|g| g.task.id != t.id);
+            let (y, a, k) = (format!("y:{}", t.id), format!("a:{}", t.id), format!("k:{}", t.id));
+            if anim && entering.contains(&t.id) {
+                self.slots.set_from(&y, i as f32 + 0.8, i as f32, cx);
+                self.slots.set_from(&a, 0.0, 1.0, cx);
+            } else {
+                self.slots.set(&y, i as f32, cx);
+                self.slots.set(&a, 1.0, cx);
+            }
+            self.slots.set(&k, if t.done { 1.0 } else { 0.0 }, cx);
+        }
+        let next = view.first().filter(|t| !t.done).map(|t| t.id);
+        if next != self.s_next {
+            if let Some(id) = next.filter(|_| anim) {
+                self.slots.start(&format!("s:{id}"), 0.0, 1.0, cx);
+            }
+            self.s_next = next;
+        }
+        self.vals.set("open", self.open_count() as f32, cx);
+        self.vals.set("more", if view.len() > ROWS { 1.0 } else { 0.0 }, cx);
+        self.prev = view;
+        self.primed = true;
+        cx.waker().wake(); // a click does not call `tick`: poke it so the glides start now
+    }
+
+    fn reload(&mut self, cx: &Cx) {
         let Some(p) = store_path("tasks.json") else { return };
         self.mtime = mtime(&p);
         let (list, corrupt) = match load_json(&p) {
@@ -134,11 +223,12 @@ impl Tasks {
             self.tasks = list;
             self.corrupt = corrupt;
             self.ver += 1;
+            self.retarget(cx);
         }
     }
 
     /// Read-modify-write on the fresh file; a corrupt file is never overwritten.
-    fn modify(&mut self, f: impl FnOnce(&mut Vec<Task>) -> bool) {
+    fn modify(&mut self, cx: &Cx, f: impl FnOnce(&mut Vec<Task>) -> bool) {
         let Some(p) = store_path("tasks.json") else { return };
         let mut list = match load_json(&p) {
             Load::Missing => Vec::new(),
@@ -160,6 +250,7 @@ impl Tasks {
             self.mtime = mtime(&p);
             self.corrupt = false;
             self.ver += 1;
+            self.retarget(cx);
         }
     }
 
@@ -173,9 +264,9 @@ impl Tasks {
         }
     }
 
-    /// The rect of row `i` (M) in card px.
-    fn row(c: Rect, i: usize) -> Rect {
-        Rect::new(c.x, c.y + 26.0 + i as f32 * ROW_H, c.w, ROW_H)
+    /// The rect of slot `y` (M, fractional while it glides) in card px.
+    fn row_at(c: Rect, y: f32) -> Rect {
+        Rect::new(c.x, c.y + 26.0 + y * ROW_H, c.w, ROW_H)
     }
     fn plus(c: Rect) -> Rect {
         Rect::new(c.right() - 20.0, c.y - 1.0, 20.0, 20.0)
@@ -184,13 +275,89 @@ impl Tasks {
     fn next_area(c: Rect) -> Rect {
         Rect::new(c.x, c.y + 70.0, c.w, c.h - 70.0)
     }
-    /// The task under the pointer: M = the row, S = the next open task.
+    /// The task under the pointer: M = the row it settles in, S = the next open task.
     fn hit(&self, size: Size, c: Rect, x: f32, y: f32) -> Option<u64> {
         let list = shown(&self.tasks);
         if size == Size::S {
             return Tasks::next_area(c).contains(x, y).then(|| list.first().filter(|t| !t.done).map(|t| t.id)).flatten();
         }
-        list.iter().take(5).enumerate().find(|(i, _)| Tasks::row(c, *i).inset_xy(-8.0, 0.0).contains(x, y)).map(|(_, t)| t.id)
+        list.iter().take(ROWS).enumerate().find(|(i, _)| Tasks::row_at(c, *i as f32).inset_xy(-8.0, 0.0).contains(x, y)).map(|(_, t)| t.id)
+    }
+
+    /// One M row at slot `y`: circle (fills, draws its check), text (fades to dim, struck by a growing line).
+    fn paint_row(cx: &Cx, c: Rect, t: &Task, y: f32, a: f32, k: f32) {
+        let a = a * edge_fade(y, ROWS);
+        if a <= 0.0 {
+            return;
+        }
+        let r = Tasks::row_at(c, y);
+        cx.with_opacity(a, |cx| {
+            let ctr = (r.x + BOX_R + 1.0, r.cy());
+            cx.circle_stroke(ctr, BOX_R - 0.75, 1.5, DIM.fade(1.0 - k));
+            if k > 0.0 {
+                cx.circle(ctr, BOX_R * crate::motion::smooth((k * 1.6).min(1.0)), accent());
+                let reveal = ((k - 0.35) / 0.65).clamp(0.0, 1.0); // the check is drawn left to right after the fill
+                if reveal > 0.0 {
+                    cx.clip(Rect::new(ctr.0 - 5.0, ctr.1 - 6.0, 10.0 * reveal, 12.0));
+                    cx.icon(Glyph::Check, Rect::new(ctr.0 - 5.0, ctr.1 - 5.0, 10.0, 10.0), WHITE);
+                    cx.pop_clip();
+                }
+            }
+            let tr = Rect::new(r.x + 24.0, r.y, r.w - 24.0, r.h);
+            cx.text(tr, &t.text, Style::BODY.ellipsis(), TEXT.mix(DIM, k));
+            if k > 0.0 {
+                let w = cx.measure(&t.text, Style::BODY, 0.0).0.min(tr.w);
+                cx.line((tr.x, r.cy() + 0.5), (tr.x + w * k, r.cy() + 0.5), 1.2, DIM);
+            }
+        });
+    }
+
+    /// Everything that moves: the count, the rows, the S card's next task. `draw` calls it when nothing glides, `overlay` while something does.
+    fn paint(&self, cx: &Cx) {
+        let c = cx.content();
+        let total = self.tasks.len();
+        if total == 0 && self.ghosts.is_empty() {
+            let msg = if self.corrupt { cx.t("Не удалось прочитать файл", "Cannot read the file") } else { cx.t("Нет задач", "No tasks") };
+            cx.icon(Glyph::CheckCircle, Rect::new(c.cx() - 18.0, c.y + 40.0, 36.0, 36.0), FAINT);
+            cx.text(Rect::new(c.x, c.y + 84.0, c.w, 20.0), msg, Style::BODY.center().ellipsis(), DIM);
+            return;
+        }
+        let open = self.vals.or("open", self.open_count() as f32).round() as usize;
+        match cx.size {
+            Size::M => {
+                cx.text(Rect::new(c.x + 62.0, c.y - 1.0, 70.0, 20.0), &format!("{open}/{total}"), Style::CAPTION.mono(), DIM);
+                let view = shown(&self.tasks);
+                for (i, t) in view.iter().enumerate() {
+                    let g = |p: &str, d: f32| self.slots.or(&format!("{p}:{}", t.id), d);
+                    Tasks::paint_row(cx, c, t, g("y", i as f32), g("a", 1.0), g("k", if t.done { 1.0 } else { 0.0 }));
+                }
+                for gh in &self.ghosts {
+                    let g = |p: &str, d: f32| self.slots.or(&format!("{p}:{}", gh.task.id), d);
+                    Tasks::paint_row(cx, c, &gh.task, g("y", 0.0), g("a", 0.0), g("k", if gh.task.done { 1.0 } else { 0.0 }));
+                }
+                let more = self.vals.or("more", 0.0);
+                if more > 0.0 {
+                    cx.text(Rect::new(c.right() - 60.0, c.bottom() - 12.0, 60.0, 12.0), &format!("+{}", total.saturating_sub(ROWS)), Style::CAPTION.right().mono(), FAINT.fade(more));
+                }
+            }
+            _ => {
+                let num = open.to_string();
+                cx.text(Rect::new(c.x, c.y + 22.0, c.w, 44.0), &num, Style::new(38.0, 300).mono(), TEXT);
+                let nw = cx.measure(&num, Style::new(38.0, 300).mono(), 0.0).0;
+                let cap = if self.open_count() == 0 { cx.t("всё сделано", "all done") } else { cx.t("осталось", "left") };
+                cx.text(Rect::new(c.x + nw + 8.0, c.y + 44.0, (c.w - nw - 8.0).max(10.0), 16.0), cap, Style::CAPTION.ellipsis(), DIM);
+                if let Some(t) = shown(&self.tasks).first().filter(|t| !t.done) {
+                    let a = Tasks::next_area(c);
+                    let f = self.slots.or(&format!("s:{}", t.id), 1.0); // the new next task rises in
+                    let mw = |s: &str| cx.measure(s, Style::BODY, 0.0).0;
+                    cx.with_opacity(f, |cx| {
+                        for (k, line) in wrap_lines(&t.text, 3, a.w, &mw).iter().enumerate() {
+                            cx.text(Rect::new(a.x, a.y + k as f32 * 17.0 + (1.0 - f) * 8.0, a.w, 17.0), line, Style::BODY.ellipsis(), TEXT);
+                        }
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -198,54 +365,18 @@ impl Widget for Tasks {
     fn draw(&mut self, cx: &mut Cx) -> Result<()> {
         self.init(cx);
         let c = cx.content();
-        let (open, total) = (self.open_count(), self.tasks.len());
         cx.text(Rect::new(c.x, c.y - 1.0, c.w - 26.0, 20.0), cx.t("Задачи", "Tasks"), Style::TITLE.ellipsis(), accent());
         cx.icon(Glyph::Plus, Tasks::plus(c).inset(2.0), accent());
-        if total == 0 {
-            let msg = if self.corrupt { cx.t("Не удалось прочитать файл", "Cannot read the file") } else { cx.t("Нет задач", "No tasks") };
-            cx.icon(Glyph::CheckCircle, Rect::new(c.cx() - 18.0, c.y + 40.0, 36.0, 36.0), FAINT);
-            cx.text(Rect::new(c.x, c.y + 84.0, c.w, 20.0), msg, Style::BODY.center().ellipsis(), DIM);
-            return Ok(());
+        if !self.moving {
+            self.paint(cx);
         }
-        let list = shown(&self.tasks);
-        match cx.size {
-            Size::M => {
-                cx.text(Rect::new(c.x + 62.0, c.y - 1.0, 70.0, 20.0), &format!("{open}/{total}"), Style::CAPTION.mono(), DIM);
-                for (i, t) in list.iter().take(5).enumerate() {
-                    let r = Tasks::row(c, i);
-                    let ctr = (r.x + BOX_R + 1.0, r.cy());
-                    if t.done {
-                        cx.circle(ctr, BOX_R, accent());
-                        cx.icon(Glyph::Check, Rect::new(ctr.0 - 5.0, ctr.1 - 5.0, 10.0, 10.0), WHITE);
-                    } else {
-                        cx.circle_stroke(ctr, BOX_R - 0.75, 1.5, DIM);
-                    }
-                    let more = if i == 4 && list.len() > 5 { 28.0 } else { 0.0 }; // room for the "+n" mark
-                    let tr = Rect::new(r.x + 24.0, r.y, r.w - 24.0 - more, r.h);
-                    cx.text(tr, &t.text, Style::BODY.ellipsis(), if t.done { DIM } else { TEXT });
-                    if t.done {
-                        let w = cx.measure(&t.text, Style::BODY, 0.0).0.min(tr.w);
-                        cx.line((tr.x, r.cy() + 0.5), (tr.x + w, r.cy() + 0.5), 1.2, DIM);
-                    }
-                }
-                if list.len() > 5 {
-                    cx.text(Rect::new(c.right() - 60.0, c.bottom() - 12.0, 60.0, 12.0), &format!("+{}", list.len() - 5), Style::CAPTION.right().mono(), FAINT);
-                }
-            }
-            _ => {
-                let num = open.to_string();
-                cx.text(Rect::new(c.x, c.y + 22.0, c.w, 44.0), &num, Style::new(38.0, 300).mono(), TEXT);
-                let nw = cx.measure(&num, Style::new(38.0, 300).mono(), 0.0).0;
-                let cap = if open == 0 { cx.t("всё сделано", "all done") } else { cx.t("осталось", "left") };
-                cx.text(Rect::new(c.x + nw + 8.0, c.y + 44.0, (c.w - nw - 8.0).max(10.0), 16.0), cap, Style::CAPTION.ellipsis(), DIM);
-                if let Some(t) = list.first().filter(|t| !t.done) {
-                    let a = Tasks::next_area(c);
-                    let mw = |s: &str| cx.measure(s, Style::BODY, 0.0).0;
-                    for (k, line) in wrap_lines(&t.text, 3, a.w, &mw).iter().enumerate() {
-                        cx.text(Rect::new(a.x, a.y + k as f32 * 17.0, a.w, 17.0), line, Style::BODY.ellipsis(), TEXT);
-                    }
-                }
-            }
+        Ok(())
+    }
+
+    /// The gliding part: rows at their fractional slots, the check being drawn, the fading ghosts.
+    fn overlay(&mut self, cx: &mut Cx) -> Result<()> {
+        if self.moving {
+            self.paint(cx);
         }
         Ok(())
     }
@@ -262,7 +393,7 @@ impl Widget for Tasks {
                     self.ask = None;
                     if let Some(s) = r {
                         let nm = now_ms(cx);
-                        self.modify(|l| add_task(l, &s, nm));
+                        self.modify(cx, |l| add_task(l, &s, nm));
                     }
                 }
                 None if !busy => self.ask = None,
@@ -270,7 +401,21 @@ impl Widget for Tasks {
             }
         }
         if store_path("tasks.json").is_some_and(|p| mtime(&p) != self.mtime) {
-            self.reload();
+            self.reload(cx);
+        }
+        let busy = self.slots.step(cx) | self.vals.step(cx);
+        if busy != self.moving {
+            self.moving = busy;
+            self.ver += 1; // `draw` takes the rows over again (or hands them to `overlay`)
+        }
+        if !busy && !self.ghosts.is_empty() {
+            self.ghosts.clear();
+            let ids: Vec<u64> = self.tasks.iter().map(|t| t.id).collect();
+            self.slots.retain(|k| key_id(k).is_some_and(|i| ids.contains(&i)));
+            self.ver += 1;
+        }
+        if busy {
+            return Tick::Fps(60); // rows glide, the check draws itself, the count counts
         }
         Tick::Poll(Duration::from_secs(5))
     }
@@ -292,8 +437,8 @@ impl Widget for Tasks {
         }
         let Some(id) = self.hit(cx.size, c, ev.x, ev.y) else { return false };
         match ev.button {
-            Button::Left => self.modify(|l| toggle_task(l, id)),
-            Button::Right => self.modify(|l| delete_task(l, id)),
+            Button::Left => self.modify(cx, |l| toggle_task(l, id)),
+            Button::Right => self.modify(cx, |l| delete_task(l, id)),
             _ => {}
         }
         true
@@ -352,5 +497,48 @@ mod tests {
         assert_eq!(tasks_from_json(&json!({"a": 1})), None);
         let v = json!([{"id": 1, "text": "ok"}, {"id": "x", "text": "bad id"}, {"id": 2, "text": "   "}, {"text": "no id"}, 5]);
         assert_eq!(tasks_from_json(&v), Some(vec![t(1, "ok", false)]));
+    }
+
+    #[test]
+    fn motion_plan() {
+        assert_eq!(diff_ids(&[1, 2, 3], &[2, 3, 4]), (vec![4], vec![1]));
+        assert_eq!(diff_ids(&[], &[1]), (vec![1], vec![]));
+        assert_eq!((edge_fade(0.0, 5), edge_fade(4.0, 5)), (1.0, 1.0));
+        assert!(edge_fade(4.3, 5) < 1.0 && edge_fade(4.3, 5) > 0.0);
+        assert_eq!(edge_fade(5.0, 5), 0.0);
+        assert_eq!((key_id("y:12"), key_id("open"), key_id("a:x")), (Some(12), None, None));
+    }
+
+    #[test]
+    fn ticked_task_glides_to_the_bottom_and_ends_exactly() {
+        use crate::motion::Glide;
+        let mut g = Glide::smooth(0.4);
+        // [a, b, c] with a ticked: the order becomes b, c, a; the done progress runs 0 -> 1
+        for (i, id) in [1, 2, 3].iter().enumerate() {
+            g.set(&format!("y:{id}"), i as f32);
+        }
+        g.set("k:1", 0.0);
+        g.set("y:1", 2.0);
+        g.set("y:2", 0.0);
+        g.set("y:3", 1.0);
+        g.set("k:1", 1.0);
+        let mut mid = None;
+        let mut n = 0;
+        while g.step(1.0 / 60.0) {
+            n += 1;
+            if n == 12 {
+                mid = g.get("y:1");
+            }
+            assert!(g.get("y:1").unwrap() >= 0.0 && g.get("y:1").unwrap() <= 2.0, "no overshoot");
+            assert!(n < 120);
+        }
+        assert!(mid.unwrap() > 0.0 && mid.unwrap() < 2.0, "it was gliding at 0.2 s");
+        assert_eq!((g.get("y:1"), g.get("y:2"), g.get("y:3"), g.get("k:1")), (Some(2.0), Some(0.0), Some(1.0), Some(1.0)));
+        // a task that enters: from below and transparent, at its slot and opaque in the end
+        g.set_from("y:4", 3.8, 3.0);
+        g.set_from("a:4", 0.0, 1.0);
+        assert_eq!((g.get("y:4"), g.get("a:4")), (Some(3.8), Some(0.0)));
+        while g.step(1.0 / 60.0) {}
+        assert_eq!((g.get("y:4"), g.get("a:4")), (Some(3.0), Some(1.0)));
     }
 }
