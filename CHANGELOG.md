@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.0] - 2026-10-29
 
 ### Changed
 - Motion in the newest widgets: Tasks (a ticked task draws its check and strikes its text, done tasks glide to the bottom, new ones slide in, deleted ones fade out, the count counts), Ping (numbers glide, the status dot cross-fades and pulses on a change, the sparkline flows, targets slide in and out), Disk health (verdicts cross-fade, numbers count, rows enter and leave), Downloads (numbers and speed bars glide, rows slide in and fade out) and Agents (rows glide when a session changes state, working dots breathe, the count badge pops). Settled cards go back to their slow poll; previews and reduced motion jump to the end state.
