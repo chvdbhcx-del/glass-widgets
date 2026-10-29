@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- Typography of the settings panel with Medeo Sans: labels keep a clear gap to their controls (a shared, wider label column in both columns), the segmented controls got the width this needs, the Reset look / Release page / Update now buttons and the strip's Back and Settings buttons have room for their text, the keyboard hint is a key chip with its description on one baseline, a single monitor shows a plain "One display" track instead of one stretched segment, the first rows of both columns share a centre line, and Russian shows a decimal comma in "7,5 px".
+
 ## [0.7.0] - 2026-10-29
 
 ### Changed

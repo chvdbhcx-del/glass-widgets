@@ -27,7 +27,7 @@ const PANEL_H: f32 = 430.0;
 const PANEL_R: f32 = 26.0;
 const SIDE_W: f32 = 200.0;
 const FOOT_H: f32 = 58.0;
-const TB_W: f32 = 552.0;
+const TB_W: f32 = 576.0;
 const TB_H: f32 = 40.0;
 const MINUS_R: f32 = 13.0;
 /// settings panel: width, height of the title + column header block above the first row, row pitch, footer height
@@ -35,6 +35,8 @@ const SET_W: f32 = 760.0;
 const SET_TOP: f32 = 74.0;
 const SET_ROW: f32 = 31.0;
 const SET_FOOT: f32 = 56.0;
+/// width of the label column of both settings columns: the longest label ("Источник стекла", "Corner roundness") plus a gap of at least 12 px to its control
+const SET_LABEL_W: f32 = 124.0;
 /// rows of the right column (segmented controls, the autostart switch)
 const OPT_ROW: f32 = 38.0;
 /// dim over the desktop while the settings panel is up (lighter than the edit mode's: the look is being judged)
@@ -1135,11 +1137,11 @@ impl Ui {
             label_glass: Rect::new(bar.x + 18.0, cy - 10.0, 50.0, 20.0),
             track: Rect::new(bar.x + 76.0, cy - 2.0, 136.0, 4.0),
             sep: Rect::new(bar.x + 232.0, cy - 9.0, 1.0, 18.0),
-            label_bg: Rect::new(bar.x + 248.0, cy - 10.0, 32.0, 20.0),
-            seg_live: Rect::new(bar.x + 286.0, cy - 12.0, 68.0, 24.0),
-            seg_plain: Rect::new(bar.x + 354.0, cy - 12.0, 68.0, 24.0),
-            sep2: Rect::new(bar.x + 442.0, cy - 9.0, 1.0, 18.0),
-            btn_settings: Rect::new(bar.x + 458.0, cy - 12.0, 78.0, 24.0),
+            label_bg: Rect::new(bar.x + 248.0, cy - 10.0, 38.0, 20.0), // wide enough for "Back" / "Фон" in Medeo Sans with a clear gap to the control
+            seg_live: Rect::new(bar.x + 296.0, cy - 12.0, 68.0, 24.0),
+            seg_plain: Rect::new(bar.x + 364.0, cy - 12.0, 68.0, 24.0),
+            sep2: Rect::new(bar.x + 452.0, cy - 9.0, 1.0, 18.0),
+            btn_settings: Rect::new(bar.x + 468.0, cy - 12.0, 92.0, 24.0),
         }
     }
 
@@ -1152,41 +1154,44 @@ impl Ui {
         let rh = ((p.bottom() - SET_FOOT - 12.0 - top) / n as f32).clamp(22.0, SET_ROW);
         // the right column squeezes its rows on a short screen (the panel is capped at the screen height) so the buttons stay above the footer
         let orow = ((p.bottom() - SET_FOOT - 14.0 - top - 40.0) / (Opt::ALL.len() + 2) as f32).clamp(28.0, OPT_ROW);
+        // the first control row of the right column sits on the centre line of the first slider row
+        let dy = (rh - 28.0) / 2.0;
         let lx = p.x + 22.0;
-        let lw = (p.w * 0.5).round();
-        let rx = p.x + lw + 60.0;
+        // the left column is as wide as its sliders need; the right one gets the rest, so its 3-segment controls keep ~60 px a segment
+        let lw = (p.w * 0.484).round();
+        let rx = p.x + lw + 46.0;
         let rw = p.right() - 22.0 - rx;
         let rows = (0..n)
             .map(|i| {
                 let row = Rect::new(lx, top + i as f32 * rh, lw, rh);
-                SliderRow { row, label: Rect::new(lx, row.y, 116.0, rh), track: Rect::new(lx + 124.0, row.cy() - 2.0, lw - 124.0 - 56.0 - 12.0, 4.0), value: Rect::new(row.right() - 54.0, row.y, 54.0, rh) }
+                SliderRow { row, label: Rect::new(lx, row.y, SET_LABEL_W, rh), track: Rect::new(lx + SET_LABEL_W + 12.0, row.cy() - 2.0, lw - SET_LABEL_W - 12.0 - 56.0 - 12.0, 4.0), value: Rect::new(row.right() - 54.0, row.y, 54.0, rh) }
             })
             .collect();
         let opts = Opt::ALL
             .iter()
             .enumerate()
             .map(|(k, o)| {
-                let y = top + k as f32 * orow;
-                OptRow { which: *o, label: Rect::new(rx, y, 112.0, 28.0), seg: Rect::new(rx + 112.0, y + 2.0, rw - 112.0, 24.0) }
+                let y = top + k as f32 * orow + dy;
+                OptRow { which: *o, label: Rect::new(rx, y, SET_LABEL_W, 28.0), seg: Rect::new(rx + SET_LABEL_W + 12.0, y + 2.0, rw - SET_LABEL_W - 12.0, 24.0) }
             })
             .collect();
-        let ay = top + Opt::ALL.len() as f32 * orow;
-        let cy = top + (Opt::ALL.len() + 1) as f32 * orow;
+        let ay = top + Opt::ALL.len() as f32 * orow + dy;
+        let cy = top + (Opt::ALL.len() + 1) as f32 * orow + dy;
         let by = top + (Opt::ALL.len() + 2) as f32 * orow + 10.0;
         let bw = ((rw - 8.0) * 0.6).round();
         let fy = p.bottom() - SET_FOOT + 13.0;
         let done = Rect::new(p.right() - 16.0 - 82.0, fy, 82.0, 30.0);
         let upd_btn = Rect::new(p.x + 22.0, fy, 176.0, 30.0);
-        let upd_dl = Rect::new(done.x - 8.0 - 112.0, fy, 112.0, 30.0);
-        let upd_page = Rect::new(upd_dl.x - 8.0 - 100.0, fy, 100.0, 30.0);
+        let upd_dl = Rect::new(done.x - 8.0 - 120.0, fy, 120.0, 30.0);
+        let upd_page = Rect::new(upd_dl.x - 8.0 - 116.0, fy, 116.0, 30.0);
         let sx = upd_btn.right() + 12.0;
         SetLay {
             panel: p,
             title: Rect::new(p.x + 22.0, p.y + 14.0, 300.0, 28.0),
-            look_hdr: Rect::new(lx, p.y + 48.0, 200.0, 20.0),
-            beh_hdr: Rect::new(rx, p.y + 48.0, 200.0, 20.0),
-            reset: Rect::new(lx + lw - 92.0, p.y + 46.0, 92.0, 24.0),
-            sep: Rect::new(p.x + lw + 30.0, p.y + 50.0, 0.8, p.h - SET_FOOT - 58.0),
+            look_hdr: Rect::new(lx, p.y + 46.0, lw - 124.0, 24.0),
+            beh_hdr: Rect::new(rx, p.y + 46.0, 200.0, 24.0),
+            reset: Rect::new(lx + lw - 108.0, p.y + 46.0, 108.0, 24.0),
+            sep: Rect::new(p.x + lw + 34.0, p.y + 50.0, 0.8, p.h - SET_FOOT - 58.0),
             rows,
             opts,
             auto_row: Rect::new(rx, ay, rw, 28.0),
@@ -1282,7 +1287,7 @@ impl Ui {
             _ => {
                 let d = &LOOK[i - 1];
                 match d.primary {
-                    "blur" => format!("{:.1} px", self.look.blur),
+                    "blur" => format!("{:.1} px", self.look.blur).replace('.', if self.lang == Lang::Ru { "," } else { "." }),
                     "radius_k" => format!("{:.0} px", Size::S.radius() * self.look.radius_k),
                     "card_k" => format!("{:.0}%", self.look.card_k * 100.0),
                     _ => {
@@ -2243,7 +2248,13 @@ impl Ui {
             let nums: Vec<String> = (1..=self.opt_n(Opt::Monitor)).map(|n| n.to_string()).collect();
             for o in &l.opts {
                 let Some((_, (ru, en), opts)) = labels.iter().find(|x| x.0 == o.which) else { continue };
-                cx.text(o.label, self.t(ru, en), Style::new(12.5, 500).ellipsis(), TEXT);
+                cx.text(Rect::new(o.label.x, o.label.y, o.label.w, o.label.h), self.t(ru, en), Style::new(12.5, 500).ellipsis(), TEXT);
+                if o.which == Opt::Monitor && nums.len() == 1 {
+                    // one monitor: nothing to choose, so no white pill: the same track as its neighbours with the plain fact in it
+                    cx.pill(o.seg, FILL);
+                    cx.text(o.seg, self.t("Один монитор", "One display"), Style::new(11.5, 500).center().ellipsis(), DIM);
+                    continue;
+                }
                 let items: Vec<&str> = if o.which == Opt::Monitor {
                     nums.iter().map(|n| n.as_str()).collect()
                 } else {
@@ -2261,8 +2272,8 @@ impl Ui {
             self.set_button(cx, l.edit_btn, self.t("Изменить виджеты", "Edit widgets"), K_EDIT, true, TEXT);
             self.set_button(cx, l.quit_btn, self.t("Выйти", "Quit"), K_QUIT, true, Color::rgb8(255, 105, 97));
 
-            // shortcuts
-            let k = Style::new(11.0, 400);
+            // shortcuts: a key chip and its description, the chips one width so the descriptions line up, both in one size so they share a baseline
+            let k = Style::new(11.0, 500);
             let lines = [
                 ("Ctrl+Alt+G", ("Настройки", "Settings")),
                 ("Ctrl+Alt+W", ("Изменить виджеты", "Edit widgets")),
@@ -2270,13 +2281,16 @@ impl Ui {
                 ("Esc", ("Закрыть (или щелчок снаружи)", "Close (or click outside)")),
                 ("Tab / ← →", ("Ползунки с клавиатуры", "Sliders by keyboard")),
             ];
+            let chip_w = lines.iter().map(|(keys, _)| cx.measure(keys, k.mono(), 0.0).0).fold(0.0, f32::max).ceil() + 14.0;
             for (n, (keys, (ru, en))) in lines.iter().enumerate() {
-                let r = Rect::new(l.keys.x, l.keys.y + n as f32 * 20.0, l.keys.w, 20.0);
+                let r = Rect::new(l.keys.x, l.keys.y + n as f32 * 24.0, l.keys.w, 22.0);
                 if r.bottom() > l.keys.bottom() + 0.5 {
                     break;
                 }
-                cx.text(Rect::new(r.x, r.y, 84.0, r.h), keys, k.mono(), FAINT);
-                cx.text(Rect::new(r.x + 90.0, r.y, r.w - 90.0, r.h), self.t(ru, en), k.ellipsis(), FAINT);
+                let chip = Rect::new(r.x, r.y, chip_w, r.h);
+                cx.rrect(chip, 6.0, Color::rgba(1.0, 1.0, 1.0, 0.09));
+                cx.text(chip, keys, k.mono().center(), DIM);
+                cx.text(Rect::new(chip.right() + 10.0, r.y, (r.right() - chip.right() - 10.0).max(0.0), r.h), self.t(ru, en), k.weight(400).ellipsis(), DIM);
             }
 
             // footer
@@ -2618,6 +2632,12 @@ mod tests {
             assert!(l.upd_btn.right() <= l.upd_status.x && l.upd_status.right() <= l.upd_page.x && l.upd_page.right() <= l.upd_dl.x && l.upd_dl.right() <= l.done.x && l.upd_status.w > 150.0);
             assert!(l.auto_row.bottom() <= l.check_row.y && l.check_row.bottom() <= l.edit_btn.y && l.edit_btn.bottom() <= l.foot.y && l.keys.bottom() <= l.foot.y + 0.01);
             assert!(l.edit_btn.right() <= l.quit_btn.x && l.rows.iter().all(|r| r.value.right() <= l.sep.x));
+            // typography: every label keeps a gap of at least 12 px to its control, both columns share the label width, a 3-segment control keeps >= 56 px a segment,
+            // and the first control row of the right column sits on the centre line of the first slider row
+            assert!(l.rows.iter().all(|r| r.track.x - r.label.right() >= 12.0 - 0.01 && r.label.w == SET_LABEL_W));
+            assert!(l.opts.iter().all(|o| o.seg.x - o.label.right() >= 12.0 - 0.01 && o.label.w == SET_LABEL_W && o.seg.w / 3.0 >= 56.0));
+            assert!((l.opts[0].seg.cy() - l.rows[0].row.cy()).abs() < 0.01, "{} vs {}", l.opts[0].seg.cy(), l.rows[0].row.cy());
+            assert!(l.reset.w >= 104.0 && l.reset.cy() == l.look_hdr.cy());
             // sliders: the track ends map to 0 / 1, the middle to ~0.5; a click in the label column does not move a slider
             let t = l.rows[3].track;
             assert_eq!(ui.set_hit(t.x, t.cy()), Hit::Look(3, 0.0));
