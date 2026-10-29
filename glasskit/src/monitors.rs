@@ -2,7 +2,7 @@
 //! process started, then pinned) | a 1-based number (display order of `order`: primary first, then left to right) | a device name
 //! (`\\.\DISPLAY2`, or the hardware key `<id>@<w>x<h>` of `MonInfo::key`, which `choice_for_position` stores: names and numbers move when a monitor is plugged in). A monitor that is gone falls back to the primary one
 //! and the choice is honoured again when it returns. Everything but `enumerate` is pure (synthetic monitor lists in the tests).
-use crate::widget::Lang;
+use crate::lang::Lang;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Mutex;

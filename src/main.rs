@@ -20,17 +20,13 @@ mod backdrop;
 mod calib;
 mod cards;
 mod fonts;
-mod gfx;
 mod glass;
 mod grid;
 mod host;
-mod icons;
 mod input;
 mod layout;
 mod liquid;
 mod menu;
-mod monitors;
-mod motion;
 mod net;
 mod prompt;
 mod registry;
@@ -39,11 +35,13 @@ mod sha256;
 mod spectrum;
 mod sys;
 mod tray;
-pub mod tz;
 mod ui;
 mod update;
 mod widget;
 mod widgets;
+
+// the shared toolkit (the rest of the crate keeps writing `crate::gfx::..`, `crate::motion::..`)
+pub use glasskit::{gfx, icons, monitors, motion, tz};
 
 use widget::{Now, Size};
 use windows::core::w;

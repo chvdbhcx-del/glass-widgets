@@ -8,30 +8,31 @@
 //!              (`cx.spawn`). Poll your `Pending` jobs here. The returned `Tick` is the next wake-up (static scene = `Tick::Never`).
 //!  * `mouse`   card-local logical px; return true when something visible changed.
 //! All drawing helpers take LOGICAL px (the framework applies the UI scale) in card-local coordinates (0,0 = top-left of the card).
-use crate::gfx::*;
-use crate::icons;
-use crate::motion::{Glide, HoverRamps};
 use crate::sys;
-pub use crate::icons::Glyph;
+pub use glasskit::color::*;
+pub use glasskit::geom::{Pt, Rect};
+pub use glasskit::icons::Glyph;
+pub use glasskit::jobs::Pending;
+pub use glasskit::lang::Lang;
+pub use glasskit::motion::{reduced_motion, AnimHost, GlideAnim, HoverAnim};
+pub use glasskit::text::{Align, Res, Style, VAlign};
+pub use glasskit::tz;
+pub use glasskit::Waker;
 pub use crate::sys::{decode_image_bytes, decode_image_file, http_get, powershell, run_hidden, spawn_hidden, Action, Decoded, MediaKey, PowerOp};
-pub use crate::tz;
 pub use serde_json::{json, Value};
+use glasskit::gfx::*;
+use glasskit::icons;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::mem::ManuallyDrop;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 pub use std::time::Duration;
-use std::time::Instant;
-use windows::core::{w, Interface, HSTRING};
+use windows::core::{Interface, HSTRING};
 use windows::Foundation::Numerics::Matrix3x2;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP};
+use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 pub use windows::core::Result;
 pub use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1 as Bitmap;
 
@@ -39,7 +40,6 @@ pub use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1 as Bitmap;
 pub const WM_WIDGET: u32 = WM_APP + 2;
 
 // ================================================================ sizes, ticks, time, input
-
 /// Widget size class: S = 1x1 cells (170x170), M = 2x1 (356x170), L = 2x2 (356x356) at UI scale 1.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Size {
@@ -90,157 +90,18 @@ impl Size {
     }
 }
 
-/// When the framework should wake the widget next. The loop sleeps (0 % CPU) when every visible card says `Never`/`Poll`.
-/// The system's "show animations" setting is off (SPI_GETCLIENTAREAANIMATION): motion goes straight to its end value.
-pub fn reduced_motion() -> bool {
-    unsafe {
-        let mut on = BOOL(1);
-        let ok = SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut BOOL as *mut std::ffi::c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).is_ok();
-        ok && !on.as_bool()
+// `reduced_motion`, `HoverAnim` and `GlideAnim` live in glasskit::motion (re-exported above); a `Cx` is their host.
+impl AnimHost for Cx<'_> {
+    fn is_preview(&self) -> bool {
+        self.preview
+    }
+    fn wake(&self) {
+        self.waker().wake();
+    }
+    fn request_frame(&self) {
+        Cx::request_frame(self);
     }
 }
-
-/// Hover ramps INSIDE a widget (a hot cell, a calendar day, a list row): `set` from `mouse` with the cell under the pointer, `step` from
-/// `tick` (it advances by the real time elapsed), `get(i)` 0..1 in `overlay`. Draw the highlight in `overlay`, not in `draw`: the glass
-/// layer is not re-rendered. While a ramp is moving `step` is true, so the widget returns `Tick::Fps(60)`; the frame after the last
-/// movement is requested here, then the widget goes back to its idle schedule and costs nothing. Reduced motion and previews jump to the end.
-pub struct HoverAnim {
-    ramps: HoverRamps,
-    hot: Option<usize>,
-    since: Option<Instant>,
-    t_in: f32,
-    t_out: f32,
-}
-impl Default for HoverAnim {
-    fn default() -> HoverAnim {
-        HoverAnim::new(0)
-    }
-}
-impl HoverAnim {
-    /// A hover ramp: 120 ms in, 180 ms out.
-    pub fn new(cells: usize) -> HoverAnim {
-        HoverAnim::timed(cells, 0.12, 0.18)
-    }
-
-    /// With its own times in seconds (a press: faster in, slower out).
-    pub fn timed(cells: usize, t_in: f32, t_out: f32) -> HoverAnim {
-        HoverAnim { ramps: HoverRamps::new(cells), hot: None, since: None, t_in, t_out }
-    }
-
-    /// The cell under the pointer (None = none). True when it changed; the ramps start moving on their own after that.
-    pub fn set(&mut self, hot: Option<usize>, cx: &Cx) -> bool {
-        if hot == self.hot {
-            return false;
-        }
-        self.hot = hot;
-        let h = hot;
-        if let Some(i) = hot {
-            self.ramps.ensure(i + 1);
-        }
-        if cx.preview || reduced_motion() {
-            self.ramps.snap(|i| Some(i) == h, |_| {}); // previews have no timers: show the end state
-        } else {
-            self.since.get_or_insert_with(Instant::now);
-            cx.waker().wake(); // mouse events do not call `tick`: poke it so the schedule starts now
-        }
-        true
-    }
-
-    /// Advance to now (call from `tick`). True while something is still moving: the widget returns `Tick::Fps(60)`.
-    pub fn step(&mut self, cx: &Cx) -> bool {
-        let Some(t0) = self.since else { return false };
-        let now = Instant::now();
-        let dt = now.saturating_duration_since(t0).as_secs_f32().min(0.05);
-        let h = self.hot;
-        self.ramps.step(dt, self.t_in, self.t_out, |i| Some(i) == h, |_| {});
-        if self.ramps.busy(|i| Some(i) == h) {
-            self.since = Some(now);
-            return true;
-        }
-        self.since = None;
-        cx.request_frame(); // the last position of the ramps
-        false
-    }
-
-    /// Eased hover amount of cell `i`.
-    pub fn get(&self, i: usize) -> f32 {
-        self.ramps.get(i)
-    }
-
-    /// Cell under the pointer.
-    pub fn hot(&self) -> Option<usize> {
-        self.hot
-    }
-}
-
-/// Values that glide INSIDE a widget, by key (a ring's fraction, a bar, the number beside it, a list row's slot). `set` the fresh
-/// targets from `tick`, then `step` (it advances by the real time elapsed); `get` / `or` in `overlay`. While anything moves `step` is true
-/// and the widget returns `Tick::Fps(60)`; after the last movement a frame is requested here and the widget goes back to its idle schedule
-/// (idle cost stays zero). A key seen for the first time starts at its target; previews and reduced motion jump straight to the end.
-pub struct GlideAnim {
-    g: Glide,
-    since: Option<Instant>,
-}
-impl Default for GlideAnim {
-    fn default() -> GlideAnim {
-        GlideAnim { g: Glide::default(), since: None }
-    }
-}
-impl GlideAnim {
-    /// Fixed-time ease-in-out moves of `secs` (a soft start and end): list rows changing places.
-    pub fn smooth(secs: f32) -> GlideAnim {
-        GlideAnim { g: Glide::smooth(secs), since: None }
-    }
-    pub fn set(&mut self, key: &str, target: f32, cx: &Cx) {
-        if cx.preview || reduced_motion() {
-            self.g.jump(key, target);
-        } else if self.g.set(key, target) {
-            self.since.get_or_insert_with(Instant::now);
-        }
-    }
-    /// Like `set`, with the value a new key starts from (a row sliding in).
-    pub fn set_from(&mut self, key: &str, from: f32, target: f32, cx: &Cx) {
-        if cx.preview || reduced_motion() {
-            self.g.jump(key, target);
-        } else if self.g.set_from(key, from, target) {
-            self.since.get_or_insert_with(Instant::now);
-        }
-    }
-    /// Restart `key` from `from` to `target` (a 0 -> 1 blend between the old and the new picture of a graph).
-    pub fn start(&mut self, key: &str, from: f32, target: f32, cx: &Cx) {
-        if cx.preview || reduced_motion() {
-            self.g.jump(key, target);
-        } else if self.g.start(key, from, target) {
-            self.since.get_or_insert_with(Instant::now);
-        }
-    }
-    /// Advance to now (call from `tick`, after the `set`s). True while something is still moving: `Tick::Fps(60)`.
-    pub fn step(&mut self, cx: &Cx) -> bool {
-        let Some(t0) = self.since else { return false };
-        let now = Instant::now();
-        if self.g.step(now.saturating_duration_since(t0).as_secs_f32().min(0.05)) {
-            self.since = Some(now);
-            return true;
-        }
-        self.since = None;
-        cx.request_frame(); // the last position
-        false
-    }
-    pub fn get(&self, key: &str) -> Option<f32> {
-        self.g.get(key)
-    }
-    /// The shown value, or `fallback` for a key that was never set.
-    pub fn or(&self, key: &str, fallback: f32) -> f32 {
-        self.g.get(key).unwrap_or(fallback)
-    }
-    pub fn forget(&mut self, key: &str) {
-        self.g.forget(key);
-    }
-    pub fn retain(&mut self, keep: impl FnMut(&str) -> bool) {
-        self.g.retain(keep);
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Tick {
     /// static scene: nothing until a mouse event, a finished job or `cx.request_frame()`
@@ -315,20 +176,6 @@ impl Now {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Lang {
-    Ru,
-    En,
-}
-impl Lang {
-    pub fn pick<'a>(self, ru: &'a str, en: &'a str) -> &'a str {
-        if self == Lang::Ru {
-            ru
-        } else {
-            en
-        }
-    }
-}
 const WD_RU: [&str; 7] = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"];
 const WD_EN: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const MO_RU: [&str; 12] = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
@@ -357,7 +204,6 @@ pub fn plural<'a>(n: u32, one: &'a str, few: &'a str, many: &'a str) -> &'a str 
         many
     }
 }
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Button {
     None,
@@ -409,317 +255,7 @@ impl MouseEv {
     }
 }
 
-// ================================================================ geometry & colour value types
-
-pub type Pt = (f32, f32);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Rect {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
-}
-impl Rect {
-    pub const fn new(x: f32, y: f32, w: f32, h: f32) -> Rect {
-        Rect { x, y, w, h }
-    }
-    pub fn right(&self) -> f32 {
-        self.x + self.w
-    }
-    pub fn bottom(&self) -> f32 {
-        self.y + self.h
-    }
-    pub fn cx(&self) -> f32 {
-        self.x + self.w / 2.0
-    }
-    pub fn cy(&self) -> f32 {
-        self.y + self.h / 2.0
-    }
-    pub fn center(&self) -> Pt {
-        (self.cx(), self.cy())
-    }
-    pub fn contains(&self, px: f32, py: f32) -> bool {
-        px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
-    }
-    pub fn inset(&self, d: f32) -> Rect {
-        Rect::new(self.x + d, self.y + d, (self.w - 2.0 * d).max(0.0), (self.h - 2.0 * d).max(0.0))
-    }
-    pub fn inset_xy(&self, dx: f32, dy: f32) -> Rect {
-        Rect::new(self.x + dx, self.y + dy, (self.w - 2.0 * dx).max(0.0), (self.h - 2.0 * dy).max(0.0))
-    }
-    pub fn offset(&self, dx: f32, dy: f32) -> Rect {
-        Rect::new(self.x + dx, self.y + dy, self.w, self.h)
-    }
-    /// same centre, new size
-    pub fn centered(&self, w: f32, h: f32) -> Rect {
-        Rect::new(self.cx() - w / 2.0, self.cy() - h / 2.0, w, h)
-    }
-    /// (top slice of height h, the rest)
-    pub fn cut_top(&self, h: f32) -> (Rect, Rect) {
-        let h = h.min(self.h);
-        (Rect::new(self.x, self.y, self.w, h), Rect::new(self.x, self.y + h, self.w, self.h - h))
-    }
-    /// (the rest, bottom slice of height h)
-    pub fn cut_bottom(&self, h: f32) -> (Rect, Rect) {
-        let h = h.min(self.h);
-        (Rect::new(self.x, self.y, self.w, self.h - h), Rect::new(self.x, self.bottom() - h, self.w, h))
-    }
-    /// (left slice of width w, the rest)
-    pub fn cut_left(&self, w: f32) -> (Rect, Rect) {
-        let w = w.min(self.w);
-        (Rect::new(self.x, self.y, w, self.h), Rect::new(self.x + w, self.y, self.w - w, self.h))
-    }
-    /// (the rest, right slice of width w)
-    pub fn cut_right(&self, w: f32) -> (Rect, Rect) {
-        let w = w.min(self.w);
-        (Rect::new(self.x, self.y, self.w - w, self.h), Rect::new(self.right() - w, self.y, w, self.h))
-    }
-    /// i-th of n equal rows (gap between rows)
-    pub fn row(&self, i: u32, n: u32, gap: f32) -> Rect {
-        let h = (self.h - gap * (n as f32 - 1.0)) / n as f32;
-        Rect::new(self.x, self.y + i as f32 * (h + gap), self.w, h)
-    }
-    /// i-th of n equal columns (gap between columns)
-    pub fn col(&self, i: u32, n: u32, gap: f32) -> Rect {
-        let w = (self.w - gap * (n as f32 - 1.0)) / n as f32;
-        Rect::new(self.x + i as f32 * (w + gap), self.y, w, self.h)
-    }
-}
-
-/// Straight (non-premultiplied) RGBA, 0..1.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Color {
-    pub r: f32,
-    pub g: f32,
-    pub b: f32,
-    pub a: f32,
-}
-impl Color {
-    pub const fn rgba(r: f32, g: f32, b: f32, a: f32) -> Color {
-        Color { r, g, b, a }
-    }
-    pub const fn rgb8(r: u8, g: u8, b: u8) -> Color {
-        Color { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a: 1.0 }
-    }
-    /// same colour, alpha replaced
-    pub const fn alpha(self, a: f32) -> Color {
-        Color { a, ..self }
-    }
-    /// same colour, alpha multiplied
-    pub fn fade(self, k: f32) -> Color {
-        Color { a: self.a * k, ..self }
-    }
-    pub fn mix(self, o: Color, t: f32) -> Color {
-        let l = |a: f32, b: f32| a + (b - a) * t;
-        Color { r: l(self.r, o.r), g: l(self.g, o.g), b: l(self.b, o.b), a: l(self.a, o.a) }
-    }
-    fn d2d(self) -> D2D1_COLOR_F {
-        col(self.r, self.g, self.b, self.a)
-    }
-}
-// palette (white text with alpha steps, like the Apple references)
-pub const TEXT: Color = Color::rgba(1.0, 1.0, 1.0, 0.96);
-pub const DIM: Color = Color::rgba(1.0, 1.0, 1.0, 0.70);
-/// secondary text that must stay readable on bright glass: titles of cards, units next to a big number
-pub const SUBTLE: Color = Color::rgba(1.0, 1.0, 1.0, 0.80);
-pub const FAINT: Color = Color::rgba(1.0, 1.0, 1.0, 0.50);
-/// subtle fills, ring tracks, bar tracks, separators
-pub const FILL: Color = Color::rgba(1.0, 1.0, 1.0, 0.18);
-pub const HAIR: Color = Color::rgba(1.0, 1.0, 1.0, 0.14);
-pub const RED: Color = Color::rgb8(255, 69, 58);
-pub const GREEN: Color = Color::rgb8(48, 209, 88);
-pub const BLUE: Color = Color::rgb8(10, 132, 255);
-pub const ORANGE: Color = Color::rgb8(255, 159, 10);
-pub const YELLOW: Color = Color::rgb8(255, 214, 10);
-pub const PINK: Color = Color::rgb8(255, 55, 95);
-pub const TEAL: Color = Color::rgb8(64, 200, 224);
-pub const PURPLE: Color = Color::rgb8(191, 90, 242);
-/// The DEFAULT accent (`accentMode` "blue"). Widgets must call `accent()` instead: it follows the wallpaper in `accentMode` "wallpaper".
-pub const ACCENT: Color = Color::rgb8(100, 190, 255); // lighter than BLUE: stays readable on grey, orange and pink glass
-const ACCENT_RGB: [u8; 3] = [100, 190, 255];
-static ACCENT_NOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(pack_rgb(ACCENT_RGB));
-const fn pack_rgb(c: [u8; 3]) -> u32 {
-    (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32
-}
-/// The accent colour of headers, links and highlights (calendar month, reminders title): `ACCENT`, or the colour taken from the wallpaper.
-pub fn accent() -> Color {
-    let v = ACCENT_NOW.load(Ordering::Relaxed);
-    Color::rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8)
-}
-/// Set the accent (`None` = the default blue); true when it changed (the cached card content has to be recorded again then).
-pub fn set_accent(rgb: Option<[u8; 3]>) -> bool {
-    ACCENT_NOW.swap(pack_rgb(rgb.unwrap_or(ACCENT_RGB)), Ordering::Relaxed) != pack_rgb(rgb.unwrap_or(ACCENT_RGB))
-}
-/// dark text on a light/cream fill (today circle, buttons)
-pub const INK: Color = Color::rgba(20.0 / 255.0, 20.0 / 255.0, 24.0 / 255.0, 0.92);
-pub const BLACK: Color = Color::rgba(0.0, 0.0, 0.0, 1.0);
-pub const WHITE: Color = Color::rgba(1.0, 1.0, 1.0, 1.0);
-
-// ================================================================ text styles
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Align {
-    Left,
-    Center,
-    Right,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum VAlign {
-    Top,
-    Middle,
-    Bottom,
-}
-/// A text style; start from a preset and chain builders: `Style::BODY.center().ellipsis()`.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Style {
-    pub size: f32,
-    pub weight: u16,
-    pub align: Align,
-    pub valign: VAlign,
-    /// tabular (fixed width) digits: clocks, counters, anything that changes in place
-    pub mono: bool,
-    /// single line cut with "..." instead of overflowing
-    pub ellipsis: bool,
-    /// wrap to the rect width (valign Top)
-    pub wrap: bool,
-    /// letter spacing in px
-    pub track: f32,
-}
-impl Style {
-    pub const fn new(size: f32, weight: u16) -> Style {
-        Style { size, weight, align: Align::Left, valign: VAlign::Middle, mono: false, ellipsis: false, wrap: false, track: 0.0 }
-    }
-    /// 13 semibold
-    pub const TITLE: Style = Style::new(13.0, 600);
-    /// 13 regular
-    pub const BODY: Style = Style::new(13.0, 400);
-    /// 11 regular
-    pub const CAPTION: Style = Style::new(11.0, 400);
-    /// 44 light (temperature, counters)
-    pub const BIG: Style = Style::new(44.0, 300);
-    /// 64 light
-    pub const HUGE: Style = Style::new(64.0, 300);
-    /// 13 regular with tabular digits
-    pub const MONO: Style = Style { mono: true, ..Style::new(13.0, 400) };
-    /// 12 bold, letter-spaced: month names, "ПЯТНИЦА", section headers (colour it ACCENT or RED, UPPERCASE the text yourself)
-    pub const LABEL: Style = Style { track: 0.48, ..Style::new(12.0, 700) };
-    pub const fn size(self, s: f32) -> Style {
-        Style { size: s, ..self }
-    }
-    pub const fn weight(self, w: u16) -> Style {
-        Style { weight: w, ..self }
-    }
-    pub const fn center(self) -> Style {
-        Style { align: Align::Center, ..self }
-    }
-    pub const fn right(self) -> Style {
-        Style { align: Align::Right, ..self }
-    }
-    pub const fn top(self) -> Style {
-        Style { valign: VAlign::Top, ..self }
-    }
-    pub const fn bottom(self) -> Style {
-        Style { valign: VAlign::Bottom, ..self }
-    }
-    pub const fn mono(self) -> Style {
-        Style { mono: true, ..self }
-    }
-    pub const fn ellipsis(self) -> Style {
-        Style { ellipsis: true, ..self }
-    }
-    pub const fn wrap(self) -> Style {
-        Style { wrap: true, valign: VAlign::Top, ..self }
-    }
-    pub const fn track(self, px: f32) -> Style {
-        Style { track: px, ..self }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Fit {
-    /// fill the rect, crop the overflow (photos, album art)
-    Cover,
-    /// whole image visible, letterboxed
-    Contain,
-    /// stretch to the rect
-    Stretch,
-}
-
-// ================================================================ shared drawing resources (one per scene)
-
-type FmtKey = (u32, u16, u8, u8, bool, bool);
-pub struct Res {
-    brush: ID2D1SolidColorBrush,
-    pub(crate) round: ID2D1StrokeStyle,
-    fams: [HSTRING; 3],
-    /// the bundled Nunito collection; `None` = system fonts (Segoe UI Variable)
-    coll: Option<IDWriteFontCollection>,
-    fmts: RefCell<HashMap<FmtKey, IDWriteTextFormat>>,
-    glyphs: RefCell<HashMap<Glyph, Rc<Vec<(ID2D1PathGeometry, icons::Paint)>>>>,
-    /// text layouts by (string, style, box): an overlay that repaints 60 times a second with unchanged text reuses them
-    lays: RefCell<HashMap<u64, LayEntry>>,
-    /// sparkline area gradients by (top, bottom, inked colour)
-    grads: RefCell<Vec<([u32; 6], ID2D1LinearGradientBrush)>>,
-}
-/// More than this many cached layouts / gradients: start over (bounded memory; a miss only costs one rebuild).
-const LAYOUT_CACHE: usize = 1024;
-const GRADIENT_CACHE: usize = 32;
-struct LayEntry {
-    s: String,
-    st: Style,
-    w: f32,
-    h: f32,
-    lay: IDWriteTextLayout,
-}
-/// Hash of everything a text layout depends on; `LayEntry` compares the real values, so a collision only costs a rebuild.
-fn lay_key(s: &str, st: Style, w: f32, h: f32) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut k = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut k);
-    (st.size.to_bits(), st.weight, st.align as u8, st.valign as u8, st.mono, st.ellipsis, st.wrap, st.track.to_bits(), w.to_bits(), h.to_bits()).hash(&mut k);
-    k.finish()
-}
-
-/// The installed optical-size cut of Segoe UI Variable (Small / Text / Display), else plain Segoe UI.
-fn family(gfx: &Gfx, cut: &str) -> HSTRING {
-    unsafe {
-        let mut coll: Option<IDWriteFontCollection> = None;
-        if gfx.dw.GetSystemFontCollection(&mut coll, false).is_ok() {
-            if let Some(c) = coll {
-                for name in [format!("Segoe UI Variable {cut}"), "Segoe UI".to_string()] {
-                    let (mut i, mut ok) = (0u32, windows::Win32::Foundation::BOOL(0));
-                    if c.FindFamilyName(&HSTRING::from(name.as_str()), &mut i, &mut ok).is_ok() && ok.as_bool() {
-                        return HSTRING::from(name.as_str());
-                    }
-                }
-            }
-        }
-        HSTRING::from("Segoe UI")
-    }
-}
-
-/// Optical size: captions use the Small cut, running text the Text cut, big numbers and headlines the Display cut.
-fn cut_for(size: f32) -> usize {
-    if size <= 11.5 {
-        0
-    } else if size <= 21.0 {
-        1
-    } else {
-        2
-    }
-}
-
-/// Nunito is lighter and rounder than Segoe: captions get one step more weight so they hold their contrast on glass.
-fn weight_for(size: f32, weight: u16, nunito: bool) -> i32 {
-    let w = weight as i32;
-    if nunito && size <= 12.5 {
-        (w + 100).min(700)
-    } else {
-        w
-    }
-}
-
+// ================================================================ colour tint (accentScope "all")
 /// `accentScope` "all" (Apple's Tinted icon and widget style): every colour a card draws becomes the accent, as bright as the colour was (white text =
 /// the accent lightened a little, a green ring = a half-bright accent); alpha is kept, the red / orange warning colours keep their meaning.
 static TINT: AtomicBool = AtomicBool::new(false);
@@ -751,443 +287,19 @@ fn tinted(c: Color, light: bool) -> Color {
         Color::rgba(r * v, g * v, b * v, c.a)
     }
 }
-
-/// The type scale of the cards (px). Widgets ask for the size they want (and fit loops step through fractions: 14.276, 11.5, 9.5...); every request
-/// snaps to the nearest step so the whole desk shares one hierarchy: caption 11, small 12, body 13, emphasis 15, headline 17, then the number sizes.
-/// `MSW_TEXT_SCALE=off` keeps the requested sizes.
-const TYPE_SCALE: [f32; 15] = [10.0, 11.0, 12.0, 13.0, 15.0, 17.0, 20.0, 24.0, 28.0, 34.0, 40.0, 46.0, 54.0, 64.0, 76.0];
-
-fn snap_size(size: f32) -> f32 {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *OFF.get_or_init(|| std::env::var("MSW_TEXT_SCALE").is_ok_and(|v| v == "off")) || size <= 0.0 {
-        return size;
-    }
-    let mut best = TYPE_SCALE[0];
-    for &t in &TYPE_SCALE {
-        // ties go up: 11.5 -> 12, 12.5 -> 13
-        if (t - size).abs() <= (best - size).abs() {
-            best = t;
-        }
-    }
-    if size > TYPE_SCALE[TYPE_SCALE.len() - 1] { size } else { best }
-}
-
 /// `MSW_TEXT_LINT` is set: every `Cx::text` logs its geometry (a developer aid, see tools/text-lint.py).
 fn text_lint() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MSW_TEXT_LINT").is_some())
 }
-
-/// Size-dependent tracking in px (SF-like): small text opens up a little, large text tightens.
-fn auto_track(size: f32) -> f32 {
-    match size {
-        s if s <= 11.5 => 0.1,
-        s if s <= 15.0 => 0.0,
-        s if s <= 21.0 => -0.006 * s,
-        s if s <= 36.0 => -0.012 * s,
-        s => -0.016 * s,
-    }
-}
-
-impl Res {
-    pub fn new(gfx: &Gfx) -> Result<Res> {
-        unsafe {
-            let sp = D2D1_STROKE_STYLE_PROPERTIES1 {
-                startCap: D2D1_CAP_STYLE_ROUND,
-                endCap: D2D1_CAP_STYLE_ROUND,
-                dashCap: D2D1_CAP_STYLE_ROUND,
-                lineJoin: D2D1_LINE_JOIN_ROUND,
-                miterLimit: 4.0,
-                dashStyle: D2D1_DASH_STYLE_SOLID,
-                dashOffset: 0.0,
-                transformType: D2D1_STROKE_TRANSFORM_TYPE_NORMAL,
-            };
-            let round: ID2D1StrokeStyle = gfx.d2d.CreateStrokeStyle(&sp, None)?.cast()?;
-            let coll = crate::fonts::collection(&gfx.dw);
-            let fams = if coll.is_some() { std::array::from_fn(|_| HSTRING::from(crate::fonts::family())) } else { [family(gfx, "Small"), family(gfx, "Text"), family(gfx, "Display")] };
-            Ok(Res {
-                brush: gfx.dc.CreateSolidColorBrush(&col(1.0, 1.0, 1.0, 1.0), None)?,
-                round,
-                fams,
-                coll,
-                fmts: RefCell::new(HashMap::new()),
-                glyphs: RefCell::new(HashMap::new()),
-                lays: RefCell::new(HashMap::new()),
-                grads: RefCell::new(Vec::new()),
-            })
-        }
-    }
-
-    fn format(&self, gfx: &Gfx, st: Style) -> Result<IDWriteTextFormat> {
-        let st = Style { size: snap_size(st.size), ..st };
-        let key: FmtKey = ((st.size * 10.0) as u32, st.weight, st.align as u8, st.valign as u8, st.wrap, st.ellipsis);
-        if let Some(f) = self.fmts.borrow().get(&key) {
-            return Ok(f.clone());
-        }
-        unsafe {
-            let f = gfx.dw.CreateTextFormat(&self.fams[cut_for(st.size)], self.coll.as_ref(), DWRITE_FONT_WEIGHT(weight_for(st.size, st.weight, self.coll.is_some() && crate::fonts::family() == "Nunito")), DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, st.size, w!("ru-ru"))?;
-            f.SetTextAlignment(match st.align {
-                Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
-                Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
-                Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
-            })?;
-            f.SetParagraphAlignment(match st.valign {
-                VAlign::Top => DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
-                VAlign::Middle => DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-                VAlign::Bottom => DWRITE_PARAGRAPH_ALIGNMENT_FAR,
-            })?;
-            f.SetWordWrapping(if st.wrap { DWRITE_WORD_WRAPPING_WRAP } else { DWRITE_WORD_WRAPPING_NO_WRAP })?;
-            if st.wrap {
-                // multi-line text breathes: 1.32 line height instead of the font's tight default
-                let lh = (st.size * 1.32).round();
-                f.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, lh, (lh * 0.8).round())?;
-            }
-            if st.ellipsis {
-                let sign = gfx.dw.CreateEllipsisTrimmingSign(&f)?;
-                f.SetTrimming(&DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 }, &sign)?;
-            }
-            self.fmts.borrow_mut().insert(key, f.clone());
-            Ok(f)
-        }
-    }
-
-    fn glyph(&self, gfx: &Gfx, g: Glyph) -> Result<Rc<Vec<(ID2D1PathGeometry, icons::Paint)>>> {
-        if let Some(v) = self.glyphs.borrow().get(&g) {
-            return Ok(v.clone());
-        }
-        let v = Rc::new(icons::geometries(&gfx.d2d, g)?);
-        self.glyphs.borrow_mut().insert(g, v.clone());
-        Ok(v)
-    }
-}
-
-// ================================================================ background jobs
-
-/// Mailbox for the result of a background job started with `cx.spawn`. Poll it with `take()` from `tick`.
-pub struct Pending<T>(Arc<PendingInner<T>>);
-struct PendingInner<T> {
-    val: Mutex<Option<T>>,
-    busy: AtomicBool,
-}
-impl<T> Clone for Pending<T> {
-    fn clone(&self) -> Self {
-        Pending(self.0.clone())
-    }
-}
-impl<T> Default for Pending<T> {
-    fn default() -> Self {
-        Pending(Arc::new(PendingInner { val: Mutex::new(None), busy: AtomicBool::new(false) }))
-    }
-}
-impl<T> Pending<T> {
-    /// the finished result (once), or None while running / not started / the job panicked
-    pub fn take(&self) -> Option<T> {
-        self.0.val.lock().ok().and_then(|mut g| g.take())
-    }
-    /// a job is running right now
-    pub fn busy(&self) -> bool {
-        self.0.busy.load(Ordering::Relaxed)
-    }
-}
-
-/// Wakes the UI thread for one card from any thread. Cheap to clone.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Waker {
-    pub hwnd: isize,
-    pub idx: usize,
-}
-impl Waker {
-    pub fn wake(&self) {
-        if self.hwnd != 0 {
-            unsafe {
-                let _ = PostMessageW(HWND(self.hwnd as *mut _), WM_WIDGET, WPARAM(self.idx), LPARAM(0));
-            }
-        }
-    }
-}
-
-/// The worker threads behind `Cx::spawn`. A thread per job (the old way) meant a few dozen thread creations per second on a busy desk, and the
-/// NVIDIA user-mode driver keeps ~192 B per thread it has ever seen (the 0.5.10 memory growth). Now: up to `core` workers, created on demand and
-/// kept; jobs run in submission order; a job that blocks (curl, a prompt, a sleeping disk) is noticed after `slow` and then an extra worker is
-/// added so the jobs queued behind it never wait for it (the extras leave after a quiet spell, `max` bounds them).
-mod jobpool {
-    use std::collections::{HashMap, VecDeque};
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
-    use std::time::{Duration, Instant};
-
-    pub type Job = Box<dyn FnOnce() + Send + 'static>;
-
-    struct State {
-        queue: VecDeque<Job>,
-        /// live worker threads / of them waiting for a job
-        workers: usize,
-        idle: usize,
-        /// worker id -> when its current job started
-        running: HashMap<u64, Instant>,
-        next_id: u64,
-        supervisor: bool,
-    }
-    struct Inner {
-        st: Mutex<State>,
-        /// workers wait here for jobs, the supervisor here for a non-empty queue
-        work: Condvar,
-        watch: Condvar,
-        core: usize,
-        max: usize,
-        slow: Duration,
-        cap: usize,
-    }
-    pub struct Pool(Arc<Inner>);
-
-    fn lock(m: &Mutex<State>) -> MutexGuard<'_, State> {
-        m.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// The pool every `Cx::spawn` uses: 4 permanent workers, up to 16 while jobs block, 256 queued jobs.
-    pub fn global() -> &'static Pool {
-        static P: OnceLock<Pool> = OnceLock::new();
-        P.get_or_init(|| Pool::new(4, 16, Duration::from_millis(250), 256))
-    }
-
-    impl Pool {
-        pub fn new(core: usize, max: usize, slow: Duration, cap: usize) -> Pool {
-            let st = State { queue: VecDeque::new(), workers: 0, idle: 0, running: HashMap::new(), next_id: 0, supervisor: false };
-            Pool(Arc::new(Inner { st: Mutex::new(st), work: Condvar::new(), watch: Condvar::new(), core: core.max(1), max: max.max(core.max(1)), slow, cap }))
-        }
-
-        /// Queue `job`; false = not accepted (queue full or no thread could be created), the job is dropped.
-        pub fn submit(&self, job: Job) -> bool {
-            let inner = &self.0;
-            let mut st = lock(&inner.st);
-            if st.queue.len() >= inner.cap {
-                return false;
-            }
-            st.queue.push_back(job);
-            if st.queue.len() > st.idle && st.workers < inner.core && !spawn_worker(inner, &mut st) && st.workers == 0 {
-                st.queue.pop_back();
-                return false;
-            }
-            if st.idle > 0 {
-                inner.work.notify_one();
-            } else if st.workers >= inner.core {
-                if !st.supervisor {
-                    let i2 = inner.clone();
-                    st.supervisor = std::thread::Builder::new().name("widget-job-watch".into()).spawn(move || supervise(i2)).is_ok();
-                }
-                inner.watch.notify_one();
-            }
-            true
-        }
-
-        #[cfg(test)]
-        pub fn workers(&self) -> usize {
-            lock(&self.0.st).workers
-        }
-    }
-
-    fn spawn_worker(inner: &Arc<Inner>, st: &mut State) -> bool {
-        let (i2, id) = (inner.clone(), st.next_id);
-        st.next_id += 1;
-        let ok = std::thread::Builder::new().name("widget-job".into()).spawn(move || worker(i2, id)).is_ok();
-        if ok {
-            st.workers += 1;
-        }
-        ok
-    }
-
-    /// A thread that ends takes its COM apartment with it; a pooled one must not carry the state of one job (STA / MTA, init counts) into the next.
-    fn reset_com() {
-        use windows::Win32::System::Com::{CoGetApartmentType, CoUninitialize, APTTYPE, APTTYPEQUALIFIER, APTTYPEQUALIFIER_IMPLICIT_MTA};
-        unsafe {
-            for _ in 0..16 {
-                let (mut t, mut q) = (APTTYPE::default(), APTTYPEQUALIFIER::default());
-                if CoGetApartmentType(&mut t, &mut q).is_err() || q == APTTYPEQUALIFIER_IMPLICIT_MTA {
-                    break;
-                }
-                CoUninitialize();
-            }
-        }
-    }
-
-    fn worker(inner: Arc<Inner>, id: u64) {
-        let mut st = lock(&inner.st);
-        loop {
-            if let Some(job) = st.queue.pop_front() {
-                st.running.insert(id, Instant::now());
-                drop(st);
-                let _ = catch_unwind(AssertUnwindSafe(job)); // a panicking job must not take the worker down
-                reset_com();
-                st = lock(&inner.st);
-                st.running.remove(&id);
-                continue;
-            }
-            st.idle += 1;
-            let extra = st.workers > inner.core;
-            if extra {
-                let (g, t) = inner.work.wait_timeout(st, Duration::from_secs(3)).unwrap_or_else(|e| e.into_inner());
-                st = g;
-                st.idle -= 1;
-                if t.timed_out() && st.queue.is_empty() && st.workers > inner.core {
-                    st.workers -= 1;
-                    return;
-                }
-            } else {
-                st = inner.work.wait(st).unwrap_or_else(|e| e.into_inner());
-                st.idle -= 1;
-            }
-        }
-    }
-
-    /// While jobs wait and every worker is busy, one of them for longer than `slow`: add a worker (up to `max`).
-    fn supervise(inner: Arc<Inner>) {
-        let mut st = lock(&inner.st);
-        loop {
-            while st.queue.is_empty() {
-                st = inner.watch.wait(st).unwrap_or_else(|e| e.into_inner());
-            }
-            let stuck = st.running.values().any(|t| t.elapsed() >= inner.slow);
-            if st.idle == 0 && stuck && st.workers < inner.max {
-                spawn_worker(&inner, &mut st);
-            }
-            st = inner.watch.wait_timeout(st, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::mpsc;
-
-        fn pool(core: usize, max: usize, slow_ms: u64, cap: usize) -> Pool {
-            Pool::new(core, max, Duration::from_millis(slow_ms), cap)
-        }
-
-        #[test]
-        fn jobs_run_in_order_and_results_arrive() {
-            let p = pool(1, 1, 250, 256);
-            let (tx, rx) = mpsc::channel();
-            for i in 0..200 {
-                let tx = tx.clone();
-                assert!(p.submit(Box::new(move || tx.send(i).unwrap())));
-            }
-            let got: Vec<i32> = (0..200).map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
-            assert_eq!(got, (0..200).collect::<Vec<_>>(), "one worker = strict submission order");
-        }
-
-        #[test]
-        fn a_panicking_job_does_not_kill_the_pool() {
-            let p = pool(2, 2, 250, 256);
-            for _ in 0..10 {
-                assert!(p.submit(Box::new(|| panic!("job panic (expected in this test)"))));
-            }
-            let (tx, rx) = mpsc::channel();
-            for i in 0..20 {
-                let tx = tx.clone();
-                assert!(p.submit(Box::new(move || tx.send(i).unwrap())));
-            }
-            let mut got: Vec<i32> = (0..20).map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
-            got.sort();
-            assert_eq!(got, (0..20).collect::<Vec<_>>());
-            assert_eq!(p.workers(), 2, "both workers survived ten panics");
-        }
-
-        fn process_threads() -> usize {
-            use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
-            use windows::Win32::System::Threading::GetCurrentProcessId;
-            unsafe {
-                let pid = GetCurrentProcessId();
-                let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) else { return 0 };
-                let mut e = THREADENTRY32 { dwSize: std::mem::size_of::<THREADENTRY32>() as u32, ..Default::default() };
-                let (mut n, mut ok) = (0, Thread32First(snap, &mut e).is_ok());
-                while ok {
-                    n += (e.th32OwnerProcessID == pid) as usize;
-                    ok = Thread32Next(snap, &mut e).is_ok();
-                }
-                let _ = windows::Win32::Foundation::CloseHandle(snap);
-                n
-            }
-        }
-
-        #[test]
-        fn many_jobs_do_not_create_many_threads() {
-            let p = pool(4, 16, 250, 4096);
-            let before = process_threads();
-            let ids = Arc::new(Mutex::new(std::collections::HashSet::new()));
-            let done = Arc::new(AtomicUsize::new(0));
-            for _ in 0..3000 {
-                while !p.submit(Box::new({
-                    let (ids, done) = (ids.clone(), done.clone());
-                    move || {
-                        ids.lock().unwrap().insert(std::thread::current().id());
-                        done.fetch_add(1, Ordering::SeqCst);
-                    }
-                })) {
-                    std::thread::sleep(Duration::from_millis(1)); // queue full: wait for the workers
-                }
-            }
-            let t0 = Instant::now();
-            while done.load(Ordering::SeqCst) < 3000 && t0.elapsed() < Duration::from_secs(10) {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            assert_eq!(done.load(Ordering::SeqCst), 3000);
-            let distinct = ids.lock().unwrap().len();
-            let after = process_threads();
-            println!("3000 jobs ran on {distinct} threads (workers {}); process threads {before} -> {after} (other tests run in parallel); a thread per job would have been 3000", p.workers());
-            assert!(distinct <= 4, "{distinct} threads ran 3000 quick jobs");
-            assert_eq!(p.workers(), 4);
-        }
-
-        #[test]
-        fn a_blocking_job_does_not_starve_the_others() {
-            let p = pool(2, 8, 80, 256);
-            let (tx, rx) = mpsc::channel();
-            // both permanent workers block for 700 ms (a hung download) ...
-            for _ in 0..2 {
-                let tx = tx.clone();
-                assert!(p.submit(Box::new(move || {
-                    std::thread::sleep(Duration::from_millis(700));
-                    tx.send("slow").unwrap();
-                })));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-            // ... a quick job queued behind them still runs long before they end
-            let t0 = Instant::now();
-            let tx2 = tx.clone();
-            assert!(p.submit(Box::new(move || tx2.send("quick").unwrap())));
-            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "quick");
-            assert!(t0.elapsed() < Duration::from_millis(500), "the quick job waited {:?}", t0.elapsed());
-            assert!(p.workers() >= 3 && p.workers() <= 8);
-            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "slow");
-            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "slow");
-        }
-
-        #[test]
-        fn the_queue_and_the_extra_workers_are_bounded() {
-            let p = pool(2, 4, 30, 5);
-            let gate = Arc::new((Mutex::new(false), Condvar::new()));
-            let mut accepted = 0;
-            for _ in 0..40 {
-                let gate = gate.clone();
-                if p.submit(Box::new(move || {
-                    let (m, c) = &*gate;
-                    let mut open = m.lock().unwrap();
-                    while !*open {
-                        open = c.wait(open).unwrap();
-                    }
-                })) {
-                    accepted += 1;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            std::thread::sleep(Duration::from_millis(300));
-            assert!(p.workers() <= 4, "workers {}", p.workers());
-            assert!(accepted <= 4 + 5, "accepted {accepted}: 4 running + a queue of 5 at most");
-            *gate.0.lock().unwrap() = true;
-            gate.1.notify_all();
-        }
-    }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fit {
+    /// fill the rect, crop the overflow (photos, album art)
+    Cover,
+    /// whole image visible, letterboxed
+    Contain,
+    /// stretch to the rect
+    Stretch,
 }
 
 // ================================================================ the widget trait
@@ -1360,27 +472,10 @@ impl<'a> Cx<'a> {
     /// Run `job` on a worker thread (HTTP, PowerShell, WMI, file scans); when it finishes the UI thread wakes and calls `tick`,
     /// where you `take()` the result. In preview mode nothing runs. The job must not touch Direct2D (UI thread only).
     pub fn spawn<T: Send + 'static>(&self, job: impl FnOnce() -> T + Send + 'static) -> Pending<T> {
-        let p = Pending::<T>::default();
         if self.preview {
-            return p;
+            return Pending::default();
         }
-        let (inner, waker) = (p.0.clone(), self.waker);
-        inner.busy.store(true, Ordering::Relaxed);
-        // a pool worker runs it (see `jobpool`): the same body as the old per-job thread, in submission order
-        let queued = jobpool::global().submit(Box::new(move || {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-            if let Ok(v) = r {
-                if let Ok(mut g) = inner.val.lock() {
-                    *g = Some(v);
-                }
-            }
-            inner.busy.store(false, Ordering::Relaxed);
-            waker.wake();
-        }));
-        if !queued {
-            p.0.busy.store(false, Ordering::Relaxed);
-        }
-        p
+        glasskit::jobs::spawn(self.waker, job)
     }
     /// Ask the user for a line of text (a glass panel on the host's canvas next to the cursor, with its own text field; Enter = OK, Esc = cancel;
     /// `multiline`: Ctrl+Enter; the Win32 popup of input.rs only when the host cannot show the panel).
@@ -1489,8 +584,8 @@ impl<'a> Cx<'a> {
         }
     }
     fn brush(&self, c: Color) -> &ID2D1SolidColorBrush {
-        unsafe { self.res.brush.SetColor(&self.ink(c).d2d()) };
-        &self.res.brush
+        unsafe { self.res.brush().SetColor(&self.ink(c).d2d()) };
+        self.res.brush()
     }
     fn set_tf(&self, m: Matrix3x2) {
         self.cur.set(m);
@@ -1499,42 +594,7 @@ impl<'a> Cx<'a> {
 
     /// The (cached) layout of `s`; callers must not modify it.
     fn layout(&self, s: &str, st: Style, w: f32, h: f32) -> Result<IDWriteTextLayout> {
-        let (w, h) = (w.max(0.0), h.max(0.0));
-        let key = lay_key(s, st, w, h);
-        if let Some(e) = self.res.lays.borrow().get(&key) {
-            if e.s == s && e.st == st && e.w == w && e.h == h {
-                return Ok(e.lay.clone());
-            }
-        }
-        let lay = self.build_layout(s, st, w, h)?;
-        let mut m = self.res.lays.borrow_mut();
-        if m.len() >= LAYOUT_CACHE {
-            m.clear();
-        }
-        m.insert(key, LayEntry { s: s.to_string(), st, w, h, lay: lay.clone() });
-        Ok(lay)
-    }
-    fn build_layout(&self, s: &str, st: Style, w: f32, h: f32) -> Result<IDWriteTextLayout> {
-        let f = self.res.format(self.gfx, st)?;
-        let wide: Vec<u16> = s.encode_utf16().collect();
-        unsafe {
-            let lay = self.gfx.dw.CreateTextLayout(&wide, &f, w, h)?;
-            let range = DWRITE_TEXT_RANGE { startPosition: 0, length: wide.len() as u32 };
-            let track = if st.track != 0.0 { st.track } else { auto_track(st.size) };
-            if track != 0.0 {
-                if let Ok(l1) = lay.cast::<IDWriteTextLayout1>() {
-                    let _ = l1.SetCharacterSpacing(0.0, track, 0.0, range);
-                }
-            }
-            // tabular figures for numbers that change in place, but not at display sizes: a tabular "9,0" at 40 px has wide holes around the comma, and nothing jitters at that size anyway
-            if let Ok(t) = self.gfx.dw.CreateTypography() {
-                if st.mono && st.size < 36.0 {
-                    let _ = t.AddFontFeature(DWRITE_FONT_FEATURE { nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, parameter: 1 });
-                }
-                let _ = lay.SetTypography(&t, range);
-            }
-            Ok(lay)
-        }
+        self.res.layout(self.gfx, s, st, w, h)
     }
 
     /// Text inside `r` (DirectWrite, Segoe UI Variable). Colour is a palette constant (`TEXT`, `DIM`, `FAINT`, `ACCENT`...).
@@ -1582,7 +642,7 @@ impl<'a> Cx<'a> {
     /// Outlined rounded rectangle (stroke centred on the edge).
     pub fn rrect_stroke(&self, r: Rect, rad: f32, width: f32, c: Color) {
         let rad = rad.min(r.w / 2.0).min(r.h / 2.0).max(0.0);
-        unsafe { self.dc.DrawRoundedRectangle(&rr(r.x, r.y, r.w, r.h, rad), self.brush(c), width, &self.res.round) };
+        unsafe { self.dc.DrawRoundedRectangle(&rr(r.x, r.y, r.w, r.h, rad), self.brush(c), width, self.res.round()) };
     }
     /// Pill (rounded rectangle with radius h/2).
     pub fn pill(&self, r: Rect, c: Color) {
@@ -1592,11 +652,11 @@ impl<'a> Cx<'a> {
         unsafe { self.dc.FillEllipse(&D2D1_ELLIPSE { point: pt(c.0, c.1), radiusX: r, radiusY: r }, self.brush(color)) };
     }
     pub fn circle_stroke(&self, c: Pt, r: f32, width: f32, color: Color) {
-        unsafe { self.dc.DrawEllipse(&D2D1_ELLIPSE { point: pt(c.0, c.1), radiusX: r, radiusY: r }, self.brush(color), width, &self.res.round) };
+        unsafe { self.dc.DrawEllipse(&D2D1_ELLIPSE { point: pt(c.0, c.1), radiusX: r, radiusY: r }, self.brush(color), width, self.res.round()) };
     }
     /// Line with round caps.
     pub fn line(&self, a: Pt, b: Pt, width: f32, c: Color) {
-        unsafe { self.dc.DrawLine(pt(a.0, a.1), pt(b.0, b.1), self.brush(c), width, &self.res.round) };
+        unsafe { self.dc.DrawLine(pt(a.0, a.1), pt(b.0, b.1), self.brush(c), width, self.res.round()) };
     }
     /// Hairline separator across `r` at its vertical middle.
     pub fn hr(&self, r: Rect) {
@@ -1627,7 +687,7 @@ impl<'a> Cx<'a> {
             });
             sink.EndFigure(D2D1_FIGURE_END_OPEN);
             if sink.Close().is_ok() {
-                self.dc.DrawGeometry(&g, self.brush(color), width, &self.res.round);
+                self.dc.DrawGeometry(&g, self.brush(color), width, self.res.round());
             }
         }
     }
@@ -1706,15 +766,11 @@ impl<'a> Cx<'a> {
     fn spark_gradient(&self, r: Rect, color: Color) -> Option<ID2D1LinearGradientBrush> {
         let c = self.ink(color.fade(0.35));
         let key = [r.y.to_bits(), r.bottom().to_bits(), c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()];
-        if let Some((_, b)) = self.res.grads.borrow().iter().find(|(k, _)| *k == key) {
-            return Some(b.clone());
+        if let Some(b) = self.res.cached_gradient(&key) {
+            return Some(b);
         }
         let b = self.gradient((0.0, r.y), (0.0, r.bottom()), &[(0.0, color.fade(0.35)), (1.0, color.fade(0.0))])?;
-        let mut g = self.res.grads.borrow_mut();
-        if g.len() >= GRADIENT_CACHE {
-            g.clear();
-        }
-        g.push((key, b.clone()));
+        self.res.cache_gradient(key, b.clone());
         Some(b)
     }
     /// The line + the soft area under it through the `n` points `p(0..n)` (card px).
@@ -1740,7 +796,7 @@ impl<'a> Cx<'a> {
             if let Some(b) = self.spark_gradient(r, color) {
                 self.dc.FillGeometry(&area, &b, None::<&ID2D1Brush>);
             }
-            self.dc.DrawGeometry(&line, self.brush(color), 1.6, &self.res.round);
+            self.dc.DrawGeometry(&line, self.brush(color), 1.6, self.res.round());
         }
     }
 
@@ -1756,10 +812,10 @@ impl<'a> Cx<'a> {
             for (geom, paint) in shapes.iter() {
                 match *paint {
                     icons::Paint::Fill => self.dc.FillGeometry(geom, b, None::<&ID2D1Brush>),
-                    icons::Paint::Stroke(w) => self.dc.DrawGeometry(geom, b, w, &self.res.round),
+                    icons::Paint::Stroke(w) => self.dc.DrawGeometry(geom, b, w, self.res.round()),
                     icons::Paint::Both(w) => {
                         self.dc.FillGeometry(geom, b, None::<&ID2D1Brush>);
-                        self.dc.DrawGeometry(geom, b, w, &self.res.round);
+                        self.dc.DrawGeometry(geom, b, w, self.res.round());
                     }
                 }
             }
@@ -1879,20 +935,5 @@ impl<'a> Cx<'a> {
             self.pop_clip();
         }
         self.set_tf(self.base);
-    }
-}
-
-#[cfg(test)]
-mod layout_cache_tests {
-    use super::*;
-
-    #[test]
-    fn layout_key_follows_every_input() {
-        let st = Style::CAPTION;
-        let k = lay_key("12%", st, 40.0, 14.0);
-        assert_eq!(k, lay_key("12%", st, 40.0, 14.0));
-        for other in [lay_key("13%", st, 40.0, 14.0), lay_key("12%", st.size(12.0), 40.0, 14.0), lay_key("12%", st.center(), 40.0, 14.0), lay_key("12%", st.mono(), 40.0, 14.0), lay_key("12%", st, 41.0, 14.0), lay_key("12%", st, 40.0, 15.0)] {
-            assert_ne!(k, other);
-        }
     }
 }

@@ -9,6 +9,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+      - run: cargo test --locked -p glasskit
       - run: cargo build --release --locked
       # headless sheet render (needs a D2D/WARP device on the runner: unverified, so non-blocking), then lint the log
       - continue-on-error: true

@@ -1,0 +1,12 @@
+[package]
+name = "glasskit"
+version = "0.1.0"
+edition = "2021"
+description = "Glass Widgets' reusable native toolkit: Direct3D11/Direct2D/DirectWrite/WIC device, text-cache, motion, text-field and menu models, fonts, icons, monitors"
+license = "MIT"
+repository = "https://github.com/chvdbhcx-del/glass-widgets"
+publish = false
+
+[dependencies]
+serde_json = { workspace = true }
+windows = { workspace = true }

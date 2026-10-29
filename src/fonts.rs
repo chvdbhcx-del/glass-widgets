@@ -1,9 +1,8 @@
 //! Bundled typefaces (SIL OFL 1.1: `assets/fonts/Medeo-OFL.txt`, `OFL.txt` for Nunito), five static weights each, subset to Latin + Cyrillic, embedded in the exe.
 //! DirectWrite reads them from memory (Windows 10 1703+); when that is not available the callers keep the system Segoe UI.
 //! Default Medeo Sans; `MSW_FONT=nunito` picks Nunito, `MSW_FONT=system` skips the bundled fonts.
-use std::sync::OnceLock;
-use windows::core::{Interface, IUnknown};
-use windows::Win32::Graphics::DirectWrite::*;
+//! The machinery (`FontSet`: the collection, GDI registration) is `glasskit::fonts`; this file only says which files and which family.
+use glasskit::fonts::FontSet;
 
 /// Family used for all text.
 pub fn family() -> &'static str {
@@ -14,15 +13,13 @@ pub fn family() -> &'static str {
     }
 }
 
-static MEDEO: [&[u8]; 5] = [
+/// Medeo Sans (Light, Regular, Medium, SemiBold, Bold), then Nunito (the same five).
+static FILES: [&[u8]; 10] = [
     include_bytes!("../assets/fonts/MedeoSans-Light.ttf"),
     include_bytes!("../assets/fonts/MedeoSans-Regular.ttf"),
     include_bytes!("../assets/fonts/MedeoSans-Medium.ttf"),
     include_bytes!("../assets/fonts/MedeoSans-SemiBold.ttf"),
     include_bytes!("../assets/fonts/MedeoSans-Bold.ttf"),
-];
-
-static NUNITO: [&[u8]; 5] = [
     include_bytes!("../assets/fonts/Nunito-Light.ttf"),
     include_bytes!("../assets/fonts/Nunito-Regular.ttf"),
     include_bytes!("../assets/fonts/Nunito-Medium.ttf"),
@@ -30,42 +27,29 @@ static NUNITO: [&[u8]; 5] = [
     include_bytes!("../assets/fonts/Nunito-Bold.ttf"),
 ];
 
-fn build(dw: &IDWriteFactory) -> windows::core::Result<IDWriteFontCollection> {
-    unsafe {
-        let f5: IDWriteFactory5 = dw.cast()?;
-        let loader = f5.CreateInMemoryFontFileLoader()?;
-        f5.RegisterFontFileLoader(&loader)?;
-        let set = f5.CreateFontSetBuilder()?;
-        for data in MEDEO.iter().chain(NUNITO.iter()).copied() {
-            let file = loader.CreateInMemoryFontFileReference(dw, data.as_ptr().cast(), data.len() as u32, None::<&IUnknown>)?;
-            set.AddFontFile(&file)?;
-        }
-        // the factory keeps the loader alive through the registration; the data is 'static
-        f5.CreateFontCollectionFromFontSet(&set.CreateFontSet()?)?.cast()
-    }
+/// Regular weight of the chosen family, for GDI (the prompt's EDIT control).
+fn gdi_file() -> &'static [u8] {
+    FILES[if family() == "Nunito" { 6 } else { 1 }]
 }
 
-/// The collection that holds Nunito, or `None` (use the system collection). Built once per process: DirectWrite's shared factory is one object.
-pub fn collection(dw: &IDWriteFactory) -> Option<IDWriteFontCollection> {
-    static C: OnceLock<Option<IDWriteFontCollection>> = OnceLock::new();
-    C.get_or_init(|| {
-        if std::env::var("MSW_FONT").is_ok_and(|v| v == "system") {
-            return None;
-        }
-        build(dw).map_err(|e| eprintln!("mswidgets: bundled font unavailable ({e})")).ok()
-    })
-    .clone()
+fn system_only() -> bool {
+    std::env::var("MSW_FONT").is_ok_and(|v| v == "system")
 }
 
-/// Makes Nunito Regular usable by GDI (the prompt's EDIT control) for this process only.
+/// Nunito is lighter than Medeo / Segoe: its small text gets one more weight step.
+fn nunito() -> bool {
+    family() == "Nunito"
+}
+
+/// The app's font set, handed to `Res::new`.
+pub static SET: FontSet = FontSet::new(&FILES, family, gdi_file).system_only_when(system_only).bolder_small_when(nunito);
+
+/// The collection that holds the bundled fonts, or `None` (use the system collection).
+pub fn collection(dw: &windows::Win32::Graphics::DirectWrite::IDWriteFactory) -> Option<windows::Win32::Graphics::DirectWrite::IDWriteFontCollection> {
+    SET.collection(dw)
+}
+
+/// Makes the Regular weight usable by GDI (the prompt's EDIT control) for this process only.
 pub fn install_gdi() {
-    use windows::Win32::Graphics::Gdi::AddFontMemResourceEx;
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let d = if family() == "Nunito" { NUNITO[1] } else { MEDEO[1] };
-        let mut n = 0u32;
-        unsafe {
-            AddFontMemResourceEx(d.as_ptr().cast(), d.len() as u32, None, &mut n);
-        }
-    });
+    SET.install_gdi();
 }

@@ -317,7 +317,7 @@ fn with_cx<R>(c: &mut CardView, sh: &Shared, gfx: &Gfx, now: &Now, base: Matrix3
         lum: *lum,
         lang: sh.lang,
         hover: *hover,
-        waker: Waker { hwnd: sh.hwnd, idx: *uid },
+        waker: Waker { hwnd: sh.hwnd, idx: *uid, msg: WM_WIDGET },
         utc_off: sh.utc_off,
         base,
         light,
@@ -526,7 +526,7 @@ fn build_text_shadow(gfx: &Gfx, c: &mut CardView, ink: usize, alpha: f32, s: f32
 impl Scene {
     /// An empty scene on a `w` x `h` px canvas over `backdrop` (canvas-sized).
     pub fn empty(gfx: &Gfx, w: i32, h: i32, s: f32, glass_g: f32, backdrop: &ID2D1Bitmap1, env: &SceneEnv) -> Result<Scene> {
-        let sh = Shared { res: Res::new(gfx)?, s, preview: env.preview, hwnd: env.hwnd, lang: env.lang, utc_off: env.utc_off };
+        let sh = Shared { res: Res::new(gfx, &crate::fonts::SET)?, s, preview: env.preview, hwnd: env.hwnd, lang: env.lang, utc_off: env.utc_off };
         Ok(Scene {
             w,
             h,

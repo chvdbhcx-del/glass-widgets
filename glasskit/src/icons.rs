@@ -1,5 +1,7 @@
 //! Built-in vector glyphs. Each glyph is a few SVG-style paths in a 24x24 box (absolute M L H V C Q A Z only), painted with the
-//! colour passed to `Cx::icon`. Stroke widths are in glyph units, so they scale with the icon size. Geometry is built lazily and cached.
+//! colour passed to the drawing call (`Cx::icon` in widgets). Stroke widths are in glyph units, so they scale with the icon size. Geometry is built lazily and cached.
+//!
+//! The built-in set is the `Glyph` enum; `register` adds your own paths (same syntax, same 24x24 box) and returns a `Glyph::Custom` that draws exactly like a built-in.
 use crate::gfx::*;
 use windows::core::{Interface, Result};
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -64,6 +66,8 @@ pub enum Glyph {
     Pin,
     Search,
     Location,
+    /// A glyph added with `register` (not part of `Glyph::ALL`).
+    Custom(u16),
 }
 
 impl Glyph {
@@ -210,6 +214,7 @@ fn shapes(g: Glyph) -> Vec<(String, Paint)> {
         Pin => vec![s("M12 21 C12 21 5.5 14.5 5.5 10 A6.5 6.5 0 0 1 18.5 10 C18.5 14.5 12 21 12 21 Z", Stroke(1.7)), (circ(12.0, 10.0, 2.3), Fill)],
         Search => vec![(circ(10.5, 10.5, 6.3), Stroke(1.8)), s("M15.2 15.2 L20.3 20.3", Stroke(2.0))],
         Location => vec![s("M20 4 L4 11 L11 13 L13 20 Z", Both(1.4))],
+        Custom(id) => registered(id),
     }
 }
 
@@ -308,6 +313,56 @@ fn glue(d: &str) -> String {
     }
     o
 }
+/// The Direct2D geometries (and how to paint each) of a glyph.
 pub fn geometries(f: &ID2D1Factory1, g: Glyph) -> Result<Vec<(ID2D1PathGeometry, Paint)>> {
     shapes(g).into_iter().map(|(d, p)| Ok((build(f, &glue(&d))?, p))).collect()
+}
+
+// ---------------------------------------------------------------- registry of your own glyphs
+
+static CUSTOM: std::sync::Mutex<Vec<Vec<(String, Paint)>>> = std::sync::Mutex::new(Vec::new());
+
+/// Add a glyph: SVG-style absolute paths (M L H V C Q A Z) in a 24x24 box, each with its `Paint`. The returned `Glyph::Custom` works wherever
+/// a built-in does (`Res::glyph`, `geometries`). Registering is cheap and permanent for the process; do it once at start-up.
+pub fn register(paths: &[(&str, Paint)]) -> Glyph {
+    let mut all = CUSTOM.lock().unwrap_or_else(|e| e.into_inner());
+    all.push(paths.iter().map(|&(d, p)| (d.to_string(), p)).collect());
+    Glyph::Custom((all.len() - 1) as u16)
+}
+
+fn registered(id: u16) -> Vec<(String, Paint)> {
+    CUSTOM.lock().unwrap_or_else(|e| e.into_inner()).get(id as usize).cloned().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_glyphs_get_their_own_id_and_paths() {
+        let a = register(&[("M4 4 L20 4 L12 20 Z", Both(1.2))]);
+        let b = register(&[("M12 3 V21", Stroke(2.0)), ("M3 12 H21", Stroke(2.0))]);
+        assert_ne!(a, b);
+        assert_eq!(shapes(a).len(), 1);
+        let two = shapes(b);
+        assert_eq!((two.len(), two[1].0.as_str()), (2, "M3 12 H21"));
+        // an id nobody registered draws nothing, built-ins are untouched
+        assert!(shapes(Glyph::Custom(u16::MAX)).is_empty());
+        assert!(Glyph::ALL.iter().all(|&g| !shapes(g).is_empty()));
+    }
+
+    #[test]
+    fn path_syntax_is_split_into_tokens() {
+        assert_eq!(glue("M12 3L5 5Z").split_whitespace().collect::<Vec<_>>(), ["M", "12", "3", "L", "5", "5", "Z"]);
+    }
+
+    #[test]
+    fn a_registered_glyph_builds_geometry() {
+        let g = register(&[("M3 3 H21 V21 H3 Z", Fill)]);
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED); // WIC wants COM on this thread
+        }
+        let gfx = Gfx::new(None).expect("a (WARP) device");
+        assert_eq!(geometries(&gfx.d2d, g).expect("geometry").len(), 1);
+    }
 }

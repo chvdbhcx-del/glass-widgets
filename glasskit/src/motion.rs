@@ -1,6 +1,10 @@
 //! Pure (no GPU, no clock) state machines behind the Liquid Glass motion: the inertial light, the materialise timeline,
 //! the backdrop-driven light / dark appearance with hysteresis, the pointer glint / hover / press response and the neighbour-merge distance logic.
 //! Everything takes explicit `dt` / `t` so it is unit-testable and the headless renderer can show any phase.
+//! The last section (`AnimHost`, `HoverAnim`, `GlideAnim`, `reduced_motion`) wraps `HoverRamps` / `Glide` for a host that owns a frame loop.
+use std::time::Instant;
+use windows::Win32::Foundation::BOOL;
+use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
 
 // ---------------------------------------------------------------- light
 
@@ -678,6 +682,168 @@ pub fn flow_phase(since_sample: f32, period: f32) -> f32 {
     (since_sample / period.max(0.05)).clamp(0.0, 1.0)
 }
 
+// ---------------------------------------------------------------- animation helpers for a host with a frame loop
+
+/// What `HoverAnim` / `GlideAnim` need from the thing that owns the frame loop (a widget `Cx`, a Pill view...).
+pub trait AnimHost {
+    /// Static previews and snapshots have no timers: animations jump to their end value.
+    fn is_preview(&self) -> bool;
+    /// Wake the loop from a place that does not tick (a mouse event), so the schedule starts now.
+    fn wake(&self);
+    /// Ask for one more frame (the last position of a finished animation).
+    fn request_frame(&self);
+}
+
+/// The system's "show animations" setting is off (SPI_GETCLIENTAREAANIMATION): motion goes straight to its end value.
+pub fn reduced_motion() -> bool {
+    unsafe {
+        let mut on = BOOL(1);
+        let ok = SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut BOOL as *mut std::ffi::c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).is_ok();
+        ok && !on.as_bool()
+    }
+}
+
+/// Hover ramps INSIDE a widget (a hot cell, a calendar day, a list row): `set` from `mouse` with the cell under the pointer, `step` from
+/// `tick` (it advances by the real time elapsed), `get(i)` 0..1 in `overlay`. Draw the highlight in `overlay`, not in `draw`: the glass
+/// layer is not re-rendered. While a ramp is moving `step` is true, so the widget returns `Tick::Fps(60)`; the frame after the last
+/// movement is requested here, then the widget goes back to its idle schedule and costs nothing. Reduced motion and previews jump to the end.
+pub struct HoverAnim {
+    ramps: HoverRamps,
+    hot: Option<usize>,
+    since: Option<Instant>,
+    t_in: f32,
+    t_out: f32,
+}
+impl Default for HoverAnim {
+    fn default() -> HoverAnim {
+        HoverAnim::new(0)
+    }
+}
+impl HoverAnim {
+    /// A hover ramp: 120 ms in, 180 ms out.
+    pub fn new(cells: usize) -> HoverAnim {
+        HoverAnim::timed(cells, 0.12, 0.18)
+    }
+
+    /// With its own times in seconds (a press: faster in, slower out).
+    pub fn timed(cells: usize, t_in: f32, t_out: f32) -> HoverAnim {
+        HoverAnim { ramps: HoverRamps::new(cells), hot: None, since: None, t_in, t_out }
+    }
+
+    /// The cell under the pointer (None = none). True when it changed; the ramps start moving on their own after that.
+    pub fn set(&mut self, hot: Option<usize>, cx: &dyn AnimHost) -> bool {
+        if hot == self.hot {
+            return false;
+        }
+        self.hot = hot;
+        let h = hot;
+        if let Some(i) = hot {
+            self.ramps.ensure(i + 1);
+        }
+        if cx.is_preview() || reduced_motion() {
+            self.ramps.snap(|i| Some(i) == h, |_| {}); // previews have no timers: show the end state
+        } else {
+            self.since.get_or_insert_with(Instant::now);
+            cx.wake(); // mouse events do not call `tick`: poke it so the schedule starts now
+        }
+        true
+    }
+
+    /// Advance to now (call from `tick`). True while something is still moving: the widget returns `Tick::Fps(60)`.
+    pub fn step(&mut self, cx: &dyn AnimHost) -> bool {
+        let Some(t0) = self.since else { return false };
+        let now = Instant::now();
+        let dt = now.saturating_duration_since(t0).as_secs_f32().min(0.05);
+        let h = self.hot;
+        self.ramps.step(dt, self.t_in, self.t_out, |i| Some(i) == h, |_| {});
+        if self.ramps.busy(|i| Some(i) == h) {
+            self.since = Some(now);
+            return true;
+        }
+        self.since = None;
+        cx.request_frame(); // the last position of the ramps
+        false
+    }
+
+    /// Eased hover amount of cell `i`.
+    pub fn get(&self, i: usize) -> f32 {
+        self.ramps.get(i)
+    }
+
+    /// Cell under the pointer.
+    pub fn hot(&self) -> Option<usize> {
+        self.hot
+    }
+}
+
+/// Values that glide INSIDE a widget, by key (a ring's fraction, a bar, the number beside it, a list row's slot). `set` the fresh
+/// targets from `tick`, then `step` (it advances by the real time elapsed); `get` / `or` in `overlay`. While anything moves `step` is true
+/// and the widget returns `Tick::Fps(60)`; after the last movement a frame is requested here and the widget goes back to its idle schedule
+/// (idle cost stays zero). A key seen for the first time starts at its target; previews and reduced motion jump straight to the end.
+pub struct GlideAnim {
+    g: Glide,
+    since: Option<Instant>,
+}
+impl Default for GlideAnim {
+    fn default() -> GlideAnim {
+        GlideAnim { g: Glide::default(), since: None }
+    }
+}
+impl GlideAnim {
+    /// Fixed-time ease-in-out moves of `secs` (a soft start and end): list rows changing places.
+    pub fn smooth(secs: f32) -> GlideAnim {
+        GlideAnim { g: Glide::smooth(secs), since: None }
+    }
+    pub fn set(&mut self, key: &str, target: f32, cx: &dyn AnimHost) {
+        if cx.is_preview() || reduced_motion() {
+            self.g.jump(key, target);
+        } else if self.g.set(key, target) {
+            self.since.get_or_insert_with(Instant::now);
+        }
+    }
+    /// Like `set`, with the value a new key starts from (a row sliding in).
+    pub fn set_from(&mut self, key: &str, from: f32, target: f32, cx: &dyn AnimHost) {
+        if cx.is_preview() || reduced_motion() {
+            self.g.jump(key, target);
+        } else if self.g.set_from(key, from, target) {
+            self.since.get_or_insert_with(Instant::now);
+        }
+    }
+    /// Restart `key` from `from` to `target` (a 0 -> 1 blend between the old and the new picture of a graph).
+    pub fn start(&mut self, key: &str, from: f32, target: f32, cx: &dyn AnimHost) {
+        if cx.is_preview() || reduced_motion() {
+            self.g.jump(key, target);
+        } else if self.g.start(key, from, target) {
+            self.since.get_or_insert_with(Instant::now);
+        }
+    }
+    /// Advance to now (call from `tick`, after the `set`s). True while something is still moving: `Tick::Fps(60)`.
+    pub fn step(&mut self, cx: &dyn AnimHost) -> bool {
+        let Some(t0) = self.since else { return false };
+        let now = Instant::now();
+        if self.g.step(now.saturating_duration_since(t0).as_secs_f32().min(0.05)) {
+            self.since = Some(now);
+            return true;
+        }
+        self.since = None;
+        cx.request_frame(); // the last position
+        false
+    }
+    pub fn get(&self, key: &str) -> Option<f32> {
+        self.g.get(key)
+    }
+    /// The shown value, or `fallback` for a key that was never set.
+    pub fn or(&self, key: &str, fallback: f32) -> f32 {
+        self.g.get(key).unwrap_or(fallback)
+    }
+    pub fn forget(&mut self, key: &str) {
+        self.g.forget(key);
+    }
+    pub fn retain(&mut self, keep: impl FnMut(&str) -> bool) {
+        self.g.retain(keep);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,5 +1272,59 @@ mod tests {
         let p = merge_pairs(&[a, at(8.0), (1000.0, 0.0, 170.0, 170.0)], 1.0);
         assert_eq!(p.len(), 1);
         assert_eq!((p[0].0, p[0].1), (0, 1));
+    }
+
+    /// A host that counts what the animations ask of it.
+    #[derive(Default)]
+    struct Host {
+        preview: bool,
+        wakes: std::cell::Cell<u32>,
+        frames: std::cell::Cell<u32>,
+    }
+    impl AnimHost for Host {
+        fn is_preview(&self) -> bool {
+            self.preview
+        }
+        fn wake(&self) {
+            self.wakes.set(self.wakes.get() + 1);
+        }
+        fn request_frame(&self) {
+            self.frames.set(self.frames.get() + 1);
+        }
+    }
+
+    #[test]
+    fn hover_anim_wakes_the_host_and_previews_jump_to_the_end() {
+        if reduced_motion() {
+            return; // the system switch turns every animation into a jump: nothing to time on this machine
+        }
+        let host = Host::default();
+        let mut h = HoverAnim::new(3);
+        assert!(h.set(Some(1), &host) && !h.set(Some(1), &host), "true only when the cell changed");
+        assert_eq!((host.wakes.get(), h.get(1)), (1, 0.0), "the host is woken, the ramp has not moved yet");
+        let mut guard = 0;
+        while h.step(&host) && guard < 1000 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            guard += 1;
+        }
+        assert_eq!((h.get(1), host.frames.get()), (1.0, 1), "eased to 1, one last frame was asked for");
+        // a preview has no timers: the end state at once, and nobody is woken
+        let pre = Host { preview: true, ..Default::default() };
+        let mut p = HoverAnim::new(3);
+        p.set(Some(2), &pre);
+        assert_eq!((p.get(2), pre.wakes.get(), p.hot()), (1.0, 0, Some(2)));
+    }
+
+    #[test]
+    fn glide_anim_starts_at_the_target_and_previews_jump() {
+        let host = Host::default();
+        let mut g = GlideAnim::default();
+        g.set("a", 5.0, &host);
+        assert_eq!(g.or("a", 0.0), 5.0, "a key seen for the first time starts at its target");
+        assert!(!g.step(&host));
+        let pre = Host { preview: true, ..Default::default() };
+        g.set("a", 9.0, &pre);
+        assert_eq!(g.get("a"), Some(9.0));
+        assert_eq!(g.or("never set", 3.0), 3.0);
     }
 }
