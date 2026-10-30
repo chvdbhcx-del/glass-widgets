@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.3] - 2026-10-30
 
 ### Fixed
 - Smoother glass highlights and shadows on dark backgrounds (no more stepped gradients): the glass of a card (shadow, lens, tint, glow, sheen, rim) is now rendered in 16-bit float and dithered down to the 8-bit window with a fixed blue-noise pattern (no shimmer, text and icons untouched). `MSWIDGETS_NO_FP16=1` restores the old 8-bit path.
