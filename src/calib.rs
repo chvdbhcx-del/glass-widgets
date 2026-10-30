@@ -311,7 +311,7 @@ impl Calib {
             let lum = s / (cw * ch) as f32 / 255.0;
             let ref_feat = features(&reference, &spec, spec.radius * scale);
             refs.push(Prepared {
-                canvas: gfx.target(d.w, d.h).map_err(|e| format!("canvas: {e}"))?,
+                canvas: gfx.target8(d.w, d.h).map_err(|e| format!("canvas: {e}"))?,
                 cpu: gfx.cpu_read(d.w, d.h).map_err(|e| format!("staging: {e}"))?,
                 margin: (48.0 * scale).round() as i32,
                 spec,
@@ -335,7 +335,7 @@ impl Calib {
         let map = Glass::make_map(gfx, w, h, r.scale, r.spec.radius, p)?;
         let style = GlassStyle { blur: r.spec.blur, veil: None };
         let glass = Glass::styled(gfx, &r.backdrop, x, y, w, h, r.scale, m, 0.5, r.spec.radius, &map, style, p)?;
-        let layer = gfx.target((w + 2 * m) as u32, (h + 2 * m) as u32)?;
+        let layer = gfx.target8((w + 2 * m) as u32, (h + 2 * m) as u32)?;
         let dc = &gfx.dc;
         unsafe {
             dc.SetTarget(&layer);

@@ -630,7 +630,7 @@ struct GlassCache {
 
 unsafe fn white_stops(gfx: &Gfx, stops: &[(f32, f32)]) -> Result<ID2D1GradientStopCollection1> {
     let st: Vec<D2D1_GRADIENT_STOP> = stops.iter().map(|&(p, a)| D2D1_GRADIENT_STOP { position: p, color: col(1.0, 1.0, 1.0, a) }).collect();
-    gfx.dc.CreateGradientStopCollection(&st, D2D1_COLOR_SPACE_SRGB, D2D1_COLOR_SPACE_SRGB, D2D1_BUFFER_PRECISION_8BPC_UNORM, D2D1_EXTEND_MODE_CLAMP, D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT)
+    gfx.dc.CreateGradientStopCollection(&st, D2D1_COLOR_SPACE_SRGB, D2D1_COLOR_SPACE_SRGB, D2D1_BUFFER_PRECISION_16BPC_FLOAT, D2D1_EXTEND_MODE_CLAMP, D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT)
 }
 
 impl Glass {
@@ -662,7 +662,7 @@ impl Glass {
         let (lw, lh) = ((self.w as i32 + 2 * self.m) as u32, (self.h as i32 + 2 * self.m) as u32);
         unsafe {
             if c.glow.is_none() {
-                let bmp = gfx.target(lw, lh)?;
+                let bmp = gfx.target_hdr(lw, lh)?;
                 Self::render_into(gfx, &bmp, |dc| dc.DrawImage(&self.glow_out, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER))?;
                 c.glow = Some(bmp);
             }
@@ -670,7 +670,7 @@ impl Glass {
             if c.shadow_key != Some(a.to_bits()) {
                 let bmp = match c.shadow.take() {
                     Some(b) => b,
-                    None => gfx.target(lw, lh)?,
+                    None => gfx.target_hdr(lw, lh)?,
                 };
                 c.shadow_key = None;
                 fx_vec4(&self.sh_a, 1, [0.0, 0.0, 0.0, a])?;
@@ -1253,7 +1253,7 @@ mod tests {
         };
         assert!(cached.cache.is_some() && plain.cache.is_none());
         let (lw, lh) = (170 + 144, 170 + 144);
-        let (t1, t2) = (gfx.target(lw, lh).unwrap(), gfx.target(lw, lh).unwrap());
+        let (t1, t2) = (gfx.target_hdr(lw, lh).unwrap(), gfx.target_hdr(lw, lh).unwrap());
         let cpu = gfx.cpu_read(lw, lh).unwrap();
         let full = windows::Win32::Foundation::RECT { left: 0, top: 0, right: lw as i32, bottom: lh as i32 };
         let shot = |g: &Glass, t: &ID2D1Bitmap1, fx: &Fx, prep: bool| -> Vec<u8> {
@@ -1272,16 +1272,22 @@ mod tests {
             gfx.read_rect(t, &cpu, full, |_, row| out.extend_from_slice(row)).unwrap();
             out
         };
+        // the layers are 16-bit float (and read back dithered): the cached copy equals the effects up to a half-float rounding of the odd pixel
+        let same = |a: &[u8], b: &[u8], what: &str| {
+            let bad = a.iter().zip(b).filter(|(x, y)| x != y).count();
+            let max = a.iter().zip(b).map(|(x, y)| (*x as i32 - *y as i32).abs()).max().unwrap_or(0);
+            assert!(max <= 1 && bad * 5000 <= a.len(), "{what}: {bad} bytes differ, by up to {max}");
+        };
         for (lum, k, blur) in [(0.2, 0.0, 0.0), (0.7, 0.0, 0.0), (0.4, 1.0, 0.0), (0.55, 0.37, 0.0), (0.3, 0.0, 12.0), (0.31, 0.0, 0.0)] {
             let fx = Fx { lum, k, blur };
             let (a, b) = (shot(&cached, &t1, &fx, true), shot(&plain, &t2, &fx, true));
-            assert_eq!(a, b, "lum {lum} k {k} blur {blur}: the cached layer differs from the effect layer");
+            same(&a, &b, &format!("lum {lum} k {k} blur {blur}: the cached layer differs from the effect layer"));
             // drawing again without a new prepare (same key) still matches
-            assert_eq!(shot(&cached, &t1, &fx, false), b);
+            same(&shot(&cached, &t1, &fx, false), &b, "second draw");
         }
         // a draw without prepare after the weight changed falls back to the effects instead of showing a stale shadow
         let fx = Fx { lum: 0.9, k: 0.0, blur: 0.0 };
-        assert_eq!(shot(&cached, &t1, &fx, false), shot(&plain, &t2, &fx, false));
+        same(&shot(&cached, &t1, &fx, false), &shot(&plain, &t2, &fx, false), "stale cache");
 
         // a look slider that only moves the lens: the successor takes the bitmaps over and still draws exactly what the effects draw
         let fx = Fx { lum: 0.33, k: 0.2, blur: 0.0 };

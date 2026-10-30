@@ -18,6 +18,7 @@ pub mod accent;
 pub mod canvas;
 pub mod color;
 pub mod controls;
+pub mod dither;
 pub mod ease;
 pub mod edit;
 pub mod fonts;

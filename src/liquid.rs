@@ -150,7 +150,7 @@ impl Liquid {
         sl.rect = (x0, y0, rw, rh);
         if sl.bmp.as_ref().is_none_or(|b| b.0 < rw || b.1 < rh) {
             let (bw, bh) = ((rw + 63) / 64 * 64, (rh + 63) / 64 * 64);
-            let bmp = gfx.target(bw as u32, bh as u32)?;
+            let bmp = gfx.target8(bw as u32, bh as u32)?;
             unsafe {
                 sl.blur.SetInput(0, &bmp, true);
                 sl.mask.SetSourceRectangle(&rf(0.0, 0.0, bw as f32, bh as f32));

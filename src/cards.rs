@@ -270,6 +270,8 @@ pub struct Scene {
     next_uid: usize,
     dim: bool,
     frame: ID2D1Bitmap1,
+    /// float scratch of the glass pass of `render_card` (grown to the biggest layer), see there
+    hdr: Option<(u32, u32, ID2D1Bitmap1)>,
     /// CPU read-back staging bitmap (grown on demand, only the dirty rectangle is ever copied through it)
     cpu: Option<(i32, i32, ID2D1Bitmap1)>,
     probe: Probe,
@@ -500,7 +502,7 @@ fn build_text_shadow(gfx: &Gfx, c: &mut CardView, ink: usize, alpha: f32, s: f32
     let Some(cl) = c.content[ink].clone() else { return Ok(()) };
     let bmp = match c.tsh.bmp.take() {
         Some(b) if unsafe { b.GetPixelSize() } == (D2D_SIZE_U { width: lw, height: lh }) => b,
-        _ => gfx.target(lw, lh)?,
+        _ => gfx.target_hdr(lw, lh)?,
     };
     c.tsh.key = None;
     let dc = &gfx.dc;
@@ -541,6 +543,7 @@ impl Scene {
             next_uid: 1,
             dim: false,
             frame: gfx.target(w as u32, h as u32)?,
+            hdr: None,
             cpu: None,
             probe: Probe::new(gfx, backdrop)?,
             params: crate::glass::global_params(),
@@ -1366,10 +1369,25 @@ impl Scene {
             }
         }
         let dc = &gfx.dc;
+        // the glass (shadow, lens, tint, veils, glow, sheen, rim) and the text shadow are rendered into a 16-bit float scratch and dithered down
+        // into the 8-bit layer; the content (text, icons, bars) is drawn onto that layer exactly as before, so it stays pixel-identical
+        let (lw, lh) = ((c.w + 2 * m_px) as u32, (c.h + 2 * m_px) as u32);
+        let hdr = if gfx.fp16 {
+            if self.hdr.as_ref().is_none_or(|h| h.0 < lw || h.1 < lh) {
+                let (hw, hh) = (self.hdr.as_ref().map_or(0, |h| h.0).max(lw), self.hdr.as_ref().map_or(0, |h| h.1).max(lh));
+                self.hdr = Some((hw, hh, gfx.target_hdr(hw, hh)?));
+            }
+            self.hdr.as_ref().map(|h| h.2.clone())
+        } else {
+            None
+        };
         unsafe {
-            dc.SetTarget(&c.layer);
+            dc.SetTarget(hdr.as_ref().unwrap_or(&c.layer));
             dc.BeginDraw();
             dc.SetTransform(&mat(1.0, 0.0, 0.0));
+            if hdr.is_some() {
+                dc.PushAxisAlignedClip(&rf(0.0, 0.0, lw as f32, lh as f32), D2D1_ANTIALIAS_MODE_ALIASED);
+            }
             let r = c.glass.draw(dc, &fx);
             if r.is_ok() {
                 // subtle text shadow, stronger over a bright backdrop (CSS: text-shadow 0 1px 8px); nearly none under dark ink
@@ -1387,6 +1405,16 @@ impl Scene {
                             }
                         }
                     }
+                }
+                // glass done: add the dither, then copy the float scratch into the 8-bit layer (a plain copy rounds to the nearest level) and carry on
+                // with the content on that layer, in the same draw session
+                if let Some(h) = &hdr {
+                    dc.PopAxisAlignedClip();
+                    gfx.add_noise(lw as f32, lh as f32)?;
+                    dc.SetTarget(&c.layer);
+                    dc.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+                    dc.DrawBitmap(h, Some(&rf(0.0, 0.0, lw as f32, lh as f32)), 1.0, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, Some(&rf(0.0, 0.0, lw as f32, lh as f32)), None);
+                    dc.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
                 }
                 // the content of the two inks cross-fades while the appearance changes
                 for l in 0..2 {
@@ -1831,9 +1859,17 @@ impl Scene {
             self.cpu = Some((cw, ch, gfx.cpu_read(cw as u32, ch as u32)?));
         }
         let Some((_, _, cpu)) = self.cpu.as_ref() else { return Ok(()) };
+        // the FP16 frame is converted to dithered 8 bit on the GPU first (only the dirty rectangle)
+        let q;
+        let src = if Gfx::is_fp16(&self.frame) {
+            q = gfx.quantize(&self.frame, r)?;
+            &q
+        } else {
+            &self.frame
+        };
         unsafe {
             let sr = D2D_RECT_U { left: r.left as u32, top: r.top as u32, right: r.right as u32, bottom: r.bottom as u32 };
-            cpu.CopyFromBitmap(Some(&D2D_POINT_2U { x: 0, y: 0 }), &self.frame, Some(&sr))?;
+            cpu.CopyFromBitmap(Some(&D2D_POINT_2U { x: 0, y: 0 }), src, Some(&sr))?;
             let map = cpu.Map(D2D1_MAP_OPTIONS_READ)?;
             let n = (w * 4) as usize;
             for row in 0..h {
@@ -1861,7 +1897,7 @@ impl Probe {
             scale.SetInput(0, backdrop, true);
             fx_vec2(&scale, 1, [0.0, 0.0])?; // centre point
             fx_u32(&scale, 2, 5)?; // HIGH_QUALITY_CUBIC (prefiltered when shrinking)
-            Ok(Probe { out: scale.GetOutput()?, scale, tgt: gfx.target(8, 8)?, cpu: gfx.cpu_read(8, 8)?, col: Default::default() })
+            Ok(Probe { out: scale.GetOutput()?, scale, tgt: gfx.target8(8, 8)?, cpu: gfx.cpu_read(8, 8)?, col: Default::default() })
         }
     }
 
@@ -1871,7 +1907,7 @@ impl Probe {
         fx_vec2(&self.scale, 0, [sx, sy])?;
         let mut bufs = self.col.borrow_mut();
         if bufs.as_ref().is_none_or(|b| (b.0, b.1) != (w, h)) {
-            *bufs = Some((w, h, gfx.target(w, h)?, gfx.cpu_read(w, h)?));
+            *bufs = Some((w, h, gfx.target8(w, h)?, gfx.cpu_read(w, h)?));
         }
         let Some((_, _, tgt, cpu)) = bufs.as_ref() else { return Err(windows::core::Error::empty()) };
         let dc = &gfx.dc;
@@ -1929,6 +1965,49 @@ mod tests {
         let mut a = 0u8;
         sc.read_rect(gfx, RECT { left: x, top: y, right: x + 1, bottom: y + 1 }, |_, row| a = row[3]).unwrap();
         a
+    }
+
+    /// Banding regression (0.7.3): the soft shadow under a dark glass card on a near-black backdrop is a ramp of a few levels. Rounded to 8 bit it was
+    /// a staircase (every pixel of a row equal, 1-level steps between the rows); the dithered FP16 pipeline mixes the two neighbouring levels inside
+    /// the transition rows. Measured on the rows of the shadow ramp (alpha): the share of steps that run against the trend of the row (0 for a rounded ramp) must be at least 4 %.
+    #[test]
+    fn dark_glass_shadow_is_dithered_not_banded() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        let gfx = Gfx::new(None).unwrap();
+        let px: Vec<u8> = (0..800 * 600).flat_map(|_| [18u8, 14, 13, 255]).collect(); // BGRA (13, 14, 18): a very dark smooth wallpaper
+        let bd = gfx.from_bgra(800, 600, &px).unwrap();
+        let env = SceneEnv { preview: true, hwnd: 0, lang: Lang::Ru, utc_off: 0 };
+        let now = Now::sample();
+        let mut sc = Scene::empty(&gfx, 800, 600, 1.0, 0.5, &bd, &env).unwrap();
+        sc.add_card(&gfx, &CardSpec { id: "a".into(), type_id: "clock".into(), size: Size::S, cfg: json!({"_appearance": "dark"}), x: 100, y: 60, w: 170, h: 170 }).unwrap();
+        sc.tick_card(&gfx, 0, &now);
+        sc.measure_lum(&gfx, 1, false).unwrap();
+        sc.render_card(&gfx, 0, &now).unwrap();
+        let full = RECT { left: 0, top: 0, right: 800, bottom: 600 };
+        sc.composite(&gfx, full, None, &now).unwrap();
+        let mut rows = Vec::new();
+        sc.read_rect(&gfx, RECT { left: 140, top: 232, right: 230, bottom: 232 + 44 }, |_, row| {
+            rows.push(row.chunks(4).map(|p| p[3]).collect::<Vec<u8>>());
+        })
+        .unwrap();
+        let ramp: Vec<&Vec<u8>> = rows.iter().filter(|r| r.iter().any(|&v| v > 0)).collect(); // rows with shadow: its alpha is the ramp (the frame is transparent, as in the window)
+        // a rounded ramp only ever steps one way along a row; a dithered one flips back and forth between the two neighbouring levels
+        let (mut pairs, mut flips) = (0usize, 0usize);
+        for r in &ramp {
+            let trend = r[r.len() - 1] as i32 - r[0] as i32;
+            for w in r.windows(2) {
+                pairs += 1;
+                if trend != 0 && trend.signum() * (w[1] as i32 - w[0] as i32) < 0 {
+                    flips += 1;
+                }
+            }
+        }
+        assert!(ramp.len() >= 10, "the shadow darkens {} rows", ramp.len());
+        if gfx.fp16 {
+            assert!(flips * 25 >= pairs, "{flips} of {pairs} steps run against the trend of the row: the shadow is banded, not dithered");
+        }
     }
 
     /// Appearance from the backdrop (bright -> light, override wins), the liquid neck between close cards and the materialise transform
