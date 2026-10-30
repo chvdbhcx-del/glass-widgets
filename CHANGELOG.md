@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.7.2] - 2026-10-30
+
+### Changed
+- Internal: the drawing, animation, font, icon, monitor and menu code now lives in the shared `glasskit` crate (also used by Pill); no visual or behavioural change (the widget sheets render pixel for pixel the same).
+
 ## [0.7.1] - 2026-10-29
 
 ### Fixed
