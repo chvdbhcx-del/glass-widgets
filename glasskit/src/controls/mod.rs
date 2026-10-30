@@ -63,6 +63,12 @@ pub fn glyph_icon(g: crate::icons::Glyph) -> Icon {
     Rc::new(move |cv: &Canvas, r: Rect, c: Color| cv.glyph(g, r, c))
 }
 
+/// An SVG (Pill's `icons.js` line icons, see [`crate::svgpath::Svg::icon`]) as an [`Icon`]: the icon is tinted with the colour the control passes
+/// (`currentColor`). Share one [`crate::svgpath::GeomCache`] between all icons of a window.
+pub fn svg_icon(svg: Rc<crate::svgpath::Svg>, cache: Rc<crate::svgpath::GeomCache>) -> Icon {
+    Rc::new(move |cv: &Canvas, r: Rect, c: Color| svg.draw(cv, r, c, &cache))
+}
+
 /// What every control can do (object-safe). Positions in events are in the same coordinate space as `rect`.
 pub trait Widget {
     /// Feed an input event; `rect` is where the control is drawn.

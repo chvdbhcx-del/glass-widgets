@@ -36,6 +36,7 @@ pub mod textfield;
 pub mod theme;
 pub mod tz;
 
+pub use canvas::Canvas;
 pub use color::Color;
 pub use geom::{Pt, Rect};
 pub use gfx::Gfx;
