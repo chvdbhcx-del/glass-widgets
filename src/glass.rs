@@ -599,6 +599,11 @@ pub struct Glass {
     cache: Option<RefCell<GlassCache>>,
     /// bits of the (lens brightness, lens sigma) last written into the effects: an unchanged value is not written again
     lens_set: Cell<Option<(u32, u32)>>,
+    /// the glow bands + specular rim of `draw_hi` for one (angle, appearance), rendered in float16 with the dither into a card-sized 8-bit bitmap
+    /// (`prepare_rim`); `draw_hi` draws that bitmap instead of the strokes while the key matches
+    rim: RefCell<Option<((u32, u32), ID2D1Bitmap1)>>,
+    /// 16 glow strokes instead of 6 (a finer falloff, only with the float pipeline)
+    fine: bool,
 }
 
 // ---------------------------------------------------------------- cached backdrop-independent images
@@ -913,6 +918,8 @@ impl Glass {
                 lamp,
                 cache,
                 lens_set: Cell::new(None),
+                rim: RefCell::new(None),
+                fine: gfx.fp16,
             })
         }
     }
@@ -995,6 +1002,75 @@ impl Glass {
         }
     }
 
+    /// The soft inner glow bands (wide -> narrow) and the thin specular rim along the light axis, in card-local coordinates (the transform is set).
+    unsafe fn rim_strokes(&self, dc: &ID2D1DeviceContext, hi: &Hi, al: f32) {
+        let (s, p) = (self.s, &self.p);
+        let k = hi.k.clamp(0.0, 1.0);
+        let (wf, hf) = (self.w, self.h);
+        let spec = p.spec * lerp(1.0, 0.75, k) * al;
+        let (a, b) = css_line(hi.angle, 0.0, 0.0, wf, hf);
+        // the gradient runs from the lit extreme (alpha 1) to the opposite one
+        self.lit.SetStartPoint(pt(a.0, a.1));
+        self.lit.SetEndPoint(pt(b.0, b.1));
+        let stroke = |w_logical: f32| -> (D2D1_ROUNDED_RECT, f32) {
+            let w = w_logical * s;
+            (rr(w / 2.0, w / 2.0, wf - w, hf - w, (self.r - w / 2.0).max(0.0)), w)
+        };
+        if p.spec_glow > 0.0 {
+            // each stroke covers the card edge down to its own depth, so the stack is a stepped falloff: 6 steps (as before 0.7.4) or, with the
+            // float pipeline, 16 finer ones of the same total strength
+            let (n, ok) = if self.fine { (16usize, 0.0805f32) } else { (6, 0.2) };
+            for i in 0..n {
+                let wk = if self.fine { 1.0 - 0.9 * i as f32 / 15.0 } else { [1.0, 0.8, 0.62, 0.46, 0.3, 0.17][i] };
+                let (r, w) = stroke(p.spec_glow_w * wk);
+                self.lit.SetOpacity(p.spec_glow * ok * al);
+                dc.DrawRoundedRectangle(&r, &self.lit, w, None::<&ID2D1StrokeStyle>);
+            }
+        }
+        if spec > 0.002 {
+            let (r, w) = stroke(p.spec_w);
+            self.lit.SetOpacity(spec);
+            dc.DrawRoundedRectangle(&r, &self.lit, w, None::<&ID2D1StrokeStyle>);
+        }
+    }
+
+    /// Render the glow bands + rim for the light `hi` (angle, appearance) into the card-sized cache bitmap: float16 strokes, the blue-noise dither,
+    /// a rounding copy into 8 bit. Call it OUTSIDE the frame's draw session (it draws in a session of its own); `scratch` is a float16 target at
+    /// least card-sized. A no-op while the key is current; `draw_hi` falls back to the strokes when this was never called or failed.
+    pub fn prepare_rim(&self, gfx: &Gfx, scratch: &ID2D1Bitmap1, hi: &Hi) -> Result<()> {
+        let key = (hi.angle.to_bits(), hi.k.clamp(0.0, 1.0).to_bits());
+        if self.rim.borrow().as_ref().is_some_and(|r| r.0 == key) {
+            return Ok(());
+        }
+        let (bw, bh) = (self.w.ceil() as u32, self.h.ceil() as u32);
+        let bmp = match self.rim.borrow_mut().take() {
+            Some((_, b)) if unsafe { b.GetPixelSize() } == (D2D_SIZE_U { width: bw, height: bh }) => b,
+            _ => gfx.target8(bw, bh)?,
+        };
+        let dc = &gfx.dc;
+        let (w, h) = (bw as f32, bh as f32);
+        unsafe {
+            dc.SetTarget(scratch);
+            dc.BeginDraw();
+            dc.SetTransform(&mat(1.0, 0.0, 0.0));
+            dc.PushAxisAlignedClip(&rf(0.0, 0.0, w, h), D2D1_ANTIALIAS_MODE_ALIASED);
+            dc.Clear(None);
+            self.rim_strokes(dc, hi, 1.0);
+            dc.PopAxisAlignedClip();
+            let n = gfx.add_noise(w, h);
+            dc.SetTarget(&bmp);
+            dc.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+            dc.DrawBitmap(scratch, Some(&rf(0.0, 0.0, w, h)), 1.0, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, Some(&rf(0.0, 0.0, w, h)), None);
+            dc.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+            let e = dc.EndDraw(None, None);
+            dc.SetTarget(None::<&ID2D1Image>);
+            n?;
+            e?;
+        }
+        *self.rim.borrow_mut() = Some((key, bmp));
+        Ok(())
+    }
+
     /// The dynamic highlights, drawn over the finished card. (ox, oy) = card top-left in the current target (physical px).
     /// Leaves the transform at identity. No allocation: a few gradient strokes along the card contour.
     pub fn draw_hi(&self, dc: &ID2D1DeviceContext, ox: f32, oy: f32, hi: &Hi) {
@@ -1007,12 +1083,6 @@ impl Glass {
             }
             dc.SetTransform(&mat(1.0, ox, oy));
             let (wf, hf) = (self.w, self.h);
-            // the strength of the specular rim is lower on light glass (white on white); the glow stays
-            let spec = p.spec * lerp(1.0, 0.75, k) * al;
-            let (a, b) = css_line(hi.angle, 0.0, 0.0, wf, hf);
-            // the gradient runs from the lit extreme (alpha 1) to the opposite one
-            self.lit.SetStartPoint(pt(a.0, a.1));
-            self.lit.SetEndPoint(pt(b.0, b.1));
             let stroke = |w_logical: f32| -> (D2D1_ROUNDED_RECT, f32) {
                 let w = w_logical * s;
                 (rr(w / 2.0, w / 2.0, wf - w, hf - w, (self.r - w / 2.0).max(0.0)), w)
@@ -1026,19 +1096,13 @@ impl Glass {
                     dc.FillRoundedRectangle(&rr(0.0, 0.0, wf, hf, self.r), &self.lamp);
                 }
             }
-            // soft inner bands first (wide -> narrow), then the thin hard rim
-            if p.spec_glow > 0.0 {
-                for (wk, ok) in [(1.0, 0.2), (0.8, 0.2), (0.62, 0.2), (0.46, 0.2), (0.3, 0.2), (0.17, 0.2)] {
-                    let (r, w) = stroke(p.spec_glow_w * wk);
-                    self.lit.SetOpacity(p.spec_glow * ok * al);
-                    dc.DrawRoundedRectangle(&r, &self.lit, w, None::<&ID2D1StrokeStyle>);
-                }
+            // glow bands + the thin rim: the cached dithered bitmap when `prepare_rim` made one for this light, else the strokes
+            let cached = self.rim.borrow();
+            match cached.as_ref().filter(|r| r.0 == (hi.angle.to_bits(), k.to_bits())) {
+                Some((_, b)) => dc.DrawBitmap(b, Some(&rf(0.0, 0.0, wf, hf)), al, D2D1_INTERPOLATION_MODE_LINEAR, None, None),
+                None => self.rim_strokes(dc, hi, al),
             }
-            if spec > 0.002 {
-                let (r, w) = stroke(p.spec_w);
-                self.lit.SetOpacity(spec);
-                dc.DrawRoundedRectangle(&r, &self.lit, w, None::<&ID2D1StrokeStyle>);
-            }
+            drop(cached);
             // pointer glint and materialise sweep: radial falloff around a contour point
             // (brush, point, strength, rim width x, band width x, band alpha): the sweep is bolder than the pointer glint
             for (b, v, strength, wx, gw, ga) in [(&self.spot, hi.glint, p.glint, 1.15, 0.6, 0.22), (&self.sweep, hi.sweep, 1.0, 2.0, 0.9, 0.5)] {

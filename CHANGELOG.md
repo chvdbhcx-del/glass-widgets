@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- The diagonal stripes in the glow and rim light of the cards: the glow bands and the specular rim are now drawn in 16-bit float with 16 fine strokes instead of 6 and dithered with the same fixed blue-noise pattern as the glass, instead of being stacked as stepped 8-bit alpha bands.
+
 ## [0.7.3] - 2026-10-30
 
 ### Fixed

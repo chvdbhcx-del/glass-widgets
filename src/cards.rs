@@ -1600,6 +1600,23 @@ impl Scene {
         if self.dim {
             self.ensure_dim(gfx)?;
         }
+        // the glow bands + rim of every visible card, dithered, for the light it has now (own draw sessions, before the frame's)
+        if gfx.fp16 {
+            for i in 0..self.cards.len() {
+                if !hit(&self.layer_rect_ext(i, (60.0 * s) as i32), &clip) {
+                    continue;
+                }
+                let (w, h) = (self.cards[i].w as u32 + 1, self.cards[i].h as u32 + 1);
+                if self.hdr.as_ref().is_none_or(|x| x.0 < w || x.1 < h) {
+                    let (hw, hh) = (self.hdr.as_ref().map_or(0, |x| x.0).max(w), self.hdr.as_ref().map_or(0, |x| x.1).max(h));
+                    self.hdr = Some((hw, hh, gfx.target_hdr(hw, hh)?));
+                }
+                let (Some(h), c) = (self.hdr.as_ref().map(|x| x.2.clone()), &self.cards[i]) else { continue };
+                let mut hi = hi_of(c, base_angle, s);
+                hi.alpha = 1.0;
+                let _ = c.glass.prepare_rim(gfx, &h, &hi);
+            }
+        }
         for i in 0..self.cards.len() {
             let lr = self.layer_rect_ext(i, (60.0 * s) as i32);
             if self.cards[i].upright() || self.cards[i].morph.is_some() || !hit(&lr, &clip) {
