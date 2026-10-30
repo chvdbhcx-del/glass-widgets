@@ -5,6 +5,10 @@
 //! * `fonts`      `FontSet`, bundled fonts for DirectWrite;  `icons` the vector glyphs and a registry for your own;  `lang` `Lang`
 //! * `motion`     pure animation state machines (springs, ramps, glides, morphs) and `HoverAnim` / `GlideAnim` on top of them
 //! * `textfield`  the text-field model (caret, selection, word wrap);  `menu` the context-menu model
+//! * `ease`, `input`, `theme`, `canvas`, `testkit`  the kit-ui foundation: CSS easing + `Tween` / `Spring`, neutral `InputEvent` + focus + Win32 translator, `Theme` (Pill dark / light, Settings, glass),
+//!   the logical-px `Canvas`, and a headless WARP `Harness` that renders to pixels / PNG
+//! * `controls`   Button, Toggle, Slider, Segmented, Checkbox / Radio, Select, Tooltip, Progress / Spinner, Badge;  `scroll` smooth scrolling, scrollbar, virtualised `ScrollList`
+//! * `edit`       `TextInput` (single / multi-line, undo, clipboard, grapheme-aware);  `richtext` + `markdown` styled text layout and the markdown view;  `svgpath` SVG paths and icons
 //! * `jobs`       background jobs (`spawn`, `Pending`, `Waker`, the worker pool)
 //! * `monitors`, `accent`, `tz`  display enumeration and choice, the wallpaper accent, calendar arithmetic and world time zones
 //!
