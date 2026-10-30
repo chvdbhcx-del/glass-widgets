@@ -158,6 +158,26 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// A built-in vector glyph (24 x 24 design box) fitted into the centre of `r`, painted with `color`.
+    pub fn glyph(&self, g: crate::icons::Glyph, r: Rect, color: Color) {
+        let Ok(shapes) = self.res.glyph(self.gfx, g) else { return };
+        let k = r.w.min(r.h) / 24.0;
+        let m = Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: r.cx() - 12.0 * k, M32: r.cy() - 12.0 * k };
+        self.with_transform(m, |cv| unsafe {
+            let b = cv.brush(color);
+            for (geom, paint) in shapes.iter() {
+                match *paint {
+                    crate::icons::Paint::Fill => cv.dc.FillGeometry(geom, b, None::<&ID2D1Brush>),
+                    crate::icons::Paint::Stroke(w) => cv.dc.DrawGeometry(geom, b, w, cv.res.round()),
+                    crate::icons::Paint::Both(w) => {
+                        cv.dc.FillGeometry(geom, b, None::<&ID2D1Brush>);
+                        cv.dc.DrawGeometry(geom, b, w, cv.res.round());
+                    }
+                }
+            }
+        });
+    }
+
     /// A soft drop shadow under a rounded rectangle, made of stacked translucent rounded rectangles (no blur effect, so it is cheap and
     /// identical on WARP and on a GPU). `blur` is the reach in px, `dy` the vertical offset, `c` the colour at the darkest.
     pub fn shadow_rr(&self, r: Rect, rad: f32, blur: f32, dy: f32, c: Color) {

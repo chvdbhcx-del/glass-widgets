@@ -29,6 +29,8 @@ pub struct Metrics {
     pub seg_r: f32,
     pub seg_track_r: f32,
     pub seg_pad_x: f32,
+    /// gap between segments (4 in Pill, 0 in Settings)
+    pub seg_gap: f32,
     /// switch: width, height, knob diameter, knob inset, knob growth while pressed
     pub sw_w: f32,
     pub sw_h: f32,
@@ -45,6 +47,13 @@ pub struct Metrics {
     /// chip / badge heights
     pub chip_h: f32,
     pub badge_h: f32,
+    /// font size / weight of button labels and segment labels (`.btn`: 12/600 in Pill, 13/400 in Settings)
+    pub btn_fs: f32,
+    pub btn_fw: u16,
+    pub seg_fs: f32,
+    pub seg_fw: u16,
+    /// duration of the switch knob spring (`0.38 s` in Pill, `0.45 s` in Settings)
+    pub sw_spring: f32,
 }
 
 /// Colours and metrics. All colours are straight RGBA.
@@ -124,6 +133,7 @@ impl Metrics {
         seg_r: 8.0,
         seg_track_r: 12.0,
         seg_pad_x: 12.0,
+        seg_gap: 4.0,
         sw_w: 40.0,
         sw_h: 24.0,
         sw_knob: 18.0,
@@ -136,6 +146,11 @@ impl Metrics {
         box_r: 5.0,
         chip_h: 24.0,
         badge_h: 16.0,
+        btn_fs: 12.0,
+        btn_fw: 600,
+        seg_fs: 12.0,
+        seg_fw: 500,
+        sw_spring: 0.38,
     };
 
     /// `settings.css`: 32 px buttons with 8 px radius, 3 px padded 26 px segments, 44 x 24 switch with a 20 px knob, 14 px slider thumb.
@@ -154,6 +169,7 @@ impl Metrics {
         seg_r: 6.0,
         seg_track_r: 8.0,
         seg_pad_x: 14.0,
+        seg_gap: 0.0,
         sw_w: 44.0,
         sw_h: 24.0,
         sw_knob: 20.0,
@@ -166,6 +182,11 @@ impl Metrics {
         box_r: 5.0,
         chip_h: 30.0,
         badge_h: 16.0,
+        btn_fs: 13.0,
+        btn_fw: 400,
+        seg_fs: 13.0,
+        seg_fw: 400,
+        sw_spring: 0.45,
     };
 }
 
@@ -397,6 +418,14 @@ impl Theme {
     /// 13 px body (rows, inputs)
     pub fn body(&self) -> Style {
         Style::new(13.0, 400)
+    }
+    /// Label of buttons (`.btn`).
+    pub fn btn_text(&self) -> Style {
+        Style::new(self.m.btn_fs, self.m.btn_fw)
+    }
+    /// Label of segmented-control items.
+    pub fn seg_text(&self) -> Style {
+        Style::new(self.m.seg_fs, self.m.seg_fw)
     }
     /// 14 px card titles
     pub fn base(&self) -> Style {
