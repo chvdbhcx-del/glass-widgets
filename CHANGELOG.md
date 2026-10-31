@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.5] - 2026-10-31
 
 ### Fixed
 - Brightness slider no longer changes the monitor brightness when the display turns off or wakes up: a drag only lives while a mouse button is held, nothing is written (and nothing is re-read) while the display is off or the session is locked, and the brightness is re-read once, 2 s after the wake.
