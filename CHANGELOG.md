@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- Brightness is remembered and restored after the display wakes up (setting 'Keep brightness after sleep' in the Quick Actions card menu, on by default). If the monitor comes back at a different brightness and you have not touched the slider, the remembered value is written back (verified, at most 3 tries). Diagnostic log: `%LOCALAPPDATA%\Glass Widgetsrightness.log` (last 200 lines).
+- Brightness is remembered and restored after the display wakes up (setting 'Keep brightness after sleep' in the Quick Actions card menu, on by default). If the monitor comes back at a different brightness and you have not touched the slider, the remembered value is written back (verified, at most 3 tries). Diagnostic log: `%LOCALAPPDATA%\Glass Widgets\brightness.log` (last 200 lines).
 
 ## [0.7.5] - 2026-10-31
 
