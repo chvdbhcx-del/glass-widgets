@@ -12,6 +12,7 @@
 //! swells under the pointer, button plates ease in / out on hover and press, and a button whose look changes (a toggle, the armed
 //! "Click again") cross-fades: `draw` leaves it out for ~170 ms and `overlay` paints the old and the new look. `Tick::Fps(60)` only while
 //! something moves.
+use crate::autopause;
 use crate::registry::{Registry, WidgetDef};
 use crate::sys::targets;
 use crate::widget::*;
@@ -27,6 +28,7 @@ use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, 
 use windows::Win32::System::Power::SetSuspendState;
 use windows::Win32::System::Registry::{RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD};
 use windows::Win32::System::Shutdown::LockWorkStation;
+use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE};
 
 /// deeper red of an armed power button (white text stays legible)
@@ -440,6 +442,36 @@ fn read_brightness() -> Option<(u32, BriMode)> {
     read_ddc().or_else(|| read_wmi().map(|v| (v, BriMode::Wmi)))
 }
 
+/// What slider writes and brightness probes are gated on. The real one asks the OS; tests plug fakes in.
+#[derive(Clone, Copy)]
+struct Gate {
+    /// a mouse button is physically down (a drag only lives while it is)
+    btn_down: fn() -> bool,
+    /// the display is off, the session is locked or the PC is suspending (autopause's message-driven reasons)
+    asleep: fn() -> bool,
+}
+
+const REAL_GATE: Gate = Gate {
+    btn_down: || unsafe { GetAsyncKeyState(0x01) < 0 || GetAsyncKeyState(0x02) < 0 }, // both: swapped buttons
+    asleep: || autopause::raised() & autopause::MESSAGES != 0,
+};
+
+/// The tick runs at least every 2 s; a longer silence means the host put the desk to sleep (monitor off, lock, suspend).
+const PAUSE_GAP: Duration = Duration::from_secs(6);
+/// Re-read the brightness this long after the desk wakes (the monitor needs a moment before DDC answers sanely).
+const WAKE_PROBE: Duration = Duration::from_secs(2);
+
+/// Fold a brightness probe into what we know. A failed read keeps the state, and once the mode is known its kind never flips
+/// (a monitor that is waking up failing one DDC read must not drop us to WMI). The value is only shown: a probe never writes.
+fn fold_probe(bri: Option<u32>, mode: Option<BriMode>, res: Option<(u32, BriMode)>, writing: bool) -> (Option<u32>, Option<BriMode>) {
+    match (res, mode) {
+        (Some((v, m)), None) => (Some(v), Some(m)),
+        (Some((v, m)), Some(old)) if std::mem::discriminant(&m) == std::mem::discriminant(&old) => (if writing { bri } else { Some(v) }, Some(m)),
+        (None, None) => (None, None),
+        _ => (bri, mode),
+    }
+}
+
 fn set_brightness(mode: BriMode, pct: u32) {
     match mode {
         BriMode::Ddc { min, max } => {
@@ -500,6 +532,12 @@ struct Controls {
     bri_q: Coalesce,
     bri_job: Option<Pending<()>>,
     drag: Option<Hit>,
+    gate: Gate,
+    /// previous tick (a long silence = the desk slept) and whether the last tick saw it asleep
+    last_tick: Option<Instant>,
+    asleep_seen: bool,
+    /// no brightness probe before this moment (set on wake)
+    probe_after: Option<Instant>,
     hot: Option<Hit>,
     down: Option<Hit>,
     /// the press began on a slider's glyph (its Settings page opens on release over the same glyph); the slider itself is not touched
@@ -544,6 +582,10 @@ impl Default for Controls {
             bri_q: Coalesce::default(),
             bri_job: None,
             drag: None,
+            gate: REAL_GATE,
+            last_tick: None,
+            asleep_seen: false,
+            probe_after: None,
             hot: None,
             down: None,
             icon_down: None,
@@ -611,16 +653,76 @@ impl Controls {
         }
     }
 
-    fn set_bri(&mut self, cx: &Cx, v: u32) {
-        let (Some(mode), Some(cur)) = (self.bri_mode, self.bri) else { return };
+    /// The one gate every brightness write goes through: Some = start a write job now. Nothing is written while the desk sleeps.
+    fn bri_req(&mut self, v: u32) -> Option<(BriMode, u32)> {
+        let (Some(mode), Some(cur)) = (self.bri_mode, self.bri) else { return None };
+        if (self.gate.asleep)() {
+            return None;
+        }
         let v = v.min(100);
         if v == cur {
-            return;
+            return None;
         }
         self.bri = Some(v);
         self.touch();
-        if let Some(go) = self.bri_q.request(v) {
+        self.bri_q.request(v).map(|go| (mode, go))
+    }
+
+    fn set_bri(&mut self, cx: &Cx, v: u32) {
+        if let Some((mode, go)) = self.bri_req(v) {
             self.bri_job = Some(cx.spawn(move || set_brightness(mode, go)));
+        }
+    }
+
+    fn drop_gesture(&mut self) {
+        (self.drag, self.down, self.icon_down) = (None, None, None);
+    }
+
+    /// A slider drag lives only while a button is physically down and the desk is awake: a lost Up / Leave (capture taken, display
+    /// off, lock) must not leave it armed for the next pointer move.
+    fn drag_alive(&self) -> bool {
+        (self.gate.btn_down)() && !(self.gate.asleep)()
+    }
+
+    /// The value the running drag moves its slider to (None = no live drag; a dead one is dropped here).
+    fn drag_value(&mut self, vol: Option<Rect>, bri: Option<Rect>, x: f32) -> Option<(Hit, u32)> {
+        let hit = self.drag?;
+        if !self.drag_alive() {
+            self.drop_gesture();
+            return None;
+        }
+        match (hit, vol, bri) {
+            (Hit::Vol, Some(r), _) | (Hit::Bri, _, Some(r)) => Some((hit, Self::slider_at(r, x))),
+            _ => None,
+        }
+    }
+
+    /// Every tick: notice that the desk slept (the host kills the tick timer meanwhile, so a long gap is the sign) and drop everything
+    /// that could replay into the hardware after the wake: the gesture, the queued wanted values, a probe that was in flight.
+    fn note_tick(&mut self, now: Instant) {
+        let asleep = (self.gate.asleep)();
+        let gap = self.last_tick.is_some_and(|t| now.saturating_duration_since(t) > PAUSE_GAP);
+        self.last_tick = Some(now);
+        if asleep || self.asleep_seen || gap {
+            self.drop_gesture();
+            (self.bri_q.want, self.vol_q.want, self.bri_probe) = (None, None, None);
+            self.probe_after = (!asleep).then(|| now + WAKE_PROBE);
+        }
+        self.asleep_seen = asleep;
+    }
+
+    /// Spawn a brightness probe now? Never while asleep or right after the wake; once ~2 s after it; else on the slow periodic schedule.
+    fn probe_ready(&mut self, now: Instant, periodic: bool) -> bool {
+        if (self.gate.asleep)() || self.bri_probe.is_some() || self.bri_mode.is_none() || self.bri_q.busy {
+            return false;
+        }
+        match self.probe_after {
+            Some(t) if now < t => false,
+            Some(_) => {
+                self.probe_after = None;
+                true
+            }
+            None => periodic,
         }
     }
 
@@ -990,6 +1092,7 @@ impl Widget for Controls {
         if cx.preview {
             return Tick::Never;
         }
+        self.note_tick(Instant::now());
         let seen = (self.vol, self.bri);
         // finished jobs
         if let Some((res, busy)) = self.snap_job.as_ref().map(|j| (j.take(), j.busy())) {
@@ -1018,14 +1121,7 @@ impl Widget for Controls {
         if let Some((res, busy)) = self.bri_probe.as_ref().map(|j| (j.take(), j.busy())) {
             if res.is_some() || !busy {
                 self.bri_probe = None;
-                if let Some((v, mode)) = res.flatten() {
-                    if !self.bri_q.busy {
-                        self.bri = Some(v);
-                    }
-                    self.bri_mode = Some(mode);
-                } else if self.bri_mode.is_none() {
-                    self.bri = None;
-                }
+                (self.bri, self.bri_mode) = fold_probe(self.bri, self.bri_mode, res.flatten(), self.bri_q.busy);
                 self.bri_in = true;
                 self.ver += 1;
             }
@@ -1040,7 +1136,8 @@ impl Widget for Controls {
         }
         if self.bri_job.as_ref().is_some_and(|j| j.take().is_some() || !j.busy()) {
             self.bri_job = None;
-            if let (Some(v), Some(mode)) = (self.bri_q.done(), self.bri_mode) {
+            let next = self.bri_q.done();
+            if let (Some(v), Some(mode), false) = (next, self.bri_mode, (self.gate.asleep)()) {
                 self.bri_job = Some(cx.spawn(move || set_brightness(mode, v)));
             }
         }
@@ -1048,6 +1145,7 @@ impl Widget for Controls {
             cx.request_frame();
         }
         // the 2 s poll
+        let mut periodic = false;
         if self.snap_job.is_none() && self.snap_in && self.drag.is_none() && poll_due(self.last_poll.map(|t| t.elapsed())) {
             self.last_poll = Some(Instant::now());
             self.polls += 1;
@@ -1055,9 +1153,10 @@ impl Widget for Controls {
                 let radios = self.polls % 5 == 0;
                 move || read_snap(radios)
             }));
-            if self.polls % 60 == 0 && self.bri_probe.is_none() && self.bri_mode.is_some() && !self.bri_q.busy {
-                self.bri_probe = Some(cx.spawn(read_brightness));
-            }
+            periodic = self.polls % 60 == 0;
+        }
+        if self.probe_ready(Instant::now(), periodic) {
+            self.bri_probe = Some(cx.spawn(read_brightness));
         }
         // arm / confirm expiry
         let now = self.ms();
@@ -1103,19 +1202,16 @@ impl Widget for Controls {
                     self.hot = hit;
                     changed = true;
                 }
-                match (self.drag, lay.vol, lay.bri) {
-                    (Some(Hit::Vol), Some(r), _) => {
-                        let v = Self::slider_at(r, ev.x);
+                let had_drag = self.drag.is_some();
+                if let Some((h, v)) = self.drag_value(lay.vol, lay.bri, ev.x) {
+                    if h == Hit::Vol {
                         self.set_vol(cx, v);
-                        changed = true;
-                    }
-                    (Some(Hit::Bri), _, Some(r)) => {
-                        let v = Self::slider_at(r, ev.x);
+                    } else {
                         self.set_bri(cx, v);
-                        changed = true;
                     }
-                    _ => {}
+                    changed = true;
                 }
+                changed |= had_drag && self.drag.is_none();
             }
             MouseKind::Down if ev.button == Button::Left => {
                 // a press on a slider's glyph is a click on the glyph, not a jump of the slider to its start
@@ -1312,6 +1408,128 @@ mod tests {
         assert_eq!(l.icon_at(24.0, 70.0), Some(targets::DISPLAY));
         assert_eq!(l.icon_at(100.0, 30.0), None);
         assert!(l.items.iter().all(|i| l.icon_at(i.hit.cx(), i.hit.cy()).is_none()));
+    }
+
+    // ---- brightness safety: fakes for the physical button and the sleep state (per test thread)
+    thread_local! {
+        static BTN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static ASLEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    const FAKE: Gate = Gate { btn_down: || BTN.with(|c| c.get()), asleep: || ASLEEP.with(|c| c.get()) };
+
+    fn rig(btn: bool, asleep: bool) -> Controls {
+        BTN.with(|c| c.set(btn));
+        ASLEEP.with(|c| c.set(asleep));
+        Controls { gate: FAKE, bri: Some(50), bri_mode: Some(BriMode::Wmi), drag: Some(Hit::Bri), down: Some(Hit::Bri), ..Controls::default() }
+    }
+
+    const ROW: fn() -> Option<Rect> = || Some(Rect::new(0.0, 0.0, 300.0, 40.0));
+
+    #[test]
+    fn stale_drag_without_button_writes_nothing() {
+        let mut c = rig(false, false);
+        // the pointer is far beyond the slider's end: with the old code this was a write of 100
+        assert_eq!(c.drag_value(None, ROW(), 9999.0), None);
+        assert!(c.drag.is_none() && c.down.is_none(), "the dead drag is dropped");
+        assert_eq!(c.drag_value(None, ROW(), 9999.0), None, "and stays dead");
+        assert_eq!((c.bri, c.bri_q.busy), (Some(50), false));
+    }
+
+    #[test]
+    fn live_drag_follows_the_pointer_and_may_reach_the_end() {
+        let mut c = rig(true, false);
+        assert_eq!(c.drag_value(None, ROW(), 9999.0), Some((Hit::Bri, 100)), "a real drag past the end is 100");
+        assert!(c.drag.is_some());
+        assert_eq!(c.bri_req(100), Some((BriMode::Wmi, 100)));
+        // a drag on a slider the layout does not have writes nothing
+        assert_eq!(c.drag_value(None, None, 10.0), None);
+    }
+
+    #[test]
+    fn no_drag_no_value() {
+        let mut c = rig(true, false);
+        c.drag = None;
+        assert_eq!(c.drag_value(ROW(), ROW(), 10.0), None);
+    }
+
+    #[test]
+    fn nothing_is_written_while_the_desk_sleeps() {
+        let mut c = rig(true, true);
+        assert_eq!(c.drag_value(None, ROW(), 9999.0), None, "button 'down' but the display is off: the drag is dead");
+        assert!(c.drag.is_none());
+        assert_eq!(c.bri_req(100), None, "not even a wheel / press write");
+        assert_eq!((c.bri, c.bri_q.busy, c.bri_q.want), (Some(50), false, None));
+    }
+
+    #[test]
+    fn pause_and_resume_clear_the_replay_state() {
+        let mut c = rig(true, false);
+        let t0 = Instant::now();
+        c.note_tick(t0);
+        assert!(c.drag.is_some(), "an ordinary tick keeps a live drag");
+        // a write is in flight and a newer value waits behind it
+        assert!(c.bri_req(80).is_some());
+        assert_eq!(c.bri_req(90), None);
+        assert_eq!(c.bri_q.want, Some(90));
+        // the display goes off
+        ASLEEP.with(|a| a.set(true));
+        c.note_tick(t0 + Duration::from_secs(1));
+        assert!(c.drag.is_none() && c.down.is_none());
+        assert_eq!(c.bri_q.want, None, "the wanted value cannot replay after the wake");
+        assert_eq!(c.probe_after, None);
+        assert!(!c.probe_ready(t0 + Duration::from_secs(60), true), "no probe while asleep");
+        assert_eq!(c.bri_q.done(), None);
+        // wake: the first awake tick schedules the single re-probe 2 s later
+        ASLEEP.with(|a| a.set(false));
+        let w = t0 + Duration::from_secs(30);
+        c.note_tick(w);
+        assert!(!c.probe_ready(w + Duration::from_millis(1999), true), "not before 2 s");
+        assert!(c.probe_ready(w + WAKE_PROBE, false), "once, 2 s after the wake");
+        assert!(!c.probe_ready(w + Duration::from_secs(3), false), "and only once");
+    }
+
+    #[test]
+    fn a_long_tick_gap_is_a_missed_sleep() {
+        // the tick timer is dead while the display is off, so the next tick may already see an awake desk
+        let mut c = rig(true, false);
+        c.bri_q.want = Some(77);
+        let t0 = Instant::now();
+        c.note_tick(t0);
+        assert_eq!(c.bri_q.want, Some(77), "the first tick has no gap to judge");
+        c.note_tick(t0 + Duration::from_secs(2));
+        assert_eq!(c.bri_q.want, Some(77), "a normal 2 s tick leaves the queue alone");
+        c.note_tick(t0 + Duration::from_secs(30));
+        assert_eq!((c.bri_q.want, c.drag), (None, None));
+        assert_eq!(c.probe_after, Some(t0 + Duration::from_secs(32)));
+    }
+
+    #[test]
+    fn periodic_probe_waits_for_quiet() {
+        let mut c = rig(false, false);
+        let now = Instant::now();
+        c.drag = None;
+        assert!(!c.probe_ready(now, false));
+        assert!(c.probe_ready(now, true));
+        c.bri_q.busy = true;
+        assert!(!c.probe_ready(now, true), "never while a write runs");
+        c.bri_q.busy = false;
+        c.bri_mode = None;
+        assert!(!c.probe_ready(now, true), "no brightness hardware: nothing to re-read");
+    }
+
+    #[test]
+    fn probe_results_never_flip_the_mode() {
+        let ddc = BriMode::Ddc { min: 0, max: 100 };
+        // first read decides the mode
+        assert_eq!(fold_probe(None, None, Some((70, ddc)), false), (Some(70), Some(ddc)));
+        assert_eq!(fold_probe(None, None, None, false), (None, None));
+        // a failed read keeps value and mode
+        assert_eq!(fold_probe(Some(70), Some(ddc), None, false), (Some(70), Some(ddc)));
+        // a WMI answer while DDC is known is ignored (a waking monitor must not switch us over)
+        assert_eq!(fold_probe(Some(70), Some(ddc), Some((100, BriMode::Wmi)), false), (Some(70), Some(ddc)));
+        // same kind updates the value, but not under a running write
+        assert_eq!(fold_probe(Some(70), Some(ddc), Some((40, ddc)), false), (Some(40), Some(ddc)));
+        assert_eq!(fold_probe(Some(70), Some(ddc), Some((40, ddc)), true), (Some(70), Some(ddc)));
     }
 
     /// Read-only hardware probe, run once by hand: `cargo test -- --ignored --nocapture hw_probe`
