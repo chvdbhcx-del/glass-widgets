@@ -17,6 +17,7 @@ mod accent;
 mod autopause;
 mod autostart;
 mod backdrop;
+mod brightness_keeper;
 mod calib;
 mod cards;
 mod fonts;

@@ -326,7 +326,7 @@ impl App {
         self.modal_begin();
         self.boost_capture();
         self.reduced = reduced_motion();
-        self.ui.open_menu(&self.scene, &self.gfx, menu::card_menu_with(req.lang, req.editing, &req.sizes, req.cur, req.click.clone()), anchor, work);
+        self.ui.open_menu(&self.scene, &self.gfx, menu::card_menu_opt(req.lang, req.editing, &req.sizes, req.cur, req.click.clone(), req.opt.clone()), anchor, work);
         self.menu_uid = req.uid;
         (self.prompt_was_fg, self.prompt_t0, self.menu_last, self.menu_shown) = (false, Instant::now(), Instant::now(), None);
         let full = RECT { left: 0, top: 0, right: self.scene.w, bottom: self.scene.h };
@@ -427,6 +427,7 @@ impl App {
         match id {
             c if (CMD_SIZE..CMD_SIZE + 3).contains(&c) => self.change_size(uid, Size::ALL[c - CMD_SIZE]),
             CMD_DELETE => self.remove_card(uid),
+            crate::menu::CMD_CARD_OPT => self.toggle_option(uid),
             c if menu::click_pick(c).is_some() => self.click_choice(uid, c),
             _ => {}
         }

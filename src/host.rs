@@ -22,7 +22,7 @@ use crate::monitors;
 use crate::motion::{self, MatState};
 use crate::prompt::{Act, Key, Mods};
 use crate::layout::{AccentMode, AccentScope};
-use crate::menu::{self, ClickPick, MAct, CMD_DELETE, CMD_EDIT, CMD_SIZE};
+use crate::menu::{self, ClickPick, MAct, CMD_CARD_OPT, CMD_DELETE, CMD_EDIT, CMD_SIZE};
 use crate::tray::{self, TrayCmd};
 use crate::ui::{self, Hit, SAct, SKey, Ui};
 use crate::update::{self, UpdateState};
@@ -203,6 +203,8 @@ struct MenuReq {
     lang: Lang,
     /// the "Click action" submenu (None = the widget has no card-body click)
     click: Option<menu::Item>,
+    /// the widget's on/off option (checked = on), e.g. Quick Actions' "Keep brightness after sleep"
+    opt: Option<menu::Item>,
 }
 
 struct App {
@@ -2313,7 +2315,8 @@ impl App {
         let def = crate::registry::global().get(&c.type_id)?;
         let (x, y) = unpack(lp);
         let click = menu::click_item(self.ui.lang, &c.type_id, &crate::sys::targets::Click::from_cfg(&c.cfg));
-        Some(MenuReq { uid, x, y, sizes: def.sizes.to_vec(), cur: c.size, editing: self.ui.edit, lang: self.ui.lang, click })
+        let opt = menu::option_item(self.ui.lang, &c.type_id, &c.cfg);
+        Some(MenuReq { uid, x, y, sizes: def.sizes.to_vec(), cur: c.size, editing: self.ui.edit, lang: self.ui.lang, click, opt })
     }
 
     /// A "Click action" menu command for card `uid`: store the choice in the card's cfg (persisted like any widget setting), or ask for a
@@ -2339,6 +2342,23 @@ impl App {
             None => return,
         };
         self.set_click(uid, choice);
+    }
+
+    /// The card's on/off menu option: flip its cfg bool (persisted like any widget setting; the widget reads it on its next tick).
+    unsafe fn toggle_option(&mut self, uid: usize) {
+        let Some(i) = self.scene.index_of_uid(uid) else { return };
+        let Some((key, default, ..)) = menu::card_option(&self.scene.cards[i].type_id) else { return };
+        self.scene.touch_cfg(i, |cfg| {
+            let on = cfg.get(key).and_then(|v| v.as_bool()).unwrap_or(default);
+            if !cfg.is_object() {
+                *cfg = serde_json::json!({});
+            }
+            cfg[key] = serde_json::json!(!on);
+        });
+        let now = self.now();
+        if let Some(r) = self.settle(i, &now, false) {
+            self.frame(r);
+        }
     }
 
     unsafe fn set_click(&mut self, uid: usize, choice: crate::sys::targets::Click) {
@@ -2392,6 +2412,7 @@ impl App {
             }
             c if (CMD_SIZE..CMD_SIZE + 3).contains(&c) => self.change_size(req.uid, Size::ALL[c - CMD_SIZE]),
             CMD_DELETE => self.remove_card(req.uid),
+            CMD_CARD_OPT => self.toggle_option(req.uid),
             c if menu::click_pick(c).is_some() => self.click_choice(req.uid, c),
             _ => {}
         }

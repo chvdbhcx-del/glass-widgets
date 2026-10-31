@@ -61,13 +61,38 @@ pub fn click_item(lang: Lang, widget: &str, cur: &crate::sys::targets::Click) ->
     Some(Item::new(0, lang.pick("Действие по клику", "Click action")).sub(kids))
 }
 
+/// Command id of the one widget-specific on/off option of a card (see `option_item`).
+pub const CMD_CARD_OPT: usize = 200;
+
+/// The cfg key and labels (ru, en) of a widget's on/off option, shown as a checkable item in its card menu; None for most widgets.
+pub fn card_option(widget: &str) -> Option<(&'static str, bool, &'static str, &'static str)> {
+    match widget {
+        // (cfg key, default, ru, en)
+        "controls" => Some(("restoreBrightness", true, "Сохранять яркость после сна", "Keep brightness after sleep")),
+        _ => None,
+    }
+}
+
+/// The checkable option item of widget `widget` with its current value in `cfg`.
+pub fn option_item(lang: Lang, widget: &str, cfg: &serde_json::Value) -> Option<Item> {
+    let (key, default, ru, en) = card_option(widget)?;
+    let on = cfg.get(key).and_then(|v| v.as_bool()).unwrap_or(default);
+    Some(Item::new(CMD_CARD_OPT, lang.pick(ru, en)).checked(on))
+}
+
 /// `card_menu` plus the "Click action" submenu (between "Size" and the separator).
 pub fn card_menu_with(lang: Lang, editing: bool, sizes: &[Size], cur: Size, click: Option<Item>) -> Vec<Entry> {
+    card_menu_opt(lang, editing, sizes, cur, click, None)
+}
+
+/// `card_menu_with` plus the widget's on/off option (after the click action).
+pub fn card_menu_opt(lang: Lang, editing: bool, sizes: &[Size], cur: Size, click: Option<Item>, opt: Option<Item>) -> Vec<Entry> {
     let edit = lang.pick(if editing { "Готово" } else { "Изменить виджеты…" }, if editing { "Done" } else { "Edit Widgets…" });
     let names = [(Size::S, lang.pick("Маленький (S)", "Small (S)")), (Size::M, lang.pick("Средний (M)", "Medium (M)")), (Size::L, lang.pick("Большой (L)", "Large (L)"))];
     let kids = names.iter().enumerate().map(|(i, (sz, name))| Entry::Item(Item::new(CMD_SIZE + i, name).checked(*sz == cur).enabled(sizes.contains(sz)))).collect();
     let mut v = vec![Entry::Item(Item::new(CMD_EDIT, edit)), Entry::Item(Item::new(0, lang.pick("Размер", "Size")).enabled(sizes.len() > 1).sub(kids))];
     v.extend(click.map(Entry::Item));
+    v.extend(opt.map(Entry::Item));
     v.push(Entry::Sep);
     v.push(Entry::Item(Item::new(CMD_DELETE, lang.pick("Удалить виджет", "Remove Widget")).destructive()));
     v
@@ -102,6 +127,19 @@ mod tests {
         // edit mode: the first item reads "Done"
         assert_eq!(card_menu(Lang::En, true, &Size::ALL, Size::M)[0].item().unwrap().label, "Done");
         assert_eq!(card_menu(Lang::Ru, false, &Size::ALL, Size::M)[0].item().unwrap().label, "Изменить виджеты…");
+    }
+
+    #[test]
+    fn controls_card_has_the_keep_brightness_option() {
+        use serde_json::json;
+        assert!(option_item(Lang::En, "clock", &json!({})).is_none());
+        let on = option_item(Lang::En, "controls", &json!({})).unwrap();
+        assert!(on.checked && on.id == CMD_CARD_OPT && on.label == "Keep brightness after sleep", "default is on");
+        assert!(!option_item(Lang::Ru, "controls", &json!({"restoreBrightness": false})).unwrap().checked);
+        assert_eq!(option_item(Lang::Ru, "controls", &json!(null)).unwrap().label, "Сохранять яркость после сна");
+        let m = card_menu_opt(Lang::En, false, &Size::ALL, Size::M, None, Some(on));
+        let ids: Vec<Option<usize>> = m.iter().map(|e| e.item().map(|i| i.id)).collect();
+        assert_eq!(ids, vec![Some(CMD_EDIT), Some(0), Some(CMD_CARD_OPT), None, Some(CMD_DELETE)]);
     }
 
     #[test]

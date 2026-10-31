@@ -13,6 +13,7 @@
 //! "Click again") cross-fades: `draw` leaves it out for ~170 ms and `overlay` paints the old and the new look. `Tick::Fps(60)` only while
 //! something moves.
 use crate::autopause;
+use crate::brightness_keeper::{Act, Keeper, Log};
 use crate::registry::{Registry, WidgetDef};
 use crate::sys::targets;
 use crate::widget::*;
@@ -538,6 +539,9 @@ struct Controls {
     asleep_seen: bool,
     /// no brightness probe before this moment (set on wake)
     probe_after: Option<Instant>,
+    /// remembers the user's brightness and restores it after a wake (`restoreBrightness`, default on)
+    keep: Keeper,
+    restore: bool,
     hot: Option<Hit>,
     down: Option<Hit>,
     /// the press began on a slider's glyph (its Settings page opens on release over the same glyph); the slider itself is not touched
@@ -586,6 +590,8 @@ impl Default for Controls {
             last_tick: None,
             asleep_seen: false,
             probe_after: None,
+            keep: Keeper::new(Log::mem()),
+            restore: true,
             hot: None,
             down: None,
             icon_down: None,
@@ -610,7 +616,7 @@ pub fn register(r: &mut Registry) {
         icon: Glyph::Power,
         sizes: &[Size::S, Size::M, Size::L],
         default_size: Size::M,
-        make: || Box::new(Controls::default()),
+        make: || Box::new(Controls { keep: Keeper::new(Log::file()), ..Controls::default() }),
     });
 }
 
@@ -660,12 +666,23 @@ impl Controls {
             return None;
         }
         let v = v.min(100);
+        self.keep.gesture(v, Instant::now()); // the user's choice is the brightness to keep
         if v == cur {
             return None;
         }
         self.bri = Some(v);
         self.touch();
         self.bri_q.request(v).map(|go| (mode, go))
+    }
+
+    /// The keeper's restore write: same hardware path as a slider write, but not a gesture and not skipped when the shown value matches.
+    fn restore_req(&mut self, v: u32) -> Option<(BriMode, u32)> {
+        let mode = self.bri_mode?;
+        if (self.gate.asleep)() {
+            return None;
+        }
+        self.bri = Some(v.min(100));
+        self.bri_q.request(v.min(100)).map(|go| (mode, go))
     }
 
     fn set_bri(&mut self, cx: &Cx, v: u32) {
@@ -706,7 +723,12 @@ impl Controls {
         if asleep || self.asleep_seen || gap {
             self.drop_gesture();
             (self.bri_q.want, self.vol_q.want, self.bri_probe) = (None, None, None);
-            self.probe_after = (!asleep).then(|| now + WAKE_PROBE);
+            self.keep.sleep(); // remembers the user's brightness (idempotent)
+            self.probe_after = None;
+            if !asleep {
+                self.keep.wake(now, self.restore);
+                self.probe_after = Some(self.keep.next_probe().unwrap_or(now + WAKE_PROBE));
+            }
         }
         self.asleep_seen = asleep;
     }
@@ -1092,6 +1114,7 @@ impl Widget for Controls {
         if cx.preview {
             return Tick::Never;
         }
+        self.restore = cx.cfg_bool("restoreBrightness").unwrap_or(true);
         self.note_tick(Instant::now());
         let seen = (self.vol, self.bri);
         // finished jobs
@@ -1121,7 +1144,17 @@ impl Widget for Controls {
         if let Some((res, busy)) = self.bri_probe.as_ref().map(|j| (j.take(), j.busy())) {
             if res.is_some() || !busy {
                 self.bri_probe = None;
-                (self.bri, self.bri_mode) = fold_probe(self.bri, self.bri_mode, res.flatten(), self.bri_q.busy);
+                let res = res.flatten();
+                // the keeper only trusts a read of the kind we already drive (a WMI answer under DDC is a failed read)
+                let read = res.filter(|(_, m)| self.bri_mode.map_or(true, |o| std::mem::discriminant(&o) == std::mem::discriminant(m))).map(|(v, _)| v);
+                (self.bri, self.bri_mode) = fold_probe(self.bri, self.bri_mode, res, self.bri_q.busy);
+                let act = self.keep.observe(Instant::now(), read, self.restore);
+                self.probe_after = self.keep.next_probe();
+                if let Act::Write(v) = act {
+                    if let Some((mode, go)) = self.restore_req(v) {
+                        self.bri_job = Some(cx.spawn(move || set_brightness(mode, go)));
+                    }
+                }
                 self.bri_in = true;
                 self.ver += 1;
             }
@@ -1153,7 +1186,9 @@ impl Widget for Controls {
                 let radios = self.polls % 5 == 0;
                 move || read_snap(radios)
             }));
-            periodic = self.polls % 60 == 0;
+            // DDC is cheap: read every ~16 s so a change made at the monitor is noticed before it sleeps; WMI (a PowerShell) every 2 min
+            let every = if self.restore && matches!(self.bri_mode, Some(BriMode::Ddc { .. })) { 8 } else { 60 };
+            periodic = self.polls % every == 0;
         }
         if self.probe_ready(Instant::now(), periodic) {
             self.bri_probe = Some(cx.spawn(read_brightness));
@@ -1501,6 +1536,50 @@ mod tests {
         c.note_tick(t0 + Duration::from_secs(30));
         assert_eq!((c.bri_q.want, c.drag), (None, None));
         assert_eq!(c.probe_after, Some(t0 + Duration::from_secs(32)));
+    }
+
+    #[test]
+    fn sleep_wake_restores_the_remembered_brightness_through_the_write_path() {
+        let ddc = BriMode::Ddc { min: 0, max: 100 };
+        let mut c = rig(false, false);
+        (c.drag, c.down, c.bri, c.bri_mode) = (None, None, Some(26), Some(ddc));
+        let t0 = Instant::now();
+        c.keep.observe(t0, Some(26), true); // seeded by the first probe
+        c.note_tick(t0);
+        // the display goes off for a while; the first awake tick sees the gap and schedules the wake check
+        let w = t0 + Duration::from_secs(600);
+        c.note_tick(w);
+        assert_eq!(c.probe_after, Some(w + Duration::from_secs(2)));
+        // the monitor woke at 100: the probe result makes the keeper ask for a write of 26, which goes out even though the shown value is 26
+        c.bri = Some(100);
+        assert_eq!(c.keep.observe(w + Duration::from_secs(2), Some(100), true), Act::Write(26));
+        assert_eq!(c.restore_req(26), Some((ddc, 26)));
+        assert_eq!(c.bri, Some(26));
+        // a restore is not a gesture: the remembered value stays, and a user write afterwards cancels the check
+        assert_eq!(c.keep.last_good(), Some(26));
+        assert_eq!(c.bri_req(40), None, "queued behind the running restore write");
+        assert_eq!((c.keep.last_good(), c.keep.next_probe()), (Some(40), None));
+    }
+
+    #[test]
+    fn restore_never_writes_while_asleep_or_without_a_mode() {
+        let mut c = rig(false, true);
+        assert_eq!(c.restore_req(26), None);
+        let mut c = rig(false, false);
+        c.bri_mode = None;
+        assert_eq!(c.restore_req(26), None);
+    }
+
+    #[test]
+    fn setting_off_keeps_the_old_behaviour() {
+        let mut c = rig(false, false);
+        c.restore = false;
+        let t0 = Instant::now();
+        c.keep.observe(t0, Some(26), false);
+        c.note_tick(t0);
+        c.note_tick(t0 + Duration::from_secs(600));
+        assert_eq!(c.probe_after, Some(t0 + Duration::from_secs(602)), "still one plain re-read after the wake");
+        assert_eq!(c.keep.observe(t0 + Duration::from_secs(602), Some(100), false), Act::None);
     }
 
     #[test]
