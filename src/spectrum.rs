@@ -128,9 +128,9 @@ const ONSET_DB: f32 = 10.0;
 const ONSET_BOOST: f32 = 0.3;
 const SILENT_DB: f32 = -120.0;
 
-/// Gain from the master volume (the loopback is captured before the volume control): gentle curve, muted = flat.
+/// Gain from the master volume (the loopback is captured before the volume control): steeper than linear so the change is plainly visible, muted = flat.
 fn volume_gain(scalar: f32, muted: bool) -> f32 {
-    if muted { 0.0 } else { scalar.clamp(0.0, 1.0).powf(0.7) }
+    if muted { 0.0 } else { scalar.clamp(0.0, 1.0).powf(1.3) }
 }
 
 impl Scaler {
@@ -499,7 +499,7 @@ mod tests {
         assert!(duck[0] < steady[0] - 0.1, "{} vs {}", duck[0], steady[0]);
         assert_eq!(volume_gain(0.8, true), 0.0);
         assert!((volume_gain(1.0, false) - 1.0).abs() < 1e-6);
-        assert!(volume_gain(0.2, false) < volume_gain(0.6, false) && volume_gain(0.2, false) > 0.2);
+        assert!(volume_gain(0.2, false) < volume_gain(0.6, false) && volume_gain(0.5, false) < 0.5);
     }
 
     /// Manual: `cargo test live_loopback -- --ignored --nocapture` while something plays on this PC.
