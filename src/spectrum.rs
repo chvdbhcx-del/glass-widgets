@@ -111,22 +111,45 @@ fn band_edge(b: usize) -> f32 {
 }
 
 /// dB per band -> bar heights 0..1: the reference follows the loudest band (up at once, down 4 dB/s), bars rise fast and fall slowly.
+/// Beat shaping: a band is judged against its own running average (a compressed loud track keeps every bar near the top, the beat is the
+/// excursion), and a jump within one frame (kick, snare) adds an onset boost.
 struct Scaler {
     reff: f32,
     lv: [f32; BANDS],
+    avg: [f32; BANDS],
+    prev: [f32; BANDS],
+}
+
+const TAU_UP: f32 = 0.012;
+const TAU_DOWN: f32 = 0.12;
+const TAU_AVG: f32 = 0.7;
+const DEVIATION_DB: f32 = 8.0;
+const ONSET_DB: f32 = 10.0;
+const ONSET_BOOST: f32 = 0.3;
+const SILENT_DB: f32 = -120.0;
+
+/// Gain from the master volume (the loopback is captured before the volume control): gentle curve, muted = flat.
+fn volume_gain(scalar: f32, muted: bool) -> f32 {
+    if muted { 0.0 } else { scalar.clamp(0.0, 1.0).powf(0.7) }
 }
 
 impl Scaler {
     fn new() -> Scaler {
-        Scaler { reff: REF_FLOOR_DB, lv: [0.0; BANDS] }
+        Scaler { reff: REF_FLOOR_DB, lv: [0.0; BANDS], avg: [SILENT_DB; BANDS], prev: [SILENT_DB; BANDS] }
     }
 
     fn step(&mut self, db: &[f32; BANDS], dt: f32) -> [f32; BANDS] {
         let peak = db.iter().cloned().fold(-200.0, f32::max);
-        self.reff = if peak > self.reff { peak } else { (self.reff - 4.0 * dt).max(peak) }.max(REF_FLOOR_DB);
-        let (up, down) = (1.0 - (-dt / 0.03).exp(), 1.0 - (-dt / 0.22).exp());
-        for (l, &d) in self.lv.iter_mut().zip(db) {
-            let v = ((d - (self.reff - RANGE_DB)) / RANGE_DB).clamp(0.0, 1.0);
+        self.reff = if peak > self.reff { peak } else { (self.reff - 6.0 * dt).max(peak) }.max(REF_FLOOR_DB);
+        let (up, down) = (1.0 - (-dt / TAU_UP).exp(), 1.0 - (-dt / TAU_DOWN).exp());
+        let k_avg = 1.0 - (-dt / TAU_AVG).exp();
+        for (i, (l, &d)) in self.lv.iter_mut().zip(db).enumerate() {
+            let base = ((d - (self.reff - RANGE_DB)) / RANGE_DB).clamp(0.0, 1.0);
+            let hit = (0.5 + (d - self.avg[i]) / (2.0 * DEVIATION_DB)).clamp(0.0, 1.0);
+            let onset = ((d - self.prev[i]) / ONSET_DB).clamp(0.0, 1.0);
+            self.avg[i] += (d - self.avg[i]) * k_avg;
+            self.prev[i] = d;
+            let v = (base * (0.7 + 0.6 * hit) + onset * ONSET_BOOST * base).clamp(0.0, 1.0);
             *l += (v - *l) * if v > *l { up } else { down };
         }
         self.lv
@@ -227,6 +250,7 @@ struct Stream {
     ring: Vec<f32>,
     pos: usize,
     added: usize,
+    vol: Option<windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume>,
 }
 
 unsafe fn device_id(en: &IMMDeviceEnumerator) -> Result<(IMMDevice, String)> {
@@ -243,6 +267,7 @@ impl Stream {
             let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
             let (dev, id) = device_id(&en)?;
             let client: IAudioClient = dev.Activate(CLSCTX_ALL, None)?;
+            let vol = dev.Activate::<windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume>(CLSCTX_ALL, None).ok();
             let p = client.GetMixFormat()?;
             let f = p.read_unaligned();
             let (tag, ch, bits, sr) = (f.wFormatTag, f.nChannels as usize, f.wBitsPerSample, f.nSamplesPerSec as f32);
@@ -262,7 +287,7 @@ impl Stream {
             init?;
             let cap: IAudioCaptureClient = client.GetService()?;
             client.Start()?;
-            Ok(Stream { en, client, cap, id, ch, fmt: fmt.unwrap_or(Fmt::F32), sr, ring: vec![0.0; N], pos: 0, added: 0 })
+            Ok(Stream { en, client, cap, id, ch, fmt: fmt.unwrap_or(Fmt::F32), sr, ring: vec![0.0; N], pos: 0, added: 0, vol })
         }
     }
 
@@ -311,7 +336,16 @@ impl Stream {
         let mut sc = Scaler::new();
         let (mut last, mut dev_check) = (Instant::now(), Instant::now());
         let mut x = vec![0.0f32; N];
+        let (mut gain, mut vol_check) = (1.0f32, Instant::now() - Duration::from_secs(1));
         while wanted() {
+            if let Some(v) = &self.vol {
+                if vol_check.elapsed() > Duration::from_millis(100) {
+                    vol_check = Instant::now();
+                    if let (Ok(sc), Ok(m)) = (unsafe { v.GetMasterVolumeLevelScalar() }, unsafe { v.GetMute() }) {
+                        gain = volume_gain(sc, m.as_bool());
+                    }
+                }
+            }
             self.drain()?;
             let dt = last.elapsed().as_secs_f32();
             if dt >= 0.014 {
@@ -326,7 +360,9 @@ impl Stream {
                 x[b.len()..].copy_from_slice(a);
                 HOPS.fetch_add(1, Relaxed);
                 PEAK.store(x.iter().fold(0.0f32, |m, v| m.max(v.abs())).to_bits(), Relaxed);
-                publish(sc.step(&dsp.bands_db(&x, self.sr), dt));
+                let mut lv = sc.step(&dsp.bands_db(&x, self.sr), dt);
+                lv.iter_mut().for_each(|v| *v *= gain);
+                publish(lv);
             }
             if dev_check.elapsed() > Duration::from_secs(2) {
                 dev_check = Instant::now();
@@ -447,6 +483,23 @@ mod tests {
             v = s.step(&[-6.0; BANDS], 0.016);
         }
         assert!(v[0] > 0.95);
+    }
+
+    #[test]
+    fn beat_stands_out_and_volume_scales() {
+        let mut s = Scaler::new();
+        let mut steady = [0.0; BANDS];
+        for _ in 0..300 {
+            steady = s.step(&[-6.0; BANDS], 0.016);
+        }
+        let mut duck = steady;
+        for _ in 0..10 {
+            duck = s.step(&[-20.0; BANDS], 0.016);
+        }
+        assert!(duck[0] < steady[0] - 0.1, "{} vs {}", duck[0], steady[0]);
+        assert_eq!(volume_gain(0.8, true), 0.0);
+        assert!((volume_gain(1.0, false) - 1.0).abs() < 1e-6);
+        assert!(volume_gain(0.2, false) < volume_gain(0.6, false) && volume_gain(0.2, false) > 0.2);
     }
 
     /// Manual: `cargo test live_loopback -- --ignored --nocapture` while something plays on this PC.

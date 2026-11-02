@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.7] - 2026-11-03
+
+### Changed
+- The music card equalizer reacts sharper on dense, loud music: faster attack and release, each band is judged against its own recent average, and a kick or snare gets an onset boost.
+- The bars follow the system volume (the loopback is captured before the volume control): quieter playback gives lower bars, mute flattens them.
+
 ## [0.7.6] - 2026-10-31
 
 ### Added
