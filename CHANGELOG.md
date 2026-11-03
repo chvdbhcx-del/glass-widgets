@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.7.8] - 2026-11-03
+
+### Changed
+- The equalizer's dependence on the system volume now rises fast at low volume and eases toward full (20% volume is already about half height, 50% about three quarters; mute still flattens the bars).
+
 ## [0.7.7] - 2026-11-03
 
 ### Changed
