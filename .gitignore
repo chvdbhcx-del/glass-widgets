@@ -6,3 +6,6 @@
 /out/
 /calib/ref/
 *.log
+
+# update-signing private key: NEVER commit
+/keys/

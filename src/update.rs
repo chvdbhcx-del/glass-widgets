@@ -29,11 +29,23 @@ pub const WM_UPDATE_DL: u32 = WM_APP + 6;
 pub const DL_VERIFYING: usize = 101;
 pub const DL_DONE: usize = 102;
 
-/// The installer of a release and the SHA-256 GitHub publishes for it.
+/// Ed25519 public key the installers are signed with (private half: `keys/update-signing.key` in the project folder, never in git; see
+/// tools/release.ps1). GitHub alone is not trusted: a release without a valid signature by this key is refused.
+const PUBKEY: [u8; 32] = [
+    0x80, 0xf8, 0xe0, 0xec, 0x13, 0xfb, 0xd9, 0x58, 0x48, 0xd7, 0x27, 0xb6, 0x55, 0xc5, 0x87, 0x4a, 0x8d, 0x74, 0xde, 0x47, 0xcf, 0x26, 0x23, 0x04, 0x29, 0x07, 0x34, 0x15, 0x46, 0xa6,
+    0xb2, 0xef,
+];
+/// the signed message is this tag + SHA-256 of the installer (examples/sign.rs builds the same bytes)
+const MSG_TAG: &[u8] = b"glasswidgets-update-v1\0";
+/// a signature file (128 hex digits) bigger than this is refused
+const MAX_SIG_BYTES: u64 = 1024;
+
+/// The installer of a release, the SHA-256 GitHub publishes for it and the address of its detached signature (`<installer>.sig`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Asset {
     pub url: String,
     pub sha256: [u8; 32],
+    pub sig_url: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -71,7 +83,10 @@ pub fn parse_release(json: &str) -> Option<Release> {
         let a = v.get("assets")?.as_array()?.iter().find(|a| a.get("name").and_then(|n| n.as_str()) == Some(want.as_str()))?;
         let url = a.get("browser_download_url")?.as_str()?.trim().to_string();
         let sha256 = parse_digest(a.get("digest")?.as_str()?)?;
-        asset_url_ok(&url).then_some(Asset { url, sha256 })
+        let sig_name = format!("{want}.sig");
+        let s = v.get("assets")?.as_array()?.iter().find(|a| a.get("name").and_then(|n| n.as_str()) == Some(sig_name.as_str()))?;
+        let sig_url = s.get("browser_download_url")?.as_str()?.trim().to_string();
+        (asset_url_ok(&url) && asset_url_ok(&sig_url)).then_some(Asset { url, sha256, sig_url })
     });
     Some(Release { tag, url, asset })
 }
@@ -172,8 +187,30 @@ pub struct Verified {
 
 static INSTALL: Mutex<Option<Result<Verified, String>>> = Mutex::new(None);
 
-/// Hash `path` (opened read-only, writers kept out) and compare with `want`. A mismatch deletes the file.
-fn verify_file(path: &Path, want: &[u8; 32]) -> Result<Verified, String> {
+/// 128 hex digits -> 64 signature bytes.
+fn parse_sig(s: &str) -> Option<[u8; 64]> {
+    let s = s.trim();
+    if s.len() != 128 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 64];
+    for (o, p) in out.iter_mut().zip(s.as_bytes().chunks(2)) {
+        *o = u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Is `sig` a valid signature by `key` over the tag + `hash`?
+fn signature_ok(key: &[u8; 32], hash: &[u8; 32], sig: &[u8; 64]) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let mut msg = MSG_TAG.to_vec();
+    msg.extend_from_slice(hash);
+    VerifyingKey::from_bytes(key).is_ok_and(|k| k.verify_strict(&msg, &Signature::from_bytes(sig)).is_ok())
+}
+
+/// Hash `path` (opened read-only, writers kept out) and compare with `want`, then check the signature `sig` over the hash against `key`.
+/// A mismatch of either deletes the file.
+fn verify_file(path: &Path, want: &[u8; 32], sig: &[u8; 64], key: &[u8; 32]) -> Result<Verified, String> {
     let mut f = std::fs::OpenOptions::new().read(true).share_mode(1).open(path).map_err(|e| format!("open: {e}"))?; // 1 = FILE_SHARE_READ
     let mut h = crate::sha256::Sha256::new();
     let mut buf = vec![0u8; 64 << 10];
@@ -184,10 +221,16 @@ fn verify_file(path: &Path, want: &[u8; 32]) -> Result<Verified, String> {
         }
         h.update(&buf[..n]);
     }
-    if h.finish() != *want {
+    let got = h.finish();
+    if got != *want {
         drop(f);
         let _ = std::fs::remove_file(path);
         return Err("checksum mismatch".into());
+    }
+    if !signature_ok(key, &got, sig) {
+        drop(f);
+        let _ = std::fs::remove_file(path);
+        return Err("bad signature".into());
     }
     Ok(Verified { _file: f, path: path.to_path_buf() })
 }
@@ -224,7 +267,16 @@ pub fn start_install(hwnd: isize, version: &str, asset: Asset) {
                 return Err(e);
             }
             post(hwnd, DL_VERIFYING);
-            verify_file(&path, &asset.sha256)
+            let sig_path = dir.join(format!("{}.sig", path.file_name().and_then(|n| n.to_str()).unwrap_or("installer")));
+            let _ = std::fs::remove_file(&sig_path);
+            let sig_got = crate::net::download(&asset.sig_url, &sig_path, MAX_SIG_BYTES, host_ok, |_, _| {});
+            let sig_text = sig_got.and_then(|_| std::fs::read_to_string(&sig_path).map_err(|e| format!("signature: {e}")));
+            let _ = std::fs::remove_file(&sig_path);
+            let sig = parse_sig(&sig_text.inspect_err(|_| drop(std::fs::remove_file(&path)))?).ok_or_else(|| {
+                let _ = std::fs::remove_file(&path);
+                "malformed signature".to_string()
+            })?;
+            verify_file(&path, &asset.sha256, &sig, &PUBKEY)
         })();
         if let Ok(mut g) = INSTALL.lock() {
             *g = Some(r);
@@ -266,10 +318,18 @@ mod tests {
 
     #[test]
     fn installer_asset_and_digest_are_picked_from_the_release() {
-        let good = reply_with(&format!(r#"[{{"name":"other.zip","browser_download_url":"{DL}","digest":"{ABC}"}},{{"name":"GlassWidgets_0.3.0_x64-setup.exe","browser_download_url":"{DL}","digest":"{ABC}"}}]"#));
+        let sig = format!(r#"{{"name":"GlassWidgets_0.3.0_x64-setup.exe.sig","browser_download_url":"{DL}.sig"}}"#);
+        let good = reply_with(&format!(r#"[{{"name":"other.zip","browser_download_url":"{DL}","digest":"{ABC}"}},{{"name":"GlassWidgets_0.3.0_x64-setup.exe","browser_download_url":"{DL}","digest":"{ABC}"}},{sig}]"#));
         let a = parse_release(&good).unwrap().asset.unwrap();
         assert_eq!((a.url.as_str(), a.sha256[0], a.sha256[31]), (DL, 0xba, 0xad));
-        let named = |name: &str, url: &str, digest: &str| reply_with(&format!(r#"[{{"name":"{name}","browser_download_url":"{url}","digest":"{digest}"}}]"#));
+        assert_eq!(a.sig_url, format!("{DL}.sig"));
+        // no signature file in the release: no installer to offer
+        let unsigned = reply_with(&format!(r#"[{{"name":"GlassWidgets_0.3.0_x64-setup.exe","browser_download_url":"{DL}","digest":"{ABC}"}}]"#));
+        assert!(parse_release(&unsigned).unwrap().asset.is_none());
+        // a signature file served from somewhere else is refused
+        let evil_sig = reply_with(&format!(r#"[{{"name":"GlassWidgets_0.3.0_x64-setup.exe","browser_download_url":"{DL}","digest":"{ABC}"}},{{"name":"GlassWidgets_0.3.0_x64-setup.exe.sig","browser_download_url":"https://evil.example/x.sig"}}]"#));
+        assert!(parse_release(&evil_sig).unwrap().asset.is_none());
+        let named = |name: &str, url: &str, digest: &str| reply_with(&format!(r#"[{{"name":"{name}","browser_download_url":"{url}","digest":"{digest}"}},{sig}]"#));
         let none = |json: String| parse_release(&json).unwrap().asset.is_none();
         let n = "GlassWidgets_0.3.0_x64-setup.exe";
         assert!(none(reply_with("[]")) && none(reply_with("null")));
@@ -345,11 +405,59 @@ mod tests {
         std::fs::write(&good, b"abc").unwrap();
         std::fs::write(&bad, b"abd").unwrap();
         let want = parse_digest(ABC).unwrap();
-        assert!(verify_file(&good, &want).is_ok());
-        assert_eq!(verify_file(&bad, &want).err().as_deref(), Some("checksum mismatch"));
+        let (key, sig) = signed(&want);
+        assert!(verify_file(&good, &want, &sig, &key).is_ok());
+        assert_eq!(verify_file(&bad, &want, &sig, &key).err().as_deref(), Some("checksum mismatch"));
         assert!(!bad.exists(), "a file with a wrong hash is deleted");
-        assert!(verify_file(&dir.join("missing.exe"), &want).is_err());
+        assert!(verify_file(&dir.join("missing.exe"), &want, &sig, &key).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (public key, signature over tag + `hash`) of a throwaway test key.
+    fn signed(hash: &[u8; 32]) -> ([u8; 32], [u8; 64]) {
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut msg = MSG_TAG.to_vec();
+        msg.extend_from_slice(hash);
+        (sk.verifying_key().to_bytes(), sk.sign(&msg).to_bytes())
+    }
+
+    #[test]
+    fn only_the_right_signature_by_the_right_key_passes() {
+        let hash = parse_digest(ABC).unwrap();
+        let (key, sig) = signed(&hash);
+        assert!(signature_ok(&key, &hash, &sig));
+        let mut other = hash;
+        other[0] ^= 1;
+        assert!(!signature_ok(&key, &other, &sig), "another file");
+        let mut bent = sig;
+        bent[10] ^= 1;
+        assert!(!signature_ok(&key, &hash, &bent), "a damaged signature");
+        assert!(!signature_ok(&PUBKEY, &hash, &sig), "a signature by another key must not pass for the shipped key");
+        assert!(!signature_ok(&[0u8; 32], &hash, &sig), "a degenerate key");
+    }
+
+    #[test]
+    fn a_signed_file_with_a_wrong_signature_is_deleted() {
+        let dir = std::env::temp_dir().join(format!("gw-update-sig-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("good.exe");
+        std::fs::write(&f, b"abc").unwrap();
+        let want = parse_digest(ABC).unwrap();
+        let (key, mut sig) = signed(&want);
+        sig[0] ^= 1;
+        assert_eq!(verify_file(&f, &want, &sig, &key).err().as_deref(), Some("bad signature"));
+        assert!(!f.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn signature_files_are_parsed_strictly() {
+        let ok = "ab".repeat(64);
+        assert!(parse_sig(&ok).is_some() && parse_sig(&format!("{ok}\n")).is_some());
+        for bad in ["".to_string(), "ab".repeat(63), "ab".repeat(65), "zz".repeat(64)] {
+            assert!(parse_sig(&bad).is_none());
+        }
     }
 
     #[test]

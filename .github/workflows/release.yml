@@ -2,6 +2,9 @@
 # Run it by hand: GitHub -> Actions -> Release -> Run workflow (also works from the GitHub mobile app).
 # Notes: the field below, or the newest CHANGELOG.md section when left empty. Bump Cargo.toml + CHANGELOG and push first.
 # Manual trigger only (no tag trigger): tools/release.ps1 / release-all create the tag themselves.
+# NOTE: installers must be signed (src/update.rs refuses unsigned ones) and the private key lives only in the project folder
+# (keys/update-signing.key, gitignored), so this workflow cannot publish: tools/release.ps1 stops at the signing step on the runner.
+# Release from the PC with `release-all widgets`.
 name: Release
 
 on:

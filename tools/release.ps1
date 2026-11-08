@@ -33,13 +33,20 @@ Write-Host "Installer: $out"
 
 if ($NoPublish) { Write-Host 'Not published (-NoPublish).'; return }
 
+# The app only offers "Update now" for an installer whose detached Ed25519 signature (<installer>.sig) verifies against the public key
+# built into src/update.rs. The private key lives in keys\update-signing.key (project folder, gitignored); without it nothing is published.
+$key = Join-Path $root 'keys\update-signing.key'
+if (-not (Test-Path $key)) { throw "signing key $key not found: restore it from your backup (a new key needs a new public key in src/update.rs and one unsigned-channel release)" }
+cargo run --release --example sign -- sign $key $out
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$out.sig")) { throw 'signing failed' }
+
 $tag = "v$ver"
 gh release view $tag --repo $Repo *> $null
 if ($LASTEXITCODE -eq 0) {
-    Write-Host "Release $tag exists: replacing its file"
-    gh release upload $tag $out --repo $Repo --clobber
+    Write-Host "Release $tag exists: replacing its files"
+    gh release upload $tag $out "$out.sig" --repo $Repo --clobber
 } else {
-    gh release create $tag $out --repo $Repo --title "Glass Widgets $ver" --notes $Notes
+    gh release create $tag $out "$out.sig" --repo $Repo --title "Glass Widgets $ver" --notes $Notes
 }
 if ($LASTEXITCODE -ne 0) { throw 'gh release failed' }
 Write-Host "Published: https://github.com/$Repo/releases/tag/$tag"

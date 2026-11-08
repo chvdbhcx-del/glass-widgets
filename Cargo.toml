@@ -88,6 +88,8 @@ features = [
 serde_json = { workspace = true }
 windows = { workspace = true }
 glasskit = { path = "glasskit" }
+# update signatures: the app verifies, examples/sign.rs (release tooling) signs
+ed25519-dalek = { version = "2", default-features = false }
 
 [build-dependencies]
 winresource = "0.1" # embeds installer/icon.ico and the version info into the exe
