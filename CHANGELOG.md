@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.7.9] - 2026-11-08
+
+### Added
+- A log file: when nothing else receives stderr (Start menu, autostart), everything the app prints and the panic messages go to `%LOCALAPPDATA%\Glass Widgets\logs\mswidgets.log` (rotated at 1 MiB, one older generation kept).
+
 ## [0.7.8] - 2026-11-03
 
 ### Changed

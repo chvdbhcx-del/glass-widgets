@@ -14,6 +14,7 @@
 // the widget API (widget.rs, sys.rs, tz.rs, icons.rs) is a public surface for widget files that do not exist yet: unused items are expected
 #![allow(dead_code, unused_imports)]
 mod accent;
+mod applog;
 mod autopause;
 mod autostart;
 mod backdrop;
@@ -198,6 +199,7 @@ fn main() {
     unsafe {
         attach_console()
     };
+    applog::init(); // stderr -> %LOCALAPPDATA%\Glass Widgets\logs\mswidgets.log when nothing else receives it
     let a = parse_args();
     glass::init_params(a.glass_params.as_deref());
     unsafe {
