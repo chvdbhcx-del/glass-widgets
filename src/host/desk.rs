@@ -2,6 +2,36 @@
 use super::*;
 
 impl App {
+    /// Follow the Windows high-contrast setting (start-up and every settings change): dense plates and matching ink while it is on.
+    pub(super) unsafe fn apply_contrast(&mut self) {
+        if let Err(e) = self.scene.set_high_contrast(&self.gfx, crate::a11y::high_contrast()) {
+            eprintln!("mswidgets: high contrast: {e}");
+            return;
+        }
+        let now = self.now();
+        for i in 0..self.scene.len() {
+            let _ = self.scene.render_card(&self.gfx, i, &now);
+        }
+        let d = self.all_dirty();
+        self.frame(d);
+    }
+
+    /// The cards as a screen reader sees them (names in the UI language, bounds in screen pixels); see a11y.rs.
+    pub(super) fn a11y_snapshot(&self) -> crate::a11y::Snap {
+        let lang = self.ui.lang;
+        let items = self
+            .scene
+            .cards
+            .iter()
+            .map(|c| {
+                let name = crate::registry::global().get(&c.type_id).map_or_else(|| c.type_id.clone(), |d| lang.pick(d.name.0, d.name.1).to_string());
+                let rect = RECT { left: self.mon.left + c.x, top: self.mon.top + c.y, right: self.mon.left + c.x + c.w, bottom: self.mon.top + c.y + c.h };
+                crate::a11y::Item { name, id: c.id.clone(), rect }
+            })
+            .collect();
+        crate::a11y::Snap { title: "Glass Widgets".into(), items }
+    }
+
     /// Re-create the backdrop and every GPU object of the scene (settings / monitor / DPI change); widget instances stay.
     pub(super) unsafe fn rebuild(&mut self, keep_layout: bool) {
         self.abort_prompt(); // new geometry: the prompt is cancelled

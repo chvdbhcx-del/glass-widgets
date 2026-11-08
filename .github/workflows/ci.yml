@@ -11,6 +11,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
       - run: cargo build --release --locked
+      # Size budget (deterministic, so a real gate): the release exe was 4.5 MB at 0.7.9; growing past 5 MB needs a deliberate bump of this number.
+      # The numbers also go to the job summary so a trend is visible run to run.
+      - name: exe size budget
+        shell: pwsh
+        run: |
+          $exe = Get-Item target\release\mswidgets.exe
+          $mb = [math]::Round($exe.Length / 1MB, 2)
+          "mswidgets.exe: $mb MB ($($exe.Length) bytes), budget 5.00 MB" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if ($exe.Length -gt 5000000) { throw "exe is $mb MB, over the 5.00 MB budget" }
       # Informational until the tree is clean; flip continue-on-error to false to make them gates.
       - name: cargo fmt --check
         continue-on-error: true

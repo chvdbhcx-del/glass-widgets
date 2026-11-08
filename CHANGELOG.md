@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.0] - 2026-11-08
+
+### Added
+- Signed updates: every installer now ships with an Ed25519 signature (`.sig`) and "Update now" installs only a file whose signature verifies against the key built into the app, so a hijacked GitHub account or release alone can no longer push code to your PC. Older versions keep their checksum check and can still update to this one; from this version on, updates must be signed.
+- Screen reader support: the desk window is now a UI Automation pane ("Glass Widgets") with one named group per card (the widget's name in the UI language, with its bounds), so Narrator and other readers can find and describe the cards.
+- Windows high-contrast themes: while one is on, the cards turn into dense, calm plates with the theme's dark or light ink instead of see-through glass; your look sliders come back when the theme is switched off.
+
+### Changed
+- `host.rs` and `ui.rs` are split into smaller modules (no behaviour change).
+- CI checks the size of the release exe (budget 5 MB) and prints it to the job summary.
+
 ## [0.7.9] - 2026-11-08
 
 ### Added

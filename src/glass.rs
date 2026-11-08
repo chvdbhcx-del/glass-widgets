@@ -51,6 +51,22 @@ macro_rules! glass_params {
     };
 }
 
+/// The look for a Windows high-contrast theme (`light` = white window colour): a calm, dense plate instead of see-through glass, so text
+/// keeps its contrast whatever is behind the card. Every value stays inside its calibration range.
+pub fn high_contrast(mut p: GlassParams, light: bool) -> GlassParams {
+    for (n, v) in [("blur", 30.0), ("refr", 0.0), ("sheen", 0.0), ("sheen_mid", 0.0), ("glow", 0.0), ("glint", 0.0), ("hover_spot", 0.0), ("rim_base", 0.7), ("edge_dark", 0.7)] {
+        p.set(n, v);
+    }
+    if light {
+        p.set("milk", 0.7);
+    } else {
+        for (n, v) in [("veil_gain", 2.5), ("veil_thresh", 0.2), ("veil_max", 0.7)] {
+            p.set(n, v);
+        }
+    }
+    p
+}
+
 glass_params! {
     /// lens gaussian sigma
     blur: 4.19, 1.0, 30.0;
@@ -1471,5 +1487,28 @@ mod tests {
         assert!((a.1 - 0.0).abs() < 1e-3 && (b.1 - 50.0).abs() < 1e-3);
         let (a, b) = css_line(90.0, 0.0, 0.0, 100.0, 50.0);
         assert!((a.0 - 0.0).abs() < 1e-3 && (b.0 - 100.0).abs() < 1e-3);
+    }
+}
+
+#[cfg(test)]
+mod high_contrast_tests {
+    use super::*;
+
+    #[test]
+    fn high_contrast_stays_in_range_and_keeps_the_rest() {
+        let base = GlassParams::default();
+        for light in [false, true] {
+            let p = high_contrast(base, light);
+            for n in GlassParams::NAMES {
+                let (lo, hi) = GlassParams::range(n).unwrap();
+                let v = p.get(n).unwrap();
+                assert!(v >= lo && v <= hi, "{n} = {v} outside {lo}..{hi}");
+            }
+            assert_eq!(p.get("sheen"), Some(0.0)); // no see-through shine
+            assert_eq!(p.light_angle, base.light_angle); // untouched values stay
+        }
+        assert_eq!(high_contrast(base, true).milk, 0.7); // the light plate is as dense as the range allows
+        assert_eq!(high_contrast(base, false).veil_max, 0.7);
+        assert_eq!(high_contrast(base, false).milk, base.milk);
     }
 }

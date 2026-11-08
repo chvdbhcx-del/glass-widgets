@@ -1,6 +1,6 @@
 [package]
 name = "mswidgets"
-version = "0.7.9"
+version = "0.8.0"
 edition = "2021"
 description = "Glass Widgets: native (no WebView) Direct2D desktop widgets for Windows with a Liquid-Glass look"
 license = "MIT"
@@ -82,11 +82,16 @@ features = [
   # idle pause: session lock notifications, power setting notifications, the input desktop
   "Win32_System_RemoteDesktop",
   "Win32_System_StationsAndDesktops",
+  # screen readers: UI Automation providers for the desk window (src/a11y.rs)
+  "implement",
+  "Win32_UI_Accessibility",
+  "Win32_System_Variant",
 ]
 
 [dependencies]
 serde_json = { workspace = true }
 windows = { workspace = true }
+windows-core = "0.58" # the `implement` macro expands to paths in this crate
 glasskit = { path = "glasskit" }
 # update signatures: the app verifies, examples/sign.rs (release tooling) signs
 ed25519-dalek = { version = "2", default-features = false }

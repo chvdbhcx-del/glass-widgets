@@ -564,6 +564,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     let mut scene = Scene::new(&gfx, mw, mh, cs, settings.glass, backdrop.bitmap(), &specs, &env)?;
     scene.set_appearance_pref(o.appearance.unwrap_or(settings.appearance));
     scene.set_params(&gfx, &look)?;
+    scene.set_high_contrast(&gfx, crate::a11y::high_contrast())?;
     // start-up: every card condenses out of the glass (staggered), a plain fade with reduced motion
     let reduced0 = reduced_motion();
     let mut pops = HashMap::new();
@@ -797,6 +798,14 @@ fn unpack(lp: isize) -> (i32, i32) {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        crate::a11y::WM_GETOBJECT => {
+            // a screen reader / UI Automation client asks for the window: publish the cards, then hand out the providers
+            with_app(|app| crate::a11y::publish(app.a11y_snapshot()));
+            if let Ok(Some(r)) = catch_unwind(|| crate::a11y::get_object(hwnd, wp, lp)) {
+                return r;
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_TIMER | WM_BACKDROP | WM_HOTKEY | WM_WIDGET | update::WM_UPDATE | update::WM_UPDATE_DL | WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
             with_app(|app| app.on_msg(msg, wp.0));
             LRESULT(0)
@@ -1124,6 +1133,7 @@ impl App {
             }
             (_, T_REPLACE) => {
                 let _ = KillTimer(self.hwnd, T_REPLACE);
+                self.apply_contrast();
                 self.replace_monitor();
             }
             (_, T_DAY) => {

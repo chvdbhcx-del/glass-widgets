@@ -276,6 +276,10 @@ pub struct Scene {
     cpu: Option<(i32, i32, ID2D1Bitmap1)>,
     probe: Probe,
     pub params: GlassParams,
+    /// the look the user's sliders asked for (`params` is this, or its high-contrast version while `hc` is set)
+    user_params: GlassParams,
+    /// Windows high-contrast theme: `Some(light)` while it is on
+    hc: Option<bool>,
     /// the base look (defaults + glass.json): the host panels (gallery, settings) are built with it, whatever the user's look sliders say
     panel_params: GlassParams,
     /// global appearance preference (`widgetsAppearance` / `--appearance`)
@@ -547,6 +551,8 @@ impl Scene {
             cpu: None,
             probe: Probe::new(gfx, backdrop)?,
             params: crate::glass::global_params(),
+            user_params: crate::glass::global_params(),
+            hc: None,
             panel_params: crate::glass::global_params(),
             pref: AppearancePref::Auto,
             merge: Vec::new(),
@@ -827,6 +833,25 @@ impl Scene {
     /// A new glass look (the settings sliders): every card gets a fresh effect graph for `p`; layers, widget instances and their state stay.
     /// The glass panels keep the base look. The caller re-renders the layers.
     pub fn set_params(&mut self, gfx: &Gfx, p: &GlassParams) -> Result<()> {
+        self.user_params = *p;
+        let eff = self.hc.map_or(*p, |light| crate::glass::high_contrast(*p, light));
+        self.apply_params(gfx, &eff)
+    }
+
+    /// A Windows high-contrast theme turned on (`Some(light)`, light = white window colour) or off: the cards get the dense plate look
+    /// (see `glass::high_contrast`) and the matching dark / light ink; the user's sliders are kept for when it ends.
+    pub fn set_high_contrast(&mut self, gfx: &Gfx, hc: Option<bool>) -> Result<()> {
+        if self.hc == hc {
+            return Ok(());
+        }
+        self.hc = hc;
+        self.fx_wake = true;
+        let p = self.user_params;
+        let eff = hc.map_or(p, |light| crate::glass::high_contrast(p, light));
+        self.apply_params(gfx, &eff)
+    }
+
+    fn apply_params(&mut self, gfx: &Gfx, p: &GlassParams) -> Result<()> {
         if *p == self.params {
             return Ok(());
         }
@@ -1249,6 +1274,9 @@ impl Scene {
     /// Where the appearance cross-fade of card `i` is heading: 0 = dark glass, 1 = light (milky) glass.
     pub fn look_target(&self, i: usize) -> f32 {
         let c = &self.cards[i];
+        if let Some(light) = self.hc {
+            return if light { 1.0 } else { 0.0 }; // a high-contrast theme decides the ink, whatever the card forced
+        }
         match c.forced {
             Some(a) => a.k(),
             None => match self.pref {
