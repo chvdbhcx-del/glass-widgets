@@ -6,12 +6,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
       - run: cargo build --release --locked
+      # Informational until the tree is clean; flip continue-on-error to false to make them gates.
+      - name: cargo fmt --check
+        continue-on-error: true
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        continue-on-error: true
+        run: cargo clippy --locked --workspace -- -D warnings
       # headless sheet render (needs a D2D/WARP device on the runner: unverified, so non-blocking), then lint the log
       - continue-on-error: true
         run: |
           $env:MSW_TEXT_LINT = '1'
           target\release\mswidgets.exe --sheet out\sheet.png --scale 1 2> lint.log
           python tools/text-lint.py lint.log
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo audit (known vulnerabilities in Cargo.lock)
+        continue-on-error: true
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
