@@ -184,7 +184,7 @@ impl Ui {
                 cx.circle_stroke((kx, tb.track.cy()), 11.5, 2.0, Color::rgba(1.0, 1.0, 1.0, 0.70));
             }
             cx.rect(tb.sep, FILL);
-            cx.text(tb.label_bg, self.t("Фон", "Back"), Style::new(12.5, 500), TEXT);
+            cx.text(tb.label_bg, self.t("Фон", "Mode"), Style::new(12.5, 500), TEXT);
             let seg = Rect::new(tb.seg_live.x, tb.seg_live.y, tb.seg_live.w + tb.seg_plain.w, tb.seg_live.h);
             self.seg(cx, seg, &[(self.t("Живое", "Live"), self.live), (self.t("Простой", "Plain"), !self.live)], 2.0, if let Hit::Seg(l) = self.hover { Some(usize::from(!l)) } else { None });
             cx.rect(tb.sep2, FILL);

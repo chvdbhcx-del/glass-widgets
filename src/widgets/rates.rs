@@ -132,19 +132,20 @@ fn split_pair(p: &str) -> (&str, &str) {
     p.split_once('/').unwrap_or((p, "USD"))
 }
 
-fn group_digits(int: &str) -> String {
+/// Thousands: a no-break space in Russian, a comma in English.
+fn group_digits(int: &str, ru: bool) -> String {
     let n = int.len();
     let mut s = String::new();
     for (i, ch) in int.chars().enumerate() {
         if i > 0 && (n - i) % 3 == 0 {
-            s.push('\u{a0}');
+            s.push(if ru { '\u{a0}' } else { ',' });
         }
         s.push(ch);
     }
     s
 }
 
-/// 67 412 / 100,41 / 0,0123 (decimals shrink as the value grows)
+/// 67 412 / 100,41 / 0,0123 (decimals shrink as the value grows); English: 67,412 / 100.41 / 0.0123
 pub(crate) fn fmt_value(v: f64, ru: bool) -> String {
     let dec = if v >= 1000.0 {
         0
@@ -157,7 +158,7 @@ pub(crate) fn fmt_value(v: f64, ru: bool) -> String {
     };
     let s = format!("{:.*}", dec, v);
     let (int, frac) = s.split_once('.').unwrap_or((&s, ""));
-    let mut out = group_digits(int);
+    let mut out = group_digits(int, ru);
     if !frac.is_empty() {
         out.push(if ru { ',' } else { '.' });
         out += frac;
@@ -758,6 +759,8 @@ mod tests {
         assert_eq!(fmt_value(67412.35, true), "67\u{a0}412");
         assert_eq!(fmt_value(100.409, true), "100,41");
         assert_eq!(fmt_value(92.15, false), "92.15");
+        assert_eq!(fmt_value(67412.35, false), "67,412");
+        assert_eq!(fmt_value(1234567.0, false), "1,234,567");
         assert_eq!(fmt_value(1234567.0, true), "1\u{a0}234\u{a0}567");
         assert_eq!(fmt_value(0.0123456, true), "0,0123");
         assert_eq!(fmt_value(0.000123, false), "0.000123");

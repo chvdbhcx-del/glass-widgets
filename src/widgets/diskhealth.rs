@@ -96,13 +96,13 @@ fn parse_disks(json: &str) -> Vec<Disk> {
     out
 }
 
-/// 12345 -> "12 345" (a thin gap, the thousands are readable in a narrow column).
-fn grouped(n: u64) -> String {
+/// 12345 -> "12 345" (a thin gap, the thousands are readable in a narrow column); English: "12,345".
+fn grouped(n: u64, lang: Lang) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
         if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push('\u{2009}');
+            out.push_str(lang.pick("\u{2009}", ","));
         }
         out.push(c);
     }
@@ -192,7 +192,7 @@ fn na(cx: &Cx) -> &'static str {
     cx.t("н/д", "n/a")
 }
 fn grouped_hours(cx: &Cx, h: u64) -> String {
-    format!("{} {}", grouped(h), cx.t("ч", "h"))
+    format!("{} {}", grouped(h, cx.lang), cx.t("ч", "h"))
 }
 
 const ROW_H: f32 = 38.0;
@@ -290,8 +290,8 @@ impl DiskHealth {
             cx.text(Rect::new(row.x + 14.0, row.y, row.w - 14.0 - 96.0, 18.0), &d.name, Style::BODY.ellipsis(), TEXT);
             self.paint_word(cx, key, d, Rect::new(row.right() - 94.0, row.y, 94.0, 18.0), Style::CAPTION.weight(600).right().ellipsis());
             let kind = if d.size > 0 { format!("{} {}", d.media, fmt_size(d.size, cx.lang)).trim().to_string() } else { d.media.clone() };
-            let t = self.glided("t", key, d.temp).map_or(na(cx).to_string(), |t| format!("{t} °C"));
-            let w = self.glided("r", key, d.wear).map_or(na(cx).to_string(), |w| format!("{w} %"));
+            let t = self.glided("t", key, d.temp).map_or(na(cx).to_string(), |t| format!("{t}{}°C", cx.t(" ", "")));
+            let w = self.glided("r", key, d.wear).map_or(na(cx).to_string(), |w| format!("{w}{}%", cx.t(" ", "")));
             let h = self.glided("h", key, d.hours.map(|h| h as u32)).map_or(na(cx).to_string(), |h| grouped_hours(cx, h as u64));
             let detail = format!("{}{}{} · {} {} · {}", kind, if kind.is_empty() { "" } else { " · " }, t, cx.t("износ", "wear"), w, h);
             cx.text(Rect::new(row.x + 14.0, row.y + 18.0, row.w - 14.0, 16.0), &detail, Style::CAPTION.ellipsis(), DIM);
@@ -331,8 +331,8 @@ impl DiskHealth {
                     cx.text(Rect::new(c.x, c.y + 50.0, c.w, 18.0), &worst.name, Style::BODY.ellipsis(), TEXT);
                     let na = na(cx);
                     let rows = [
-                        (cx.t("Температура", "Temperature"), self.glided("t", k, worst.temp).map(|t| format!("{t} °C"))),
-                        (cx.t("Износ", "Wear"), self.glided("r", k, worst.wear).map(|w| format!("{w} %"))),
+                        (cx.t("Температура", "Temperature"), self.glided("t", k, worst.temp).map(|t| format!("{t}{}°C", cx.t(" ", "")))),
+                        (cx.t("Износ", "Wear"), self.glided("r", k, worst.wear).map(|w| format!("{w}{}%", cx.t(" ", "")))),
                         (cx.t("Наработка", "Power on"), self.glided("h", k, worst.hours.map(|h| h as u32)).map(|h| grouped_hours(cx, h as u64))),
                     ];
                     for (i, (label, v)) in rows.iter().enumerate() {
@@ -461,10 +461,11 @@ mod tests {
 
     #[test]
     fn number_grouping() {
-        assert_eq!(grouped(5), "5");
-        assert_eq!(grouped(1234), "1\u{2009}234");
-        assert_eq!(grouped(21_340), "21\u{2009}340");
-        assert_eq!(grouped(1_234_567), "1\u{2009}234\u{2009}567");
+        assert_eq!(grouped(5, Lang::Ru), "5");
+        assert_eq!(grouped(1234, Lang::Ru), "1\u{2009}234");
+        assert_eq!(grouped(21_340, Lang::Ru), "21\u{2009}340");
+        assert_eq!(grouped(1_234_567, Lang::Ru), "1\u{2009}234\u{2009}567");
+        assert_eq!(grouped(21_340, Lang::En), "21,340");
     }
 
     /// Runs the real script: `cargo test diskhealth_live -- --ignored --nocapture`.

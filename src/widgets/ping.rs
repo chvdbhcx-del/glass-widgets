@@ -223,8 +223,8 @@ fn sample_row(target: &str, base: f32, lost_every: usize) -> Row {
 fn label(cx: &Cx, target: &str, ip: Option<Ipv4Addr>) -> String {
     if target == GATEWAY {
         match ip {
-            Some(ip) => format!("{} {ip}", cx.t("Шлюз", "Gateway")),
-            None => cx.t("Шлюз", "Gateway").to_string(),
+            Some(ip) => format!("{} {ip}", cx.t("Шлюз", "Router")),
+            None => cx.t("Шлюз", "Router").to_string(),
         }
     } else {
         target.to_string()

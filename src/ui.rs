@@ -345,7 +345,7 @@ fn done_button_k(cx: &Cx, r: Rect, label: &str, hot: f32) {
 // Animation keys of the controls (`hkey`): the look sliders first, then everything else.
 const K_RESET: usize = 16;
 const K_OPT: usize = 20; // + option index * MON_SEGS + segment
-const K_AUTO: usize = K_OPT + 7 * MON_SEGS;
+const K_AUTO: usize = K_OPT + Opt::ALL.len() * MON_SEGS;
 const K_CHECK: usize = K_AUTO + 1;
 const K_EDIT: usize = K_AUTO + 2;
 const K_QUIT: usize = K_AUTO + 3;
@@ -423,7 +423,7 @@ struct SetAnim {
     /// the handle position of each look slider
     kp: [Option<f32>; K_RESET],
     /// the sliding pill of each segmented control, in segments
-    seg: [Option<f32>; 6],
+    seg: [Option<f32>; Opt::ALL.len()],
     /// the autostart / check-on-start switches, 0..1 linear
     sw: [Option<f32>; 2],
     /// a slider press: the slider and the pointer x (canvas px) it started at; `snapped` once the pointer left that spot (1:1 from then on)
@@ -444,7 +444,7 @@ impl SetAnim {
             hov: HoverRamps::new(N_KEYS),
             prs: vec![Bump::default(); N_KEYS],
             kp: [None; K_RESET],
-            seg: [None; 6],
+            seg: [None; Opt::ALL.len()],
             sw: [None; 2],
             drag: None,
             snapped: false,

@@ -214,7 +214,7 @@ fn sample_rows(ru: bool) -> Vec<Row> {
     let pick = |a: &'static str, b: &'static str| if ru { a } else { b };
     let s: [(&str, i64); 8] = [
         ("https://github.com/anthropics/claude-code", 20),
-        (pick("Созвон завтра в 15:30 — ссылка в календаре", "Call tomorrow at 3:30 pm: the link is in the calendar"), 3 * 60),
+        (pick("Созвон завтра в 15:30 — ссылка в календаре", "Call tomorrow at 3:30 pm: link in the calendar"), 3 * 60),
         ("npm install --save-dev typescript", 12 * 60),
         ("+7 (916) 555-01-32", 47 * 60),
         (pick("Купить молоко, яйца и хлеб", "Buy milk, eggs and bread"), 2 * 3600),

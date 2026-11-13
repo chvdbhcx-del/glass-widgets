@@ -153,7 +153,7 @@ fn sample(lang: Lang) -> Vec<Task> {
         mk(1, "Отправить отчёт", "Send the report", false),
         mk(2, "Купить билеты на пятницу", "Buy tickets for Friday", false),
         mk(3, "Позвонить маме", "Call Mom", false),
-        mk(4, "Записаться к врачу и узнать про анализы", "Book a doctor's appointment and ask about the tests", false),
+        mk(4, "Записаться к врачу и узнать про анализы", "Book a doctor and ask about the tests", false),
         mk(5, "Оплатить интернет", "Pay the internet bill", true),
         mk(6, "Прибраться на столе", "Tidy up the desk", true),
     ]

@@ -222,7 +222,7 @@ impl Ui {
             label_glass: Rect::new(bar.x + 18.0, cy - 10.0, 50.0, 20.0),
             track: Rect::new(bar.x + 76.0, cy - 2.0, 136.0, 4.0),
             sep: Rect::new(bar.x + 232.0, cy - 9.0, 1.0, 18.0),
-            label_bg: Rect::new(bar.x + 248.0, cy - 10.0, 38.0, 20.0), // wide enough for "Back" / "Фон" in Medeo Sans with a clear gap to the control
+            label_bg: Rect::new(bar.x + 248.0, cy - 10.0, 38.0, 20.0), // wide enough for "Mode" / "Фон" in Medeo Sans with a clear gap to the control
             seg_live: Rect::new(bar.x + 296.0, cy - 12.0, 68.0, 24.0),
             seg_plain: Rect::new(bar.x + 364.0, cy - 12.0, 68.0, 24.0),
             sep2: Rect::new(bar.x + 452.0, cy - 9.0, 1.0, 18.0),

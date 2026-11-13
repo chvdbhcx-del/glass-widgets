@@ -2375,4 +2375,43 @@ mod tests {
             }
         }
     }
+
+    /// Every widget at every size draws offscreen in Russian AND English without a panic (a panic inside a widget is caught and only logged,
+    /// so the card's `err_logged` flag is what shows it), and the live language switch (`set_lang` + `invalidate_all`) draws the same card again in the other one.
+    #[test]
+    fn every_widget_renders_in_both_languages() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        let gfx = Gfx::new(None).unwrap();
+        let px: Vec<u8> = (0..420 * 420).flat_map(|_| [120u8, 90, 140, 255]).collect();
+        let bd = gfx.from_bgra(420, 420, &px).unwrap();
+        let now = Now::sample();
+        let full = RECT { left: 0, top: 0, right: 420, bottom: 420 };
+        let mut drawn = 0;
+        for (first, second) in [(Lang::Ru, Lang::En), (Lang::En, Lang::Ru)] {
+            for def in crate::registry::global().all() {
+                for &size in def.sizes {
+                    let env = SceneEnv { preview: true, hwnd: 0, lang: first, utc_off: 180 };
+                    let mut sc = Scene::empty(&gfx, 420, 420, 1.0, 0.5, &bd, &env).unwrap();
+                    let (w, h) = size.logical();
+                    sc.add_card(&gfx, &CardSpec { id: "c".into(), type_id: def.type_id.into(), size, cfg: json!({}), x: 24, y: 24, w: w as i32, h: h as i32 }).unwrap();
+                    sc.tick_card(&gfx, 0, &now);
+                    sc.measure_lum(&gfx, 1, false).unwrap();
+                    sc.render_card(&gfx, 0, &now).unwrap();
+                    sc.composite(&gfx, full, None, &now).unwrap();
+                    assert!(!sc.cards[0].err_logged, "{}:{size:?} panicked in {first:?}", def.type_id);
+                    // the live switch
+                    sc.set_lang(second);
+                    sc.invalidate_all();
+                    sc.tick_card(&gfx, 0, &now);
+                    sc.render_card(&gfx, 0, &now).unwrap();
+                    sc.composite(&gfx, full, None, &now).unwrap();
+                    assert!(!sc.cards[0].err_logged, "{}:{size:?} panicked after switching {first:?} -> {second:?}", def.type_id);
+                    drawn += 1;
+                }
+            }
+        }
+        assert!(drawn >= 100, "only {drawn} cards drawn");
+    }
 }

@@ -255,7 +255,7 @@ fn cell_text(v: f32, by_ram: bool, lang: Lang) -> String {
     if by_ram {
         fmt_size(v.max(0.0) as u64, lang)
     } else {
-        fmt_cpu(v)
+        fmt_cpu(v, lang)
     }
 }
 
@@ -387,11 +387,11 @@ impl Processes {
     }
 }
 
-fn fmt_cpu(v: f32) -> String {
+fn fmt_cpu(v: f32, lang: Lang) -> String {
     if v < 0.05 {
         "0%".to_string()
     } else if v < 10.0 {
-        format!("{:.1}%", v).replace('.', ",")
+        format!("{:.1}%", v).replace('.', lang.pick(",", "."))
     } else {
         format!("{}%", v.round() as i32)
     }
@@ -609,9 +609,10 @@ mod tests {
 
     #[test]
     fn cpu_text() {
-        assert_eq!(fmt_cpu(0.0), "0%");
-        assert_eq!(fmt_cpu(3.14), "3,1%");
-        assert_eq!(fmt_cpu(24.6), "25%");
+        assert_eq!(fmt_cpu(0.0, Lang::Ru), "0%");
+        assert_eq!(fmt_cpu(3.14, Lang::Ru), "3,1%");
+        assert_eq!(fmt_cpu(3.14, Lang::En), "3.1%");
+        assert_eq!(fmt_cpu(24.6, Lang::Ru), "25%");
     }
 
     /// `cargo test processes_live -- --ignored --nocapture`

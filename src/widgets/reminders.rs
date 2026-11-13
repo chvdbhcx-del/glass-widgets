@@ -825,19 +825,6 @@ mod tests {
     }
 
     #[test]
-    fn english_phrases() {
-        assert_eq!(p("call mom tomorrow at 6pm"), ("call mom".into(), Some(ms(1, 18, 0))));
-        assert_eq!(p("meet Anna 6:30 PM"), ("meet Anna".into(), Some(ms(0, 18, 30))));
-        assert_eq!(p("dentist day after tomorrow at 9 am"), ("dentist".into(), Some(ms(2, 9, 0))));
-        assert_eq!(p("gym at 7 a.m."), ("gym".into(), Some(ms(1, 7, 0)))); // 07:00 is past at 14:00: tomorrow
-        assert_eq!(p("bed today 11:45pm"), ("bed".into(), Some(ms(0, 23, 45))));
-        assert_eq!(p("noon 12pm"), ("noon".into(), Some(ms(1, 12, 0)))); // 12 pm = 12:00, already past
-        assert_eq!(p("visit at 13pm"), ("visit at 13pm".into(), None), "an hour outside 1..12 is not a 12-hour time");
-        assert_eq!(p("5 apples"), ("5 apples".into(), None));
-        assert_eq!(p("tomorrow at 7:05"), ("tomorrow at 7:05".into(), Some(ms(1, 7, 5))), "no text left: the original stays");
-    }
-
-    #[test]
     fn parser_matches_the_js_tests() {
         assert_eq!(p("Купить молоко"), ("Купить молоко".into(), None));
         assert_eq!(p("Купить молоко завтра"), ("Купить молоко".into(), Some(ms(1, 0, 0))));

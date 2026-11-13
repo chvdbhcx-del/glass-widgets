@@ -233,26 +233,26 @@ fn browser_item() -> Item {
 }
 
 /// Preview content: standard Windows apps with their real shell icons (a missing app falls back to a letter tile).
-fn sample_items() -> Vec<Item> {
+fn sample_items(ru: bool) -> Vec<Item> {
     let app = |pfn: &str| Some(format!(r"shell:AppsFolder\{pfn}!App"));
-    let mk = |n: &str, t: &str, icon: Option<String>| Item::new(n, t, icon);
+    let mk = |n: (&str, &str), t: &str, icon: Option<String>| Item::new(if ru { n.0 } else { n.1 }, t, icon);
     vec![
-        mk("Проводник", "explorer.exe", None),
+        mk(("Проводник", "Explorer"), "explorer.exe", None),
         browser_item(),
-        mk("Терминал", "wt.exe", app("Microsoft.WindowsTerminal_8wekyb3d8bbwe")),
-        mk("Блокнот", "notepad.exe", app("Microsoft.WindowsNotepad_8wekyb3d8bbwe")),
-        mk("Калькулятор", "calc.exe", Some(CALC_ICON.into())),
-        mk("Настройки", "ms-settings:", Some(SETTINGS_ICON.into())),
-        mk("Paint", "mspaint.exe", app("Microsoft.Paint_8wekyb3d8bbwe")),
-        mk("Фотографии", "ms-photos:", app("Microsoft.Windows.Photos_8wekyb3d8bbwe")),
-        mk("Часы", "ms-clock:", app("Microsoft.WindowsAlarms_8wekyb3d8bbwe")),
-        mk("Ножницы", "ms-screenclip:", app("Microsoft.ScreenSketch_8wekyb3d8bbwe")),
-        mk("Магазин", "ms-windows-store:", app("Microsoft.WindowsStore_8wekyb3d8bbwe")),
-        mk("Задачи", "taskmgr.exe", None),
-        mk("Cmd", "cmd.exe", None),
-        mk("PowerShell", r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", None),
-        mk("Панель", "control.exe", None),
-        mk("Сведения", "msinfo32.exe", None),
+        mk(("Терминал", "Terminal"), "wt.exe", app("Microsoft.WindowsTerminal_8wekyb3d8bbwe")),
+        mk(("Блокнот", "Notepad"), "notepad.exe", app("Microsoft.WindowsNotepad_8wekyb3d8bbwe")),
+        mk(("Калькулятор", "Calculator"), "calc.exe", Some(CALC_ICON.into())),
+        mk(("Настройки", "Settings"), "ms-settings:", Some(SETTINGS_ICON.into())),
+        mk(("Paint", "Paint"), "mspaint.exe", app("Microsoft.Paint_8wekyb3d8bbwe")),
+        mk(("Фотографии", "Photos"), "ms-photos:", app("Microsoft.Windows.Photos_8wekyb3d8bbwe")),
+        mk(("Часы", "Clock"), "ms-clock:", app("Microsoft.WindowsAlarms_8wekyb3d8bbwe")),
+        mk(("Ножницы", "Snipping Tool"), "ms-screenclip:", app("Microsoft.ScreenSketch_8wekyb3d8bbwe")),
+        mk(("Магазин", "Store"), "ms-windows-store:", app("Microsoft.WindowsStore_8wekyb3d8bbwe")),
+        mk(("Задачи", "Task Manager"), "taskmgr.exe", None),
+        mk(("Cmd", "Cmd"), "cmd.exe", None),
+        mk(("PowerShell", "PowerShell"), r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", None),
+        mk(("Панель", "Control Panel"), "control.exe", None),
+        mk(("Сведения", "System Info"), "msinfo32.exe", None),
     ]
 }
 
@@ -554,7 +554,7 @@ impl Widget for Shortcuts {
         if !self.started {
             self.started = true;
             if cx.preview {
-                self.items = sample_items();
+                self.items = sample_items(cx.lang == Lang::Ru);
                 for src in self.items.iter().filter_map(icon_source).collect::<Vec<_>>() {
                     if let Some(b) = preview_icon(&src).and_then(|d| cx.image(&d).ok()) {
                         self.icons.insert(src, b);
