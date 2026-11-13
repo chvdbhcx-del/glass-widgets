@@ -587,6 +587,7 @@ unsafe fn setup(o: &Opts) -> Result<()> {
     ui.appearance = settings.appearance;
     ui.dim_mode = settings.dim;
     ui.check_start = settings.check_updates;
+    ui.lang_pref = settings.lang;
     let panels = if o.no_config { ((0.0, 0.0), (0.0, 0.0)) } else { layout::read_panels() };
     (ui.gal_off, ui.set_off) = panels;
     let check_now = settings.check_updates && !o.no_config && o.bench.is_none();

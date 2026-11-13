@@ -20,7 +20,7 @@ impl App {
         if let Ok(mut g) = scene::SCENE_PROGRAMS.lock() {
             g.clone_from(&scene_programs);
         }
-        tray::MenuState { lang: self.ui.lang, editing: self.editing, hidden: self.user_hidden, autostart: crate::autostart::enabled(), profiles, active, monitors, monitor, scene_rules: self.scene_menu_lines(), scene_programs, scene_active: self.scenes.applied_rule().and_then(|a| self.scene_rules.iter().position(|r| r == a)) }
+        tray::MenuState { lang: self.ui.lang, lang_pref: self.ui.lang_pref, editing: self.editing, hidden: self.user_hidden, autostart: crate::autostart::enabled(), profiles, active, monitors, monitor, scene_rules: self.scene_menu_lines(), scene_programs, scene_active: self.scenes.applied_rule().and_then(|a| self.scene_rules.iter().position(|r| r == a)) }
     }
 
     /// A tray click / menu choice.
@@ -52,6 +52,7 @@ impl App {
             TrayCmd::SaveProfile => self.ask_profile_name(),
             TrayCmd::DeleteProfile => self.delete_profile(),
             TrayCmd::Monitor(i) => self.set_monitor(i),
+            TrayCmd::Language(p) => self.set_language(p, true),
             TrayCmd::SceneRemove(i) => self.scene_remove(i),
             TrayCmd::SceneProgram(prog, prof) => self.scene_add_program(prog, prof),
             TrayCmd::SceneTyped(prof) => self.ask_scene_text(false, prof),
@@ -466,10 +467,34 @@ impl App {
                 self.apply_scope();
             }
             ui::Opt::Monitor => return self.set_monitor(k), // redraws the panel itself
+            ui::Opt::Language => return self.set_language(ui::Opt::language(k), true), // repaints everything itself
         }
         if let Some(d) = self.hover_dirty(Hit::Panel) {
             self.frame(d);
         }
+    }
+
+    /// The language setting (settings panel, tray, or `lang` edited in config.json): applies LIVE. The preference is remembered here, the
+    /// widgets, gallery previews, the panels and the next menus are drawn in the new language at once; `persist` also writes `lang`.
+    pub(super) unsafe fn set_language(&mut self, pref: crate::i18n::LangPref, persist: bool) {
+        let lang = crate::i18n::set_pref(pref);
+        self.settings.lang = pref;
+        if persist {
+            self.write_setting("lang", serde_json::json!(pref.key()));
+        }
+        let changed = lang != self.ui.lang;
+        self.ui.set_language(pref, lang);
+        if changed {
+            self.abort_menu();
+            self.scene.set_lang(lang);
+            self.scene.invalidate_all();
+            let now = self.now();
+            for i in 0..self.scene.len() {
+                let _ = self.scene.render_card(&self.gfx, i, &now);
+            }
+        }
+        let d = self.all_dirty();
+        self.frame(d);
     }
 
     /// The "Start with Windows" switch: the per-user Run value is written / removed right now.

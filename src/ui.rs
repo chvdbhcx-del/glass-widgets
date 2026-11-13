@@ -158,11 +158,13 @@ pub enum Opt {
     Scope,
     /// which monitor the desk lives on (`widgetsMonitor`): one segment per connected monitor, `Ui::opt_n` of them
     Monitor,
+    /// the UI language: auto / Russian / English (`lang`)
+    Language,
 }
 /// At most this many monitors get a segment (the tray menu lists all of them).
 pub const MON_SEGS: usize = 5;
 impl Opt {
-    pub const ALL: [Opt; 6] = [Opt::Appearance, Opt::Dim, Opt::Source, Opt::Accent, Opt::Scope, Opt::Monitor];
+    pub const ALL: [Opt; 7] = [Opt::Appearance, Opt::Dim, Opt::Source, Opt::Accent, Opt::Scope, Opt::Monitor, Opt::Language];
     /// Number of options of a fixed control (`Monitor` depends on the connected monitors: `Ui::opt_n`).
     pub fn count(self) -> usize {
         match self {
@@ -182,6 +184,10 @@ impl Opt {
     /// Option `k` as the accent scope (Main, All).
     pub fn scope(k: usize) -> AccentScope {
         [AccentScope::Main, AccentScope::All][k.min(1)]
+    }
+    /// Option `k` as the language preference (Auto, Russian, English).
+    pub fn language(k: usize) -> crate::i18n::LangPref {
+        crate::i18n::LangPref::from_index(k)
     }
     /// Option `k` as the dimming mode (Auto, Never, Always).
     pub fn dim(k: usize) -> Dim {
@@ -252,6 +258,8 @@ struct Pv {
 
 pub struct Ui {
     pub lang: Lang,
+    /// the language SETTING (auto / ru / en); `lang` is what it resolves to
+    pub lang_pref: crate::i18n::LangPref,
     pub s: f32,
     /// monitor size, logical px
     pub mw: f32,
@@ -337,7 +345,7 @@ fn done_button_k(cx: &Cx, r: Rect, label: &str, hot: f32) {
 // Animation keys of the controls (`hkey`): the look sliders first, then everything else.
 const K_RESET: usize = 16;
 const K_OPT: usize = 20; // + option index * MON_SEGS + segment
-const K_AUTO: usize = K_OPT + 6 * MON_SEGS;
+const K_AUTO: usize = K_OPT + 7 * MON_SEGS;
 const K_CHECK: usize = K_AUTO + 1;
 const K_EDIT: usize = K_AUTO + 2;
 const K_QUIT: usize = K_AUTO + 3;
@@ -369,6 +377,7 @@ fn opt_idx(o: Opt) -> usize {
         Opt::Accent => 3,
         Opt::Scope => 4,
         Opt::Monitor => 5,
+        Opt::Language => 6,
     }
 }
 
@@ -1397,6 +1406,7 @@ pub fn dump_ui(a: &DumpArgs) -> std::result::Result<(), String> {
         scene.render_card(&gfx, i, &now).map_err(e("render"))?;
     }
     let mut ui = Ui::new(env.lang, s, lw, lh);
+    ui.lang_pref = crate::i18n::pref();
     ui.glass = settings.glass;
     ui.live = settings.live;
     let edit = matches!(a.state.as_str(), "edit" | "gallery" | "settings");

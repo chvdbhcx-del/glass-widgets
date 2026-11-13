@@ -224,6 +224,9 @@ impl App {
         if (new.glass - old.glass).abs() > 1e-4 {
             self.apply_glass(new.glass);
         }
+        if new.lang != old.lang {
+            self.set_language(new.lang, false);
+        }
         self.ui.appearance = new.appearance;
         self.ui.dim_mode = new.dim;
         self.ui.check_start = new.check_updates;

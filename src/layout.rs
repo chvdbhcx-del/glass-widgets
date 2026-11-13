@@ -261,17 +261,10 @@ pub fn persist_cfg_at(p: &std::path::Path, slot: Option<&str>, items: &[Item], i
     }
 }
 
-/// UI language from config.json (`lang`: "ru" | "en"), default ru.
+/// The UI language in force: config.json `lang` ("auto" | "ru" | "en", missing = auto) resolved against the Windows UI language,
+/// or what the host / `--lang` set since (see i18n.rs).
 pub fn lang() -> crate::widget::Lang {
-    let l = (|| -> Option<String> {
-        let v: Value = serde_json::from_str(&std::fs::read_to_string(config_path()?).ok()?).ok()?;
-        v.get("lang")?.as_str().map(str::to_string)
-    })();
-    if l.as_deref().is_some_and(|s| s.starts_with("en")) {
-        crate::widget::Lang::En
-    } else {
-        crate::widget::Lang::Ru
-    }
+    crate::i18n::current()
 }
 
 // ---------------------------------------------------------------- host: settings, layout write-back
@@ -341,7 +334,7 @@ impl AccentMode {
 }
 
 /// The host settings of config.json: `widgetsGlass` 0..1, `widgetsDim`, `widgetsGlassMode` ("plain" = no desktop capture, anything else = live glass),
-/// `widgetsAppearance` ("auto" | "dark" | "light"), `checkUpdates` (bool), `accentMode` ("blue" | "wallpaper"), `captureFps` ("auto" | 1..30).
+/// `widgetsAppearance` ("auto" | "dark" | "light"), `checkUpdates` (bool), `accentMode` ("blue" | "wallpaper"), `captureFps` ("auto" | 1..30), `lang` ("auto" | "ru" | "en").
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Settings {
     pub glass: f32,
@@ -355,10 +348,12 @@ pub struct Settings {
     pub accent_scope: AccentScope,
     /// `captureFps`: None = auto (15 fps backing off to 2 while the wallpaper is still), Some(n) = a fixed capture rate
     pub capture_fps: Option<u32>,
+    /// `lang`: the UI language, auto (follow the Windows UI language) / ru / en
+    pub lang: crate::i18n::LangPref,
 }
 impl Default for Settings {
     fn default() -> Self {
-        Settings { glass: 0.5, dim: Dim::Auto, live: true, appearance: crate::motion::AppearancePref::Dark, check_updates: false, accent: AccentMode::Blue, accent_scope: AccentScope::Main, capture_fps: None }
+        Settings { glass: 0.5, dim: Dim::Auto, live: true, appearance: crate::motion::AppearancePref::Dark, check_updates: false, accent: AccentMode::Blue, accent_scope: AccentScope::Main, capture_fps: None, lang: crate::i18n::LangPref::Auto }
     }
 }
 impl Settings {
@@ -377,6 +372,7 @@ impl Settings {
             accent: if v.get("accentMode").and_then(|g| g.as_str()) == Some("wallpaper") { AccentMode::Wallpaper } else { AccentMode::Blue },
             accent_scope: if v.get("accentScope").and_then(|g| g.as_str()) == Some("all") { AccentScope::All } else { AccentScope::Main },
             capture_fps: crate::backdrop::parse_capture_fps(v.get("captureFps")),
+            lang: crate::i18n::LangPref::from_value(v),
         }
     }
 }

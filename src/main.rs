@@ -26,6 +26,7 @@ mod fonts;
 mod glass;
 mod grid;
 mod host;
+mod i18n;
 mod input;
 mod layout;
 mod liquid;
@@ -100,6 +101,8 @@ struct Args {
     /// `--accent RRGGBB`: render the headless output with this accent colour; `--accent-of image`: print the accent picked from an image and exit
     accent: Option<[u8; 3]>,
     accent_of: Option<String>,
+    /// `--lang auto|ru|en`: the UI language of the headless output / of this run (not written to config.json)
+    lang: Option<i18n::LangPref>,
 }
 
 fn parse_args() -> Args {
@@ -171,6 +174,13 @@ fn parse_args() -> Args {
                 }
             }
             "--accent-of" => a.accent_of = Some(val()),
+            "--lang" => {
+                let v = val();
+                a.lang = i18n::LangPref::parse(&v);
+                if a.lang.is_none() {
+                    eprintln!("mswidgets: --lang expects auto|ru|en, got '{v}'");
+                }
+            }
             other => eprintln!("mswidgets: unknown argument {other}"),
         }
     }
@@ -203,6 +213,9 @@ fn main() {
     applog::init(); // stderr -> %LOCALAPPDATA%\Glass Widgets\logs\mswidgets.log when nothing else receives it
     let a = parse_args();
     glass::init_params(a.glass_params.as_deref());
+    if let Some(p) = a.lang {
+        i18n::set_pref(p);
+    }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -221,9 +234,9 @@ fn main() {
     }
     if let Some(mode) = &a.prompt_demo {
         let multi = mode == "multi";
-        let mut o = input::PromptOpts::new(if multi { "Новая заметка" } else { "Новое напоминание" }, "", multi);
-        o.placeholder = if multi { "Текст заметки…".into() } else { "Что напомнить?".into() };
-        o.ok_label = "Добавить".into();
+        let mut o = input::PromptOpts::new(if multi { i18n::tr("Новая заметка", "New note") } else { i18n::tr("Новое напоминание", "New reminder") }, "", multi);
+        o.placeholder = if multi { i18n::tr("Текст заметки…", "Note text…").into() } else { i18n::tr("Что напомнить?", "Remind me to…").into() };
+        o.ok_label = i18n::tr("Добавить", "Add").into();
         println!("{:?}", input::prompt_ex(o));
         std::process::exit(0);
     }

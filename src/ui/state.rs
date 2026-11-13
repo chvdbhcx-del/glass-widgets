@@ -12,6 +12,7 @@ impl Ui {
         }
         Ui {
             lang,
+            lang_pref: crate::i18n::LangPref::Auto,
             s,
             mw,
             mh,
@@ -178,7 +179,7 @@ impl Ui {
     /// The settings panel opens at the right edge, vertically centred: the cards (top left of the desk) stay visible to judge the look.
     pub(super) fn settings_home(&self) -> Rect {
         let w = SET_W.min(self.mw - 16.0);
-        let h = (SET_TOP + (1 + LOOK.len()) as f32 * SET_ROW + 14.0 + SET_FOOT + OPT_ROW).min(self.mh - 24.0);
+        let h = (SET_TOP + (1 + LOOK.len()) as f32 * SET_ROW + 14.0 + SET_FOOT + OPT_ROW * 2.0).min(self.mh - 24.0);
         Rect::new((self.mw - w - (self.mw * 0.04).max(8.0)).max(8.0), ((self.mh - h) / 2.0).max(8.0), w, h)
     }
 
@@ -391,7 +392,7 @@ impl Ui {
         if k < n {
             return Hit::Look(k, self.set_pos(k));
         }
-        [Hit::ResetLook, Hit::Opt(Opt::Appearance, 1), Hit::Opt(Opt::Dim, 0), Hit::Opt(Opt::Source, 1), Hit::Opt(Opt::Accent, 1), Hit::Opt(Opt::Scope, 1), Hit::Opt(Opt::Monitor, 0), Hit::Autostart, Hit::CheckStart, Hit::EditBtn, Hit::QuitBtn, Hit::UpdBtn, Hit::UpdInstall, Hit::UpdPage, Hit::Done].get(k - n).copied().unwrap_or(Hit::None)
+        [Hit::ResetLook, Hit::Opt(Opt::Appearance, 1), Hit::Opt(Opt::Dim, 0), Hit::Opt(Opt::Source, 1), Hit::Opt(Opt::Accent, 1), Hit::Opt(Opt::Scope, 1), Hit::Opt(Opt::Monitor, 0), Hit::Opt(Opt::Language, 1), Hit::Autostart, Hit::CheckStart, Hit::EditBtn, Hit::QuitBtn, Hit::UpdBtn, Hit::UpdInstall, Hit::UpdPage, Hit::Done].get(k - n).copied().unwrap_or(Hit::None)
     }
 
     // ------------------------------------------------ keyboard / wheel on the sliders
@@ -448,6 +449,7 @@ impl Ui {
             Opt::Accent => usize::from(self.accent_mode == AccentMode::Wallpaper),
             Opt::Scope => usize::from(self.accent_scope == AccentScope::All),
             Opt::Monitor => self.mon_sel.min(self.opt_n(o) - 1),
+            Opt::Language => self.lang_pref.index(),
         }
     }
 
@@ -457,6 +459,13 @@ impl Ui {
             Opt::Monitor => self.mon_count.clamp(1, MON_SEGS),
             _ => o.count(),
         }
+    }
+
+    /// The language setting changed: texts come from `lang` now; the cached gallery previews (each a scene of its own) are drawn again in it.
+    pub fn set_language(&mut self, pref: crate::i18n::LangPref, lang: Lang) {
+        self.lang_pref = pref;
+        self.lang = lang;
+        self.pv.clear();
     }
 
     pub fn lay(&self) -> Lay {

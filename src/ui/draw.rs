@@ -289,13 +289,15 @@ impl Ui {
             self.set_button(cx, l.reset, self.t("Сбросить вид", "Reset look"), K_RESET, true, TEXT);
 
             // behaviour: segmented controls
-            let labels: [(Opt, (&str, &str), [(&str, &str); 3]); 6] = [
+            let labels: [(Opt, (&str, &str), [(&str, &str); 3]); 7] = [
                 (Opt::Appearance, ("Оформление", "Appearance"), [("Тёмное", "Dark"), ("Светлое", "Light"), ("Авто", "Auto")]),
                 (Opt::Dim, ("Приглушение", "Dimming"), [("Авто", "Auto"), ("Никогда", "Never"), ("Всегда", "Always")]),
                 (Opt::Source, ("Источник стекла", "Glass source"), [("Живой", "Live"), ("Простой", "Plain"), ("", "")]),
                 (Opt::Accent, ("Акцент", "Accent"), [("Синий", "Blue"), ("Из обоев", "Wallpaper"), ("", "")]),
                 (Opt::Scope, ("Акцент на", "Accent on"), [("Главном", "Main"), ("Везде", "Everywhere"), ("", "")]),
                 (Opt::Monitor, ("Монитор", "Monitor"), [("", ""), ("", ""), ("", "")]),
+                // the language names stay in their own language in both UIs, so a lost reader can always find theirs
+                (Opt::Language, ("Язык", "Language"), [("Авто", "Auto"), ("Русский", "Русский"), ("English", "English")]),
             ];
             let nums: Vec<String> = (1..=self.opt_n(Opt::Monitor)).map(|n| n.to_string()).collect();
             for o in &l.opts {

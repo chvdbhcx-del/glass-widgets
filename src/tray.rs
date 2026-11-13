@@ -24,6 +24,8 @@ pub enum TrayCmd {
     DeleteProfile,
     /// "Monitor" submenu: move the desk to the n-th monitor (display order, the list in `MenuState::monitors`)
     Monitor(usize),
+    /// "Language" submenu: Auto / Русский / English
+    Language(crate::i18n::LangPref),
     /// "Scenes" submenu: remove rule n / a rule for the n-th running program with profile m / for a typed exe name with profile m / for a time range with profile m
     SceneRemove(usize),
     SceneProgram(usize, usize),
@@ -35,6 +37,8 @@ pub enum TrayCmd {
 /// What the menu needs to know to label and check its items.
 pub struct MenuState {
     pub lang: Lang,
+    /// the language SETTING (the radio mark of the "Language" submenu)
+    pub lang_pref: crate::i18n::LangPref,
     pub editing: bool,
     pub hidden: bool,
     pub autostart: bool,
@@ -95,6 +99,10 @@ const C_DELETE_PROFILE: usize = 7;
 const C_MONITORS: usize = 9;
 /// the "Scenes" submenu entry of the main menu (a popup)
 const C_SCENES: usize = 10;
+/// the "Language" submenu entry of the main menu (a popup)
+const C_LANG: usize = 11;
+/// + `LangPref::index`
+const C_LANG_PREF: usize = 300;
 /// + the index of the profile; at most `MAX_PROFILES` are listed
 const C_PROFILE: usize = 100;
 const MAX_PROFILES: usize = 40;
@@ -191,6 +199,19 @@ pub unsafe fn run_menu(hwnd: HWND, st: &MenuState, foreground: impl Fn(HWND)) ->
         }
     }
     let scenes = scenes_popup(st);
+    // the "Language" submenu: Auto follows the Windows display language; the names stay in their own language
+    let language = CreatePopupMenu().ok();
+    if let Some(sub) = language {
+        for p in crate::i18n::LangPref::ALL {
+            let label = match p {
+                crate::i18n::LangPref::Auto => wide(st.lang.pick("Авто (как в Windows)", "Auto (as in Windows)")),
+                crate::i18n::LangPref::Ru => wide("Русский"),
+                crate::i18n::LangPref::En => wide("English"),
+            };
+            let flags = MF_STRING | if st.lang_pref == p { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(sub, flags, C_LANG_PREF + p.index(), PCWSTR(label.as_ptr()));
+        }
+    }
     let items = [
         (C_SETTINGS, t("Настройки…", "Settings…"), false),
         (C_EDIT, if st.editing { t("Готово", "Done") } else { t("Изменить виджеты…", "Edit Widgets…") }, false),
@@ -198,6 +219,7 @@ pub unsafe fn run_menu(hwnd: HWND, st: &MenuState, foreground: impl Fn(HWND)) ->
         (C_LAYOUTS, t("Макеты", "Layouts"), false),
         (C_SCENES, t("Сцены", "Scenes"), false),
         (C_MONITORS, t("Монитор", "Monitor"), false),
+        (C_LANG, t("Язык", "Language"), false),
         (0, Vec::new(), false),
         (C_AUTOSTART, t("Запускать вместе с Windows", "Start with Windows"), st.autostart),
         (0, Vec::new(), false),
@@ -212,6 +234,10 @@ pub unsafe fn run_menu(hwnd: HWND, st: &MenuState, foreground: impl Fn(HWND)) ->
             }
         } else if *id == C_SCENES {
             if let Some(sub) = scenes {
+                let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(label.as_ptr()));
+            }
+        } else if *id == C_LANG {
+            if let Some(sub) = language {
                 let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(label.as_ptr()));
             }
         } else if *id == C_MONITORS {
@@ -239,6 +265,7 @@ pub unsafe fn run_menu(hwnd: HWND, st: &MenuState, foreground: impl Fn(HWND)) ->
         C_DELETE_PROFILE => TrayCmd::DeleteProfile,
         C_QUIT => TrayCmd::Quit,
         c if (C_PROFILE..C_PROFILE + MAX_PROFILES).contains(&c) => TrayCmd::Profile(c - C_PROFILE),
+        c if (C_LANG_PREF..C_LANG_PREF + 3).contains(&c) => TrayCmd::Language(crate::i18n::LangPref::from_index(c - C_LANG_PREF)),
         c if (C_MONITOR..C_MONITOR + MAX_MONITORS).contains(&c) => TrayCmd::Monitor(c - C_MONITOR),
         c if (C_SC_REMOVE..C_SC_REMOVE + MAX_RULES).contains(&c) => TrayCmd::SceneRemove(c - C_SC_REMOVE),
         c if (C_SC_TYPED..C_SC_TYPED + MAX_PROFILES).contains(&c) => TrayCmd::SceneTyped(c - C_SC_TYPED),

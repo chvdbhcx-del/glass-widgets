@@ -1292,6 +1292,10 @@ impl Scene {
             self.fx_wake = true;
         }
     }
+    /// The UI language changed: the widgets draw their text in `lang` from now on. Call `invalidate_all` + `render_card` after it.
+    pub fn set_lang(&mut self, lang: Lang) {
+        self.sh.lang = lang;
+    }
     /// Record every card's static content again on its next `render_card` (the accent colour changed).
     pub fn invalidate_all(&mut self) {
         for c in &self.cards {
