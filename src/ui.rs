@@ -846,7 +846,7 @@ mod tests {
             assert_eq!(ui.set_hit(p.x - 1.0, p.cy()), Hit::None);
             assert_eq!(ui.set_hit(1.0, 1.0), Hit::None);
             // reading order for the headless --hover
-            assert!(matches!(ui.nth_control(0), Hit::Look(0, _)) && ui.nth_control(l.rows.len() + 14) == Hit::Done && ui.nth_control(99) == Hit::None);
+            assert!(matches!(ui.nth_control(0), Hit::Look(0, _)) && ui.nth_control(l.rows.len() + 15) == Hit::Done && ui.nth_control(99) == Hit::None);
         }
     }
 
@@ -872,6 +872,37 @@ mod tests {
         // the row sits inside the panel above the switches, and the panel grew to hold it
         assert!(l.panel.contains(o.seg.cx(), o.seg.cy()) && o.seg.bottom() <= l.auto_row.y + 0.5);
         assert!(l.edit_btn.bottom() < l.panel.bottom());
+    }
+
+    /// The language row of the settings panel: three segments (auto / Russian / English), the selection is the SETTING (not what it resolves
+    /// to), a click lands on the right segment, and `set_language` switches the texts and throws the cached gallery previews away.
+    #[test]
+    fn language_control_and_live_switch() {
+        use crate::i18n::LangPref;
+        let mut ui = Ui::new(Lang::Ru, 1.0, 1600.0, 900.0);
+        ui.edit = true;
+        ui.settings = true;
+        assert_eq!((Opt::Language.count(), ui.opt_n(Opt::Language), ui.opt_sel(Opt::Language)), (3, 3, 0), "auto by default");
+        let l = ui.set_lay();
+        let o = l.opts.iter().find(|o| o.which == Opt::Language).expect("language row");
+        for k in 0..3 {
+            assert_eq!(ui.set_hit(o.seg.x + o.seg.w * (k as f32 + 0.5) / 3.0, o.seg.cy()), Hit::Opt(Opt::Language, k));
+            assert_eq!(Opt::language(k), LangPref::from_index(k));
+        }
+        assert!(l.panel.contains(o.seg.cx(), o.seg.cy()) && o.seg.bottom() <= l.auto_row.y + 0.5, "the row sits above the switches");
+        assert!(l.edit_btn.bottom() < l.panel.bottom());
+        // Russian Windows + "auto" shows Russian, the selection still says auto; picking English changes both
+        assert_eq!((ui.t("Язык", "Language"), ui.lang_pref), ("Язык", LangPref::Auto));
+        ui.set_language(LangPref::En, Lang::En);
+        assert_eq!((ui.t("Язык", "Language"), ui.opt_sel(Opt::Language)), ("Language", 2));
+        ui.set_language(LangPref::Auto, Lang::Ru);
+        assert_eq!((ui.t("Язык", "Language"), ui.opt_sel(Opt::Language)), ("Язык", 0));
+        // keyboard order: the language row is reachable like the others
+        assert!((0..40).any(|k| ui.nth_control(k) == Hit::Opt(Opt::Language, 1)));
+        // every row has its own animation key
+        let keys: std::collections::HashSet<usize> = Opt::ALL.iter().map(|o| hkey(Hit::Opt(*o, 0)).unwrap()).collect();
+        assert_eq!(keys.len(), Opt::ALL.len());
+        assert!(hkey(Hit::Opt(Opt::Language, MON_SEGS - 1)).unwrap() < hkey(Hit::Autostart).unwrap());
     }
 
     /// The shown values follow the look: positions, texts, the selected options, the base tick.

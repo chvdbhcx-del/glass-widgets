@@ -589,7 +589,8 @@ mod tests {
         assert_eq!(vs_from_cfg(Some(" RUB ")), "rub");
         assert_eq!(vs_from_cfg(Some("zzz")), "usd");
         assert_eq!(vs_from_cfg(None), "usd");
-        assert_eq!(money("usd", 67412.35, false), "$67\u{a0}412");
+        assert_eq!(money("usd", 67412.35, false), "$67,412");
+        assert_eq!(money("usd", 67412.35, true), "$67\u{a0}412");
         assert_eq!(money("rub", 92.15, true), "92,15\u{a0}₽");
         assert_eq!(money("eur", 0.0123456, false), "€0.0123");
     }

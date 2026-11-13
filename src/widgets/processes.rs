@@ -603,7 +603,8 @@ mod tests {
     #[test]
     fn cell_text_units() {
         assert_eq!(cell_text(24.6, false, Lang::En), "25%");
-        assert_eq!(cell_text(3.14, false, Lang::En), "3,1%");
+        assert_eq!(cell_text(3.14, false, Lang::En), "3.1%");
+        assert_eq!(cell_text(3.14, false, Lang::Ru), "3,1%");
         assert_eq!(cell_text(2.0 * 1073741824.0, true, Lang::En), fmt_size(2 * 1073741824, Lang::En));
     }
 
