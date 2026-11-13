@@ -295,10 +295,11 @@ fn wx_file(lat: f64, lon: f64) -> String {
     format!("weather_{lat:.2}_{lon:.2}.json")
 }
 
-/// Location previously resolved for `key` (auto-detect results expire after a week).
-fn read_loc(key: &str, auto: bool) -> Option<Loc> {
+/// Location previously resolved for `key` in the language `ru` (auto-detect results expire after a week). The place NAME is stored in the
+/// language it was looked up in (`lang`, absent in older files = Russian): after a language switch it is looked up again.
+fn read_loc(key: &str, auto: bool, ru: bool) -> Option<Loc> {
     let v = read_file("weather_loc.json")?;
-    if v.get("key")?.as_str()? != key || (auto && unix_now() - v.get("at")?.as_i64()? > 7 * 86400) {
+    if v.get("key")?.as_str()? != key || (auto && unix_now() - v.get("at")?.as_i64()? > 7 * 86400) || (v.get("lang").and_then(|l| l.as_str()) != Some("en")) != ru {
         return None;
     }
     Some(Loc { lat: v.get("lat")?.as_f64()?, lon: v.get("lon")?.as_f64()?, name: v.get("name")?.as_str()?.to_string(), auto })
@@ -312,7 +313,7 @@ fn geocode(q: &str, ru: bool) -> R<(f64, f64, String)> {
 /// Resolve what the user wants into coordinates (disk cache first, then the network).
 fn resolve(w: &Want, ru: bool) -> R<Loc> {
     let (key, auto) = (w.key(), matches!(w, Want::Auto));
-    if let Some(l) = read_loc(&key, auto) {
+    if let Some(l) = read_loc(&key, auto, ru) {
         return Ok(l);
     }
     let (lat, lon, name) = match w {
@@ -326,13 +327,13 @@ fn resolve(w: &Want, ru: bool) -> R<Loc> {
             }
         }
     };
-    write_file("weather_loc.json", &json!({"key": key, "lat": lat, "lon": lon, "name": name, "at": unix_now()}));
+    write_file("weather_loc.json", &json!({"key": key, "lat": lat, "lon": lon, "name": name, "at": unix_now(), "lang": if ru { "ru" } else { "en" }}));
     Ok(Loc { lat, lon, name, auto })
 }
 
 /// Instant start: last good forecast from disk, no network.
-fn load_cached(w: &Want) -> Option<Loaded> {
-    let loc = read_loc(&w.key(), matches!(w, Want::Auto))?;
+fn load_cached(w: &Want, ru: bool) -> Option<Loaded> {
+    let loc = read_loc(&w.key(), matches!(w, Want::Auto), ru)?;
     let v = read_file(&wx_file(loc.lat, loc.lon))?;
     Some(Loaded { key: w.key(), raw: v.get("raw")?.clone(), fetched: v.get("fetched")?.as_i64()?, loc })
 }
@@ -365,6 +366,8 @@ struct Weather {
     failed: bool,
     not_found: bool,
     cur_key: String,
+    /// the UI language the place name was looked up in; a switch looks it up again
+    name_lang: Option<Lang>,
     cache_job: Option<Pending<Option<Loaded>>>,
     net_job: Option<Pending<R<Loaded>>>,
     prompt: Option<Pending<Option<String>>>,
@@ -438,7 +441,7 @@ impl Weather {
         }
     }
 
-    fn load_sample(&mut self, now: &Now) {
+    fn load_sample(&mut self, now: &Now, lang: Lang) {
         let h0 = now.h as i64;
         let d0 = tz::days_from_civil(now.y, now.mo, now.d);
         const T: [f32; 24] = [6.8, 7.4, 8.1, 8.7, 8.9, 8.4, 7.6, 6.9, 6.2, 5.6, 5.0, 4.5, 4.0, 3.6, 3.4, 3.3, 3.5, 4.2, 5.0, 5.8, 6.4, 6.9, 7.2, 7.4];
@@ -452,7 +455,7 @@ impl Weather {
         const D: [(u8, f32, f32); 6] = [(2, 3.0, 8.9), (61, 2.2, 7.1), (3, 1.0, 6.0), (0, -0.8, 4.9), (71, -2.4, 1.1), (3, -1.0, 3.0)];
         let days = D.iter().enumerate().map(|(i, &(code, lo, hi))| Day { key: d0 + i as i64, dow: (d0 + i as i64 + 3).rem_euclid(7) as u32, code, lo, hi }).collect();
         self.wx = Some(Wx { temp: 6.8, code: 2, day: (7..17).contains(&now.h), off: 0, hours, days });
-        self.place = "Москва".into();
+        self.place = lang.pick("Москва", "Moscow").into();
         self.auto = true;
     }
 
@@ -665,7 +668,7 @@ impl Widget for Weather {
         if cx.preview {
             if !self.started {
                 self.started = true;
-                self.load_sample(&cx.now);
+                self.load_sample(&cx.now, cx.lang);
                 if let (Some(c), Some(wx)) = (cx.cfg_f64("sample_code"), self.wx.as_mut()) {
                     wx.code = c as u8; // preview only: check how every condition text fits
                 }
@@ -710,7 +713,9 @@ impl Widget for Weather {
             self.net_job = None;
             self.next_try = 0;
             let w = want.clone();
-            self.cache_job = Some(cx.spawn(move || load_cached(&w)));
+            let ru = cx.lang == Lang::Ru;
+            self.name_lang = Some(cx.lang);
+            self.cache_job = Some(cx.spawn(move || load_cached(&w, ru)));
         }
         let cached = self.cache_job.as_ref().map(|j| (!j.busy(), j.take()));
         if let Some((done, res)) = cached {
@@ -754,6 +759,12 @@ impl Widget for Weather {
                 }
                 None => {}
             }
+        }
+        // the UI language changed: the place name is looked up again in it (the forecast itself stays)
+        if self.name_lang != Some(cx.lang) {
+            self.name_lang = Some(cx.lang);
+            self.net_job = None;
+            self.next_try = 0;
         }
         if self.net_job.is_none() && utc >= self.next_try {
             let (w, ru) = (want, cx.lang == Lang::Ru);

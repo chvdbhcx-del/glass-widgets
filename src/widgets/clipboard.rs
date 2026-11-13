@@ -211,15 +211,16 @@ fn make_rows(entries: &[Entry], current: Option<&str>, now: i64, ru: bool) -> Ve
 }
 
 fn sample_rows(ru: bool) -> Vec<Row> {
+    let pick = |a: &'static str, b: &'static str| if ru { a } else { b };
     let s: [(&str, i64); 8] = [
         ("https://github.com/anthropics/claude-code", 20),
-        ("Созвон завтра в 15:30 — ссылка в календаре", 3 * 60),
+        (pick("Созвон завтра в 15:30 — ссылка в календаре", "Call tomorrow at 3:30 pm: the link is in the calendar"), 3 * 60),
         ("npm install --save-dev typescript", 12 * 60),
         ("+7 (916) 555-01-32", 47 * 60),
-        ("Купить молоко, яйца и хлеб", 2 * 3600),
+        (pick("Купить молоко, яйца и хлеб", "Buy milk, eggs and bread"), 2 * 3600),
         ("SELECT * FROM users WHERE id = 42;", 3 * 3600),
-        ("Привет! Как дела? Давно не виделись, заходи в гости", 5 * 3600),
-        (r"C:\Users\Anna\Documents\отчёт.xlsx", 26 * 3600),
+        (pick("Привет! Как дела? Давно не виделись, заходи в гости", "Hi! How are you? Long time no see, come over sometime"), 5 * 3600),
+        (pick(r"C:\Users\Anna\Documents\отчёт.xlsx", r"C:\Users\Anna\Documents\report.xlsx"), 26 * 3600),
     ];
     let entries: Vec<Entry> = s.iter().map(|&(t, age)| Entry { text: t.to_string(), at: 1_000_000 - age }).collect();
     make_rows(&entries, Some(s[0].0), 1_000_000, ru)

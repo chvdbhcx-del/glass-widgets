@@ -94,7 +94,7 @@ fn low(c: char) -> char {
 fn starts_at(cs: &[char], i: usize, w: &str) -> bool {
     w.chars().enumerate().all(|(k, wc)| cs.get(i + k).map(|&c| low(c)) == Some(wc))
 }
-const DAY_WORDS: [(&str, i64); 5] = [("сегодня", 0), ("завтра", 1), ("послезавтра", 2), ("today", 0), ("tomorrow", 1)];
+const DAY_WORDS: [(&str, i64); 6] = [("сегодня", 0), ("завтра", 1), ("послезавтра", 2), ("today", 0), ("day after tomorrow", 2), ("tomorrow", 1)];
 
 /// leftmost whole-word day keyword: (start, end, day offset)
 fn find_day(cs: &[char]) -> Option<(usize, usize, i64)> {
@@ -137,6 +137,39 @@ fn digits12(cs: &[char], p: usize) -> Option<(u32, usize)> {
     }
     Some((cs[p..j].iter().collect::<String>().parse().ok()?, j))
 }
+/// English 12-hour suffix at `j`: an optional blank, then "am" / "pm" (any case, "a.m." too) not followed by a letter or digit.
+/// Returns (end, pm).
+fn ampm_at(cs: &[char], j: usize) -> Option<(usize, bool)> {
+    let j = if cs.get(j) == Some(&' ') { j + 1 } else { j };
+    for (w, pm) in [("am", false), ("pm", true), ("a.m.", false), ("p.m.", true)] {
+        if starts_at(cs, j, w) {
+            let e = j + w.chars().count();
+            if cs.get(e).map_or(true, |&c| !is_word(c)) {
+                return Some((e, pm));
+            }
+        }
+    }
+    None
+}
+/// 12-hour clock to 24-hour: 12 am = 0, 12 pm = 12; `None` for an hour outside 1..=12.
+fn to24(h: u32, pm: bool) -> Option<u32> {
+    (1..=12).contains(&h).then(|| h % 12 + if pm { 12 } else { 0 })
+}
+/// `(\d{1,2})(:\d{2})? ?(am|pm)` with no "at" before it ("6pm", "6:30 pm")
+fn ampm_bare(cs: &[char], i: usize) -> Option<(usize, u32, u32)> {
+    let (h, mut j) = digits12(cs, i)?;
+    let mut m = 0;
+    if cs.get(j) == Some(&':') {
+        let (a, b) = (cs.get(j + 1)?, cs.get(j + 2)?);
+        if !(a.is_ascii_digit() && b.is_ascii_digit()) {
+            return None;
+        }
+        m = a.to_digit(10)? * 10 + b.to_digit(10)?;
+        j += 3;
+    }
+    let (e, pm) = ampm_at(cs, j)?;
+    Some((e, to24(h, pm)?, m))
+}
 /// `(?:(?:в|at)\s+)?(\d{1,2}):(\d{2})` not followed by a letter, digit or colon
 fn colon_at(cs: &[char], i: usize) -> Option<(usize, u32, u32)> {
     for p in [skip_prefix(cs, i), Some(i)].into_iter().flatten() {
@@ -178,9 +211,14 @@ fn take_time(cs: &mut Vec<char>, f: fn(&[char], usize) -> Option<(usize, u32, u3
     None
 }
 
+/// "at 6pm" / "6pm": `ampm_bare` after an optional "at " (or "в ")
+fn ampm_at_prefixed(cs: &[char], i: usize) -> Option<(usize, u32, u32)> {
+    skip_prefix(cs, i).and_then(|p| ampm_bare(cs, p)).or_else(|| ampm_bare(cs, i))
+}
+
 /// "<text> завтра в 18:30" -> (text, due unix ms). A due at exactly local 00:00 means "all day".
 /// Recognised: сегодня / завтра / послезавтра (today / tomorrow), "в 18:30", "в 9", "at 7:05", a bare "18:30". A time that has already
-/// passed today means tomorrow. `now` is local time, `off_min` the UTC offset (minutes).
+/// passed today means tomorrow. English: "today / tomorrow / day after tomorrow", "at 6pm", "6:30 pm", "at 18:30". `now` is local time, `off_min` the UTC offset (minutes).
 pub(crate) fn parse_due(input: &str, now: &Now, off_min: i32) -> (String, Option<i64>) {
     let orig = input.trim().to_string();
     let mut cs: Vec<char> = orig.chars().collect();
@@ -190,7 +228,8 @@ pub(crate) fn parse_due(input: &str, now: &Now, off_min: i32) -> (String, Option
         off = Some(o);
     }
     // ponytail: "в 5 яблок" is read as 05:00 (same as the JS version); add a stop-word list if that ever annoys
-    let hm = take_time(&mut cs, colon_at).or_else(|| take_time(&mut cs, hour_at));
+    // English "6pm" / "at 6:30 pm" first (the 24-hour readers would stop at the letters), then "в 18:30" / "at 7:05" / "в 9"
+    let hm = take_time(&mut cs, ampm_at_prefixed).or_else(|| take_time(&mut cs, colon_at)).or_else(|| take_time(&mut cs, hour_at));
     // collapse blank runs, strip leading `[\s,.;:-]` and trailing `[\s,;:-]`
     let mut text = String::new();
     let mut blanks = 0;
@@ -493,20 +532,20 @@ struct Reminders {
     ask: Option<(Pending<Option<String>>, Ask)>,
 }
 
-fn sample(now: &Now, off: i32) -> Vec<Item> {
+fn sample(now: &Now, off: i32, lang: Lang) -> Vec<Item> {
     let at = |k: i64, h: u32, m: u32| {
         let (y, mo, d) = day_plus(now.y, now.mo, now.d, k);
         Some(local_to_ms(y, mo, d, h, m, off))
     };
-    let mk = |id: u64, t: &str, due: Option<i64>| Item { id, text: t.into(), done: false, due_ms: due, created_ms: id as i64 };
+    let mk = |id: u64, ru: &str, en: &str, due: Option<i64>| Item { id, text: lang.pick(ru, en).into(), done: false, due_ms: due, created_ms: id as i64 };
     vec![
-        mk(1, "Отправить отчёт", at(0, 10, 0)),
-        mk(2, "Позвонить маме", at(0, 18, 30)),
-        mk(3, "Купить билеты", at(1, 0, 0)),
-        mk(4, "Забрать посылку в пункте выдачи на Ленина", at(2, 12, 0)),
-        mk(5, "Записаться к врачу", at(3, 0, 0)),
-        mk(6, "Оплатить интернет", None),
-        mk(7, "Прибраться на столе", None),
+        mk(1, "Отправить отчёт", "Send the report", at(0, 10, 0)),
+        mk(2, "Позвонить маме", "Call Mom", at(0, 18, 30)),
+        mk(3, "Купить билеты", "Buy tickets", at(1, 0, 0)),
+        mk(4, "Забрать посылку в пункте выдачи на Ленина", "Pick up the parcel at the pickup point on Main Street", at(2, 12, 0)),
+        mk(5, "Записаться к врачу", "Book a doctor's appointment", at(3, 0, 0)),
+        mk(6, "Оплатить интернет", "Pay the internet bill", None),
+        mk(7, "Прибраться на столе", "Tidy up the desk", None),
     ]
 }
 
@@ -523,7 +562,7 @@ impl Reminders {
         self.started = true;
         self.ver += 1;
         if cx.preview {
-            self.items = sample(&cx.now, cx.utc_offset_min());
+            self.items = sample(&cx.now, cx.utc_offset_min(), cx.lang);
         } else {
             self.reload();
         }
@@ -770,6 +809,32 @@ mod tests {
     }
     fn p(s: &str) -> (String, Option<i64>) {
         parse_due(s, &now(), OFF)
+    }
+
+    #[test]
+    fn english_phrases() {
+        assert_eq!(p("call mom tomorrow at 6pm"), ("call mom".into(), Some(ms(1, 18, 0))));
+        assert_eq!(p("meet Anna 6:30 PM"), ("meet Anna".into(), Some(ms(0, 18, 30))));
+        assert_eq!(p("dentist day after tomorrow at 9 am"), ("dentist".into(), Some(ms(2, 9, 0))));
+        assert_eq!(p("gym at 7 a.m."), ("gym".into(), Some(ms(1, 7, 0)))); // 07:00 is past at 14:00: tomorrow
+        assert_eq!(p("bed today 11:45pm"), ("bed".into(), Some(ms(0, 23, 45))));
+        assert_eq!(p("noon 12pm"), ("noon".into(), Some(ms(1, 12, 0)))); // 12 pm = 12:00, already past
+        assert_eq!(p("visit at 13pm"), ("visit at 13pm".into(), None), "an hour outside 1..12 is not a 12-hour time");
+        assert_eq!(p("5 apples"), ("5 apples".into(), None));
+        assert_eq!(p("tomorrow at 7:05"), ("tomorrow at 7:05".into(), Some(ms(1, 7, 5))), "no text left: the original stays");
+    }
+
+    #[test]
+    fn english_phrases() {
+        assert_eq!(p("call mom tomorrow at 6pm"), ("call mom".into(), Some(ms(1, 18, 0))));
+        assert_eq!(p("meet Anna 6:30 PM"), ("meet Anna".into(), Some(ms(0, 18, 30))));
+        assert_eq!(p("dentist day after tomorrow at 9 am"), ("dentist".into(), Some(ms(2, 9, 0))));
+        assert_eq!(p("gym at 7 a.m."), ("gym".into(), Some(ms(1, 7, 0)))); // 07:00 is past at 14:00: tomorrow
+        assert_eq!(p("bed today 11:45pm"), ("bed".into(), Some(ms(0, 23, 45))));
+        assert_eq!(p("noon 12pm"), ("noon".into(), Some(ms(1, 12, 0)))); // 12 pm = 12:00, already past
+        assert_eq!(p("visit at 13pm"), ("visit at 13pm".into(), None), "an hour outside 1..12 is not a 12-hour time");
+        assert_eq!(p("5 apples"), ("5 apples".into(), None));
+        assert_eq!(p("tomorrow at 7:05"), ("tomorrow at 7:05".into(), Some(ms(1, 7, 5))), "no text left: the original stays");
     }
 
     #[test]

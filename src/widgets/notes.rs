@@ -161,15 +161,15 @@ struct Notes {
     ask: Option<(Pending<Option<String>>, Ask)>,
 }
 
-fn sample() -> Vec<Note> {
-    let mk = |id: u64, t: &str| Note { id, text: t.into(), updated_ms: 1_000 - id as i64 };
+fn sample(lang: Lang) -> Vec<Note> {
+    let mk = |id: u64, ru: &str, en: &str| Note { id, text: lang.pick(ru, en).into(), updated_ms: 1_000 - id as i64 };
     vec![
-        mk(1, "План на неделю\nПонедельник: дописать виджеты и прогнать сборку\nСреда: созвон с командой в 15:00\nПятница: релиз и отчёт\n\nНе забыть купить кофе и позвонить маме"),
-        mk(2, "Список покупок\nмолоко, хлеб, яйца, кофе, сыр"),
-        mk(3, "Идея для приложения\nЗаметки, которые живут прямо на рабочем столе"),
-        mk(4, "Пароль от Wi-Fi для гостей\nнаписан на холодильнике"),
-        mk(5, "Книги\nПрочитать: Чистая архитектура, Rust в действии"),
-        mk(6, "Подарок на день рождения"),
+        mk(1, "План на неделю\nПонедельник: дописать виджеты и прогнать сборку\nСреда: созвон с командой в 15:00\nПятница: релиз и отчёт\n\nНе забыть купить кофе и позвонить маме", "Plan for the week\nMonday: finish the widgets and run the build\nWednesday: team call at 3 pm\nFriday: release and the report\n\nDon't forget to buy coffee and call Mom"),
+        mk(2, "Список покупок\nмолоко, хлеб, яйца, кофе, сыр", "Shopping list\nmilk, bread, eggs, coffee, cheese"),
+        mk(3, "Идея для приложения\nЗаметки, которые живут прямо на рабочем столе", "App idea\nNotes that live right on the desktop"),
+        mk(4, "Пароль от Wi-Fi для гостей\nнаписан на холодильнике", "Guest Wi-Fi password\nwritten on the fridge"),
+        mk(5, "Книги\nПрочитать: Чистая архитектура, Rust в действии", "Books\nTo read: Clean Architecture, Rust in Action"),
+        mk(6, "Подарок на день рождения", "Birthday present"),
     ]
 }
 
@@ -185,7 +185,7 @@ impl Notes {
         self.started = true;
         self.ver += 1;
         if cx.preview {
-            self.notes = sample();
+            self.notes = sample(cx.lang);
             self.sel = 1;
         } else {
             self.reload();

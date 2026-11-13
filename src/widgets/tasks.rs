@@ -147,15 +147,15 @@ struct Tasks {
     moving: bool,
 }
 
-fn sample() -> Vec<Task> {
-    let mk = |id: u64, t: &str, done: bool| Task { id, text: t.into(), done, created_ms: id as i64 };
+fn sample(lang: Lang) -> Vec<Task> {
+    let mk = |id: u64, ru: &str, en: &str, done: bool| Task { id, text: lang.pick(ru, en).into(), done, created_ms: id as i64 };
     vec![
-        mk(1, "Отправить отчёт", false),
-        mk(2, "Купить билеты на пятницу", false),
-        mk(3, "Позвонить маме", false),
-        mk(4, "Записаться к врачу и узнать про анализы", false),
-        mk(5, "Оплатить интернет", true),
-        mk(6, "Прибраться на столе", true),
+        mk(1, "Отправить отчёт", "Send the report", false),
+        mk(2, "Купить билеты на пятницу", "Buy tickets for Friday", false),
+        mk(3, "Позвонить маме", "Call Mom", false),
+        mk(4, "Записаться к врачу и узнать про анализы", "Book a doctor's appointment and ask about the tests", false),
+        mk(5, "Оплатить интернет", "Pay the internet bill", true),
+        mk(6, "Прибраться на столе", "Tidy up the desk", true),
     ]
 }
 
@@ -172,7 +172,7 @@ impl Tasks {
         self.ver += 1;
         self.slots = GlideAnim::smooth(0.4);
         if cx.preview {
-            self.tasks = sample();
+            self.tasks = sample(cx.lang);
         } else {
             self.reload(cx);
         }

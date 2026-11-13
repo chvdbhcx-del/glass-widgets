@@ -126,7 +126,7 @@ impl Widget for Calendar {
                 cx.rect(Rect::new(16.0, 248.0, 324.0, 0.6), FILL);
                 cx.text(Rect::new(16.0, 255.0, 324.0, 15.0), &cx.t("СЕГОДНЯ", "TODAY"), Style::LABEL, accent());
                 if cx.preview {
-                    let rows = [("Позвонить маме", "18:30", true), ("Купить билеты", "", false), ("Отправить отчёт", "10:00", false)];
+                    let rows = [(cx.t("Позвонить маме", "Call Mom"), "18:30", true), (cx.t("Купить билеты", "Buy tickets"), "", false), (cx.t("Отправить отчёт", "Send the report"), "10:00", false)];
                     for (i, (t, tm, over)) in rows.iter().enumerate() {
                         let y = 274.0 + i as f32 * 22.0;
                         cx.circle_stroke((21.5, y + 11.0), 4.9, 1.5, FAINT);

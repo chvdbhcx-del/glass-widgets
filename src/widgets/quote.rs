@@ -161,6 +161,163 @@ const QUOTES: &[(&str, &str)] = &[
     ("Рождённый ползать летать не может.", "М. Горький"),
 ];
 
+/// The English edition of `QUOTES`: the SAME quotes in the SAME order (the day picks one index for both languages), in the usual English
+/// renditions where one exists, otherwise a plain translation.
+const QUOTES_EN: &[(&str, &str)] = &[
+    // Marcus Aurelius
+    ("An obstacle in the path becomes the path itself.", "Marcus Aurelius"),
+    ("The best revenge is not to be like your enemy.", "Marcus Aurelius"),
+    ("A person is worth exactly as much as the things he cares about.", "Marcus Aurelius"),
+    ("Live every day as if it were your last.", "Marcus Aurelius"),
+    ("What is not good for the swarm is not good for the bee.", "Marcus Aurelius"),
+    ("Our life is what our thoughts make it.", "Marcus Aurelius"),
+    ("Waste no more time arguing about what a good man should be. Be one.", "Marcus Aurelius"),
+    ("If something is hard for you, do not think it impossible for a human being.", "Marcus Aurelius"),
+    // Seneca
+    ("While we are postponing, life speeds by.", "Seneca"),
+    ("It is not because things are difficult that we do not dare; it is because we do not dare that they are difficult.", "Seneca"),
+    ("If a man does not know to which port he is sailing, no wind is favourable.", "Seneca"),
+    ("It is not the man who has too little, but the man who craves more, that is poor.", "Seneca"),
+    ("Life is long enough, if you know how to use it.", "Seneca"),
+    ("Wherever there is a human being, there is an opportunity for kindness.", "Seneca"),
+    ("It is not how long you live, but how you live that matters.", "Seneca"),
+    ("We suffer more often in imagination than in reality.", "Seneca"),
+    ("Happy is the one who is content with the present.", "Seneca"),
+    ("Fire tests gold; misfortune tests strong men.", "Seneca"),
+    // Epictetus
+    ("People are disturbed not by things, but by the views they take of them.", "Epictetus"),
+    ("Don't demand that things happen as you wish; wish that they happen as they do, and you will be at peace.", "Epictetus"),
+    ("Some things are up to us, and some are not.", "Epictetus"),
+    ("If you want to be a writer, write.", "Epictetus"),
+    ("Never say \u{201c}I have lost it\u{201d}, but \u{201c}I have given it back.\u{201d}", "Epictetus"),
+    ("Circumstances show what a person is made of.", "Epictetus"),
+    // Pushkin
+    ("Habit is given to us from above: it is a substitute for happiness.", "A. S. Pushkin"),
+    ("We regard everyone as a zero, and ourselves as a one.", "A. S. Pushkin"),
+    ("What passes will be dear to us.", "A. S. Pushkin"),
+    ("Oh, it is easy to deceive me! I am glad to be deceived myself!", "A. S. Pushkin"),
+    ("Blessed is he who was young in his youth, blessed is he who ripened in time.", "A. S. Pushkin"),
+    ("Genius and villainy are two things incompatible.", "A. S. Pushkin"),
+    ("Poetry, God forgive me, has to be a little silly.", "A. S. Pushkin"),
+    ("All ages bow to love.", "A. S. Pushkin"),
+    ("The service of the Muses does not tolerate bustle.", "A. S. Pushkin"),
+    ("If life deceives you, do not grieve, do not be angry!", "A. S. Pushkin"),
+    // Lermontov
+    ("Passions are nothing but ideas in their first stage of development.", "M. Yu. Lermontov"),
+    ("We almost always forgive what we understand.", "M. Yu. Lermontov"),
+    // Tolstoy
+    ("All happy families are alike; each unhappy family is unhappy in its own way.", "L. N. Tolstoy"),
+    ("Everyone thinks of changing the world, but no one thinks of changing himself.", "L. N. Tolstoy"),
+    ("There is no greatness where there is no simplicity, goodness and truth.", "L. N. Tolstoy"),
+    ("The most important time is now, the most important person is the one beside you, the most important deed is to do them good.", "L. N. Tolstoy"),
+    ("To live honestly, one must struggle, get confused, fight, make mistakes.", "L. N. Tolstoy"),
+    ("Patience and time are my warriors.", "L. N. Tolstoy"),
+    // Lao Tzu
+    ("A journey of a thousand miles begins with a single step.", "Lao Tzu"),
+    ("He who knows others is wise; he who knows himself is enlightened.", "Lao Tzu"),
+    ("He who conquers others is strong; he who conquers himself is mighty.", "Lao Tzu"),
+    ("The soft overcomes the hard, the weak overcomes the strong.", "Lao Tzu"),
+    ("He who is content with little is rich.", "Lao Tzu"),
+    ("The great begins with the small.", "Lao Tzu"),
+    ("Those who know do not speak; those who speak do not know.", "Lao Tzu"),
+    ("The highest good is like water: it benefits all things and does not compete.", "Lao Tzu"),
+    // Confucius
+    ("Do not do to others what you do not want done to yourself.", "Confucius"),
+    ("To learn without thinking is a waste; to think without learning is dangerous.", "Confucius"),
+    ("Do not worry that people do not know you; worry that you do not know people.", "Confucius"),
+    ("The noble man seeks harmony, not sameness.", "Confucius"),
+    ("Seeing a worthy person, strive to equal them; seeing an unworthy one, examine yourself.", "Confucius"),
+    ("To know what you know and to know what you do not know: that is true knowledge.", "Confucius"),
+    // Franklin
+    ("Time is money.", "Benjamin Franklin"),
+    ("Early to bed and early to rise makes a man healthy, wealthy and wise.", "Benjamin Franklin"),
+    ("An investment in knowledge pays the best interest.", "Benjamin Franklin"),
+    ("A small leak will sink a great ship.", "Benjamin Franklin"),
+    ("Never leave till tomorrow what you can do today.", "Benjamin Franklin"),
+    ("He that can have patience can have what he will.", "Benjamin Franklin"),
+    ("Well done is better than well said.", "Benjamin Franklin"),
+    // Antiquity
+    ("I know that I know nothing.", "Socrates"),
+    ("The unexamined life is not worth living.", "Socrates"),
+    ("There is only one good, knowledge, and one evil, ignorance.", "Socrates"),
+    ("Plato is dear to me, but truth is dearer.", "Aristotle"),
+    ("Man is by nature a social animal.", "Aristotle"),
+    ("Hope is a waking dream.", "Aristotle"),
+    ("The roots of education are bitter, but the fruit is sweet.", "Aristotle"),
+    ("Everything flows.", "Heraclitus"),
+    ("You cannot step into the same river twice.", "Heraclitus"),
+    ("A person's character is their destiny.", "Heraclitus"),
+    ("The beginning is the most important part of any work.", "Plato"),
+    ("Wisdom begins in wonder.", "Plato"),
+    ("While I breathe, I hope.", "Cicero"),
+    ("To live is to think.", "Cicero"),
+    ("Gratitude is not only the greatest of virtues, but the parent of all the others.", "Cicero"),
+    ("Seize the day, and trust as little as possible in tomorrow.", "Horace"),
+    ("Dare to know.", "Horace"),
+    // Modern philosophers
+    ("Have the courage to use your own understanding.", "Immanuel Kant"),
+    ("Two things fill the mind with wonder and awe: the starry heavens above me and the moral law within me.", "Immanuel Kant"),
+    ("I think, therefore I am.", "René Descartes"),
+    ("Not to laugh, not to lament, not to detest, but to understand.", "Spinoza"),
+    ("What does not kill me makes me stronger.", "Friedrich Nietzsche"),
+    ("He who has a why to live can bear almost any how.", "Friedrich Nietzsche"),
+    ("Man is only a reed, the weakest in nature, but he is a thinking reed.", "Blaise Pascal"),
+    ("The heart has its reasons, which reason does not know.", "Blaise Pascal"),
+    ("What do I know?", "Michel de Montaigne"),
+    ("The greatest thing in the world is to know how to belong to oneself.", "Michel de Montaigne"),
+    ("We all have strength enough to endure the misfortunes of others.", "La Rochefoucauld"),
+    ("Only great men have great faults.", "La Rochefoucauld"),
+    ("Knowledge is power.", "Francis Bacon"),
+    ("Nature is conquered only by obeying her.", "Francis Bacon"),
+    ("The best is the enemy of the good.", "Voltaire"),
+    ("Work keeps at bay three great evils: boredom, vice and need.", "Voltaire"),
+    ("To have a friend, you must be one.", "Ralph Emerson"),
+    ("Nothing great was ever achieved without enthusiasm.", "Ralph Emerson"),
+    ("Simplicity, simplicity, simplicity!", "Henry Thoreau"),
+    ("It is not what you look at that matters, it is what you see.", "Henry Thoreau"),
+    ("Courage is resistance to fear, mastery of fear, not absence of fear.", "Mark Twain"),
+    ("The reports of my death are greatly exaggerated.", "Mark Twain"),
+    ("I can resist everything except temptation.", "Oscar Wilde"),
+    ("Experience is the name everyone gives to their mistakes.", "Oscar Wilde"),
+    ("Know your enemy and know yourself, and in a hundred battles you will never be in peril.", "Sun Tzu"),
+    ("The supreme art of war is to subdue the enemy without fighting.", "Sun Tzu"),
+    // Goethe, Shakespeare
+    ("Knowing is not enough, we must apply; willing is not enough, we must do.", "Johann Goethe"),
+    ("All theory, dear friend, is grey, but the golden tree of life is green.", "Johann Goethe"),
+    ("He alone deserves freedom and life who must daily conquer them anew.", "Johann Goethe"),
+    ("Stay a while, you are so beautiful!", "Johann Goethe"),
+    ("All the world's a stage, and all the men and women merely players.", "William Shakespeare"),
+    ("To be, or not to be, that is the question.", "William Shakespeare"),
+    ("There is nothing either good or bad, but thinking makes it so.", "William Shakespeare"),
+    ("Brevity is the soul of wit.", "William Shakespeare"),
+    // Russian classics
+    ("Everything about a person should be beautiful: the face, the clothes, the soul, the thoughts.", "A. P. Chekhov"),
+    ("Brevity is the sister of talent.", "A. P. Chekhov"),
+    ("A man needs not six feet of earth, but the whole globe.", "A. P. Chekhov"),
+    ("Beauty will save the world.", "F. M. Dostoevsky"),
+    ("The mystery of human existence lies not in just staying alive, but in finding something to live for.", "F. M. Dostoevsky"),
+    ("Man is a mystery. It must be solved.", "F. M. Dostoevsky"),
+    ("There are no bonds holier than comradeship.", "N. V. Gogol"),
+    ("And Vaska listens on, and eats.", "I. A. Krylov"),
+    ("Trouble comes when the cobbler starts baking pies and the pie-maker starts mending boots.", "I. A. Krylov"),
+    ("In the eyes of the strong, the powerless are always to blame.", "I. A. Krylov"),
+    ("The happy do not watch the clock.", "A. S. Griboyedov"),
+    ("I would gladly serve, but being servile makes me sick.", "A. S. Griboyedov"),
+    ("Sciences nourish the young and give delight to the old.", "M. V. Lomonosov"),
+    ("Hard in training, easy in battle.", "A. V. Suvorov"),
+    ("Look to the root!", "Kozma Prutkov"),
+    ("No one can embrace the unembraceable.", "Kozma Prutkov"),
+    ("If you want to be happy, be.", "Kozma Prutkov"),
+    ("Diligence overcomes everything.", "Kozma Prutkov"),
+    ("Nature is not a temple but a workshop, and man is the workman in it.", "I. S. Turgenev"),
+    ("You need not be a poet, but you must be a citizen.", "N. A. Nekrasov"),
+    ("We cannot foresee how our word will echo back.", "F. I. Tyutchev"),
+    ("Be silent, hide yourself, and conceal your feelings and your dreams.", "F. I. Tyutchev"),
+    ("Russia cannot be understood with the mind, nor measured by a common yardstick.", "F. I. Tyutchev"),
+    ("Man: that sounds proud.", "M. Gorky"),
+    ("One born to crawl cannot fly.", "M. Gorky"),
+];
+
 /// Quote index for a day number: a fixed-stride walk through the list, so neighbouring days are unrelated and
 /// every quote comes up once per `QUOTES.len()` days (the stride is coprime to the length, see the test).
 fn pick(day: i64, len: usize) -> usize {
@@ -190,7 +347,8 @@ pub fn register(r: &mut Registry) {
 impl Quote {
     fn day(&self, cx: &Cx, extra: i64) -> (&'static str, &'static str) {
         let d = tz::days_from_civil(cx.now.y, cx.now.mo, cx.now.d) + self.skip + extra;
-        QUOTES[pick(d, QUOTES.len())]
+        // one index for both editions: the same quote comes up on the same day in either language
+        (if cx.lang == Lang::Ru { QUOTES } else { QUOTES_EN })[pick(d, QUOTES.len())]
     }
 }
 
@@ -291,6 +449,19 @@ mod tests {
         }
         assert!(pick(5, n) != pick(6, n));
         assert_eq!(pick(-3, n), pick(-3 + n as i64, n));
+    }
+
+    #[test]
+    fn english_edition_matches_the_russian_one() {
+        assert_eq!(QUOTES_EN.len(), QUOTES.len());
+        for (i, ((t, a), (rt, ra))) in QUOTES_EN.iter().zip(QUOTES).enumerate() {
+            assert!(!t.is_empty() && !a.is_empty(), "{i}");
+            assert!(![t, a].iter().any(|s| s.chars().any(|c| ('\u{0400}'..='\u{04ff}').contains(&c))), "Cyrillic in the English edition: {t}");
+            assert_ne!(t, rt, "{i} not translated");
+            assert!(t.chars().count() <= 130, "too long: {t}");
+            // the same author, in the same slot (a renamed author would mean the lists drifted apart)
+            assert_eq!(a.chars().filter(|c| *c == '.').count() > 0, ra.chars().filter(|c| *c == '.').count() > 0, "{i}: {a} vs {ra}");
+        }
     }
 
     #[test]

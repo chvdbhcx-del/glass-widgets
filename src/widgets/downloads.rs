@@ -169,13 +169,13 @@ struct Downloads {
     moving: bool,
 }
 
-fn sample() -> Vec<Item> {
+fn sample(lang: Lang) -> Vec<Item> {
     const MB: u64 = 1 << 20;
     let it = |file: &str, name: &str, size: u64, speed: f64| Item { file: file.into(), name: name.into(), size, speed };
     vec![
         it("ubuntu-24.04-desktop-amd64.iso.crdownload", "ubuntu-24.04-desktop-amd64.iso", 1480 * MB, 11.8 * MB as f64),
         it("setup-1.2.exe.part", "setup-1.2.exe", 62 * MB, 2.4 * MB as f64),
-        it("Отчёт за квартал.pdf.crdownload", "Отчёт за квартал.pdf", 3 * MB, 0.4 * MB as f64),
+        it(lang.pick("Отчёт за квартал.pdf.crdownload", "Quarterly report.pdf.crdownload"), lang.pick("Отчёт за квартал.pdf", "Quarterly report.pdf"), 3 * MB, 0.4 * MB as f64),
     ]
 }
 
@@ -195,7 +195,7 @@ impl Downloads {
         self.ver += 1;
         self.slots = GlideAnim::smooth(0.4);
         if cx.preview {
-            self.items = sample();
+            self.items = sample(cx.lang);
         }
         self.retarget(cx, Vec::new());
     }

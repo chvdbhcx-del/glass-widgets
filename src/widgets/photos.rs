@@ -88,7 +88,7 @@ fn stem(path: &str) -> String {
 }
 
 const SAMPLE_PALETTES: usize = 4;
-const SAMPLE_NAMES: [&str; SAMPLE_PALETTES] = ["Закат у озера", "Морской бриз", "Утро в лесу", "Сумерки в горах"];
+const SAMPLE_NAMES: [(&str, &str); SAMPLE_PALETTES] = [("Закат у озера", "Sunset by the lake"), ("Морской бриз", "Sea breeze"), ("Утро в лесу", "Morning in the forest"), ("Сумерки в горах", "Dusk in the mountains")];
 
 /// Which generated sample the preview shows for a given day key, and the one after it (for the crossfade test).
 fn sample_pair(day_key: u32) -> (usize, usize) {
@@ -313,7 +313,7 @@ impl Widget for Photos {
             self.interval = interval_secs(cx.cfg_f64("interval_s"));
             if cx.preview {
                 let (a, b) = sample_pair(cx.now.day_key());
-                let mk = |i: usize| cx.image(&sample_photo(i, 640, 400)).ok().map(|bmp| Photo { bmp, name: SAMPLE_NAMES[i].to_string() });
+                let mk = |i: usize| cx.image(&sample_photo(i, 640, 400)).ok().map(|bmp| Photo { bmp, name: cx.t(SAMPLE_NAMES[i].0, SAMPLE_NAMES[i].1).to_string() });
                 self.cur = mk(a);
                 self.next = mk(b).map(|p| (1, p));
                 self.ver += 1;
