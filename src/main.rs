@@ -7,6 +7,7 @@
 //!                                                                     (menu: the card context menu over the first card; menu-size has the Size submenu open, menu-one is a single-size widget; --hover n = highlighted row)
 //!   mswidgets [--backdrop-fps 30] [--scale S] [--no-config] [--no-hotkeys]   live mode (Ctrl+Alt+Q quits, Ctrl+Alt+W edits; a second instance exits silently)
 //!   mswidgets --bench SECONDS [--backdrop-fps N]                    live mode that prints stats and exits
+//!   (--dump, --sheet and --dump-ui take --lang auto|ru|en: the UI language of the render, default the `lang` setting)
 //!   mswidgets --selftest-dupl                                       desktop-duplication self test (no window)
 // release builds are GUI-subsystem: no console window flashes when started from the Start menu / autostart (see `attach_console`)
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]

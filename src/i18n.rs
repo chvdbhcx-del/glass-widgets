@@ -218,6 +218,40 @@ mod tests {
         }
     }
 
+    /// The installer wizard: English and Russian for every LangString, defined after `MUI_LANGUAGE` (NSIS needs the language to exist first),
+    /// and the file keeps its UTF-8 BOM (without it makensis reads the Russian as ANSI).
+    #[test]
+    fn installer_has_both_languages_for_every_string() {
+        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/installer/glass-widgets.nsi")).unwrap();
+        assert_eq!(&bytes[..3], b"\xEF\xBB\xBF", "the .nsi lost its UTF-8 BOM");
+        let text = String::from_utf8(bytes).unwrap();
+        let lang_decl = text.rfind("!insertmacro MUI_LANGUAGE").expect("MUI_LANGUAGE");
+        let mut names = std::collections::BTreeMap::<String, (bool, bool)>::new();
+        for (pos, line) in text.match_indices("LangString ") {
+            let l = text[pos..].lines().next().unwrap_or(line);
+            let mut w = l.split_whitespace();
+            let (_, name, lang) = (w.next(), w.next().unwrap(), w.next().unwrap());
+            assert!(pos > lang_decl, "LangString {name} comes before MUI_LANGUAGE");
+            let e = names.entry(name.to_string()).or_default();
+            match lang {
+                "${LANG_ENGLISH}" => {
+                    assert!(!l.contains(|c: char| is_cyr(c)), "{name}: Cyrillic in the English text");
+                    e.0 = true
+                }
+                "${LANG_RUSSIAN}" => {
+                    // "${NAME}" is the same product name in both
+                    assert!(l.contains(is_cyr) || l.contains("\"${NAME}\""), "{name}: the Russian text is not Russian");
+                    e.1 = true
+                }
+                other => panic!("{name}: unexpected language {other}"),
+            }
+        }
+        assert!(names.len() >= 10);
+        for (n, (en, ru)) in names {
+            assert!(en && ru, "LangString {n} lacks a language: english {en}, russian {ru}");
+        }
+    }
+
     // ---------------------------------------------------------------- the source lint
     // Every user-visible string is a `(ru, en)` pair of literals. This walks the sources and fails when an English half is empty,
     // still Cyrillic, or when a NEW Russian-only literal appears (the per-file allowance below is a ratchet: it may only shrink).

@@ -55,7 +55,7 @@ mswidgets.exe --dump out\<you>\d.png --backdrop out\bd_sunset2.png --cards "cloc
 ```
 `type:size@col,row` (size optional = default size). The canvas auto-fits unless `--w/--h`. Use `--scale 2` to inspect details (it is also a test that you
 use logical px everywhere). Previews use the FIXED time 2026-10-24 10:08:35 unless `--time` is given, so two renders are comparable.
-`--no-config` makes a `--dump` without `--cards` use the default layout instead of the user's config.json.
+`--no-config` makes a `--dump` without `--cards` use the default layout instead of the user's config.json. `--lang auto|ru|en` renders in that language (default: the `lang` setting, section 14).
 
 `--cards "_dev:l@0,0;_dev:l@2,0{\"mode\":\"icons\"}"` renders the primitive gallery (text styles, rings, bars, sparkline, clip, bitmap, rotation)
 and all glyphs numbered in `Glyph::ALL` order.
@@ -293,7 +293,7 @@ Reference implementations here: `clock.rs`, `calendar.rs`. Product contract: `..
   L (356x356) = a list or grid (4-6 rows of ~44 px, a month, a chart) with a title; lists anchor to the top, summaries to the bottom. Empty states are dim centred text, never blank.
 * List rows are 44 px with a 0.6 px `FILL` separator (see the world-clock rows in clock.rs); checkbox circles are 11 px with a 1.5 px `FAINT` stroke.
 * Everything must stay legible over a bright AND a dark backdrop: check the sheet on `bd_sunset2.png` and `bd_bw.png`.
-* `.ellipsis()` on every variable-length string; `.wrap()` only where designed. Russian first, `cx.t(ru, en)` for both.
+* `.ellipsis()` on every variable-length string; `.wrap()` only where designed. Russian first, `cx.t(ru, en)` for both (section 14).
 
 ## 10. Threading and performance rules
 
@@ -408,3 +408,16 @@ Result (weighted distance, lower is better): old constants 0.272 -> baked defaul
 The bright-green clear_z crops got worse (0.044 / 0.064 -> 0.12 / 0.14): they want a lighter glass than the warm references (one `bright` for all backdrops; Apple tints per backdrop, we use the luminance veil).
 Residual: the references show a 1 px DARK outline on the left / right edges and a bright rim on top / bottom (lit from above), which a uniform rim + a 315 deg light cannot reproduce pixel-exact (edge error stays ~0.05);
 the light angle is nearly irrelevant to the fit (error 0.116-0.140 over 0..330 deg, best 150 deg, 315 deg is 2 % worse), so the product default 315 deg stays.
+
+## 14. Languages (Russian / English)
+
+The UI is bilingual. Every user-visible string is a `(ru, en)` pair picked by the language in force: `cx.t(ru, en)` in widgets, `Lang::pick(ru, en)` elsewhere (menus, panels, toasts, the tray), `i18n::tr(ru, en)` where no `Cx` / `Lang` is at hand (worker threads, prompts). A string must be a pair: the unit tests (below) fail otherwise.
+
+* **Setting** (`src/i18n.rs`): `lang` in `config.json` = `auto` | `ru` | `en`; a missing or unknown value is `auto`, which is Russian when the Windows display language (`GetUserDefaultUILanguage`, primary language Russian) is Russian and English for every other one. `LangPref` is the setting, `Lang` (`glasskit::lang`) what it resolves to; `i18n::current()` / `pref()` are relaxed atomic loads (free per frame), the first call reads `config.json`. `layout::Settings::lang` carries it, `poll_config` applies an edit of the file behind the app's back.
+* **Live switch** (`App::set_language`): settings panel row "Language" (`Opt::Language`, three segments Auto / Русский / English, the language names stay in their own language) and tray submenu "Language" (`TrayCmd::Language`). It stores the preference (`i18n::set_pref`), writes `lang`, sets `Ui::lang` (`Ui::set_language` also drops the cached gallery previews, which are scenes of their own), `Scene::set_lang` + `invalidate_all` and re-renders every card; menus and the tray menu are built per use from `ui.lang`, the UI Automation names per request. A widget that caches something language-dependent must notice `cx.lang` changing (the weather card looks its place name up again: `weather_loc.json` stores the language of the name).
+* **Writing text**: Russian is the reference, English is natural English, not word for word; keep the English short enough for the same box (check S / M / L in both: `--lang en` and `--lang ru`). Dates: `weekday_name` / `month_name` / `month_genitive` (and the short tables of nextevent / weather); numbers: the decimal point is `.` and thousands are `,` in English, `,` and a no-break space in Russian (`rates::fmt_value`, `sysmon::num`, `diskhealth::grouped`); units have an English table next to the Russian one (sysmon, nextevent). The clock widgets are 24-hour in both languages (there is no 12-hour setting). Sample data of the previews (`cx.preview`) is localised too (reminders, tasks, notes, clipboard, downloads, photos, shortcuts, calendar, weather, nextevent's `sample_ics`); user data (notes, reminders, shortcut names, cities, stored cfg) is never translated.
+* **Quote of the Day** has two editions, `QUOTES` and `QUOTES_EN`, the same quotes in the same order (a test checks the lengths): the day picks one index for both.
+* **Reminders** parse English as well: `today`, `tomorrow`, `day after tomorrow`, `at 6pm`, `6:30 PM`, `at 7:05`, next to the Russian words.
+* **Headless**: `--lang auto|ru|en` on `--sheet` / `--dump` / `--dump-ui` renders that language without touching `config.json` (default: the setting). Review sheets in English with at most 9 cards per sheet, e.g. `mswidgets --sheet out\en\g1.png --backdrop out\bd_sunset2.png --only clock,calendar,weather --lang en`, and `MSW_TEXT_LINT=1` lists every text run (grep Cyrillic in the English render; compare overflowing boxes with the Russian render).
+* **Tests**: `i18n.rs` (Auto resolution from the language id, fallback for old configs, the round trips), a source lint (`english_halves_are_filled_and_not_russian`: every `"ru", "en"` literal pair has a non-empty English half without Cyrillic; `no_new_russian_only_strings`: a per-file allowance of Cyrillic literals without a partner, which are Russian data such as weekday tables and parser words, and may only shrink), `every_widget_has_english_text` (names and descriptions in the registry), `cards::every_widget_renders_in_both_languages` (every widget at every size, Russian -> English and English -> Russian across a live `set_lang`), `ui::language_control_and_live_switch`, and `installer_has_both_languages_for_every_string` (every NSIS `LangString` has English and Russian, defined after `MUI_LANGUAGE`, and the `.nsi` keeps its UTF-8 BOM).
+* **Installer** (`installer/glass-widgets.nsi`): NSIS shows English or Russian by the Windows language (`MUI_LANGUAGE "English"` + `"Russian"`, a `LangString` for each text in both languages after them).

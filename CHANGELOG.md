@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.8.1] - unreleased
+
+### Added
+- Language setting: **Auto** (Russian when Windows is displayed in Russian, English otherwise), **Русский** or **English**. Pick it in the settings panel ("Language" row) or in the tray menu ("Language"); it applies at once, without a restart: the widgets, the gallery and its previews, the panels, the context menus and the tray menu are redrawn in the new language. Stored as `lang` in `config.json` (`auto` | `ru` | `en`; an older config without the key is Auto, so a Russian Windows stays Russian).
+- English throughout: the sample data of the gallery previews and contact sheets (reminders, tasks, notes, clipboard, downloads, photos, shortcuts, calendar, weather) and the Quote of the Day (a full English edition of the quotes, the same quote on the same day in either language) are now in the chosen language.
+- Reminders understand English times: "call mom tomorrow at 6pm", "meet Anna 6:30 pm", "dentist day after tomorrow at 9 am" (plus the 24-hour forms that already worked).
+- `mswidgets --lang auto|ru|en` for the headless tools (`--sheet`, `--dump`, `--dump-ui`): renders a language without touching `config.json`.
+
+### Changed
+- English number formats: decimal point and comma thousands separators ("$67,412", "21,340 h", "3.1%") instead of the Russian comma / space; "52°C" and "88%" without a space in English.
+- The weather card looks its place name up again in the new language when the language is switched (the forecast stays).
+- English wording: the gallery bar label "Фон" is "Mode" (was "Back"), the router entry of the Ping card is "Router".
+- The settings panel is one row (38 px) taller for the new Language row.
+
+### Developer
+- `src/i18n.rs` holds the setting (`LangPref`), its resolution against the Windows UI language and the process-wide current language; unit tests read the sources and fail on an empty or Cyrillic English half of any `(ru, en)` pair and on a new Russian-only string, and a render test draws every widget at every size in both languages (and across a live switch). The installer test checks that every NSIS LangString has both languages.
+
+## [0.8.1] - unreleased
+
+### Added
+- Language setting: **Auto** (Russian when Windows is displayed in Russian, English otherwise), **Русский** or **English**. Pick it in the settings panel ("Language" row) or in the tray menu ("Language"); it applies at once, without a restart: the widgets, the gallery and its previews, the panels, the context menus and the tray menu are redrawn in the new language. Stored as `lang` in `config.json` (`auto` | `ru` | `en`; an older config without the key is Auto, so a Russian Windows stays Russian).
+- English throughout: the sample data of the gallery previews and contact sheets (reminders, tasks, notes, clipboard, downloads, photos, shortcuts, calendar, weather) and the Quote of the Day (a full English edition of the quotes, the same quote on the same day in either language) are now in the chosen language.
+- Reminders understand English times: "call mom tomorrow at 6pm", "meet Anna 6:30 pm", "dentist day after tomorrow at 9 am" (plus the 24-hour forms that already worked).
+- `mswidgets --lang auto|ru|en` for the headless tools (`--sheet`, `--dump`, `--dump-ui`): renders a language without touching `config.json`.
+
+### Changed
+- English number formats: decimal point and comma thousands separators ("$67,412", "21,340 h", "3.1%") instead of the Russian comma / space; "52°C" and "88%" without a space in English.
+- The weather card looks its place name up again in the new language when the language is switched (the forecast stays).
+- English wording: the gallery bar label "Фон" is "Mode" (was "Back"), the router entry of the Ping card is "Router".
+- The settings panel is one row (38 px) taller for the new Language row.
+
+### Developer
+- `src/i18n.rs` holds the setting (`LangPref`), its resolution against the Windows UI language and the process-wide current language; unit tests read the sources and fail on an empty or Cyrillic English half of any `(ru, en)` pair and on a new Russian-only string, and a render test draws every widget at every size in both languages (and across a live switch). The installer test checks that every NSIS LangString has both languages.
+
 ## [0.8.0] - 2026-11-08
 
 ### Added
