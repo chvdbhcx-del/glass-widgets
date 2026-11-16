@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- "Update now" never worked: the public key built into the app had two swapped bytes, so every real release failed the signature check ("bad signature") and the download was thrown away. The key is fixed and a test now checks the app's key against the signature of a real published release. A copy of Glass Widgets older than this fix cannot update itself once: install the new version by hand from the release page, after that updates work as designed.
+
 ## [0.8.1] - 2026-11-13
 
 ### Added
