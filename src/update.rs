@@ -32,7 +32,7 @@ pub const DL_DONE: usize = 102;
 /// Ed25519 public key the installers are signed with (private half: `keys/update-signing.key` in the project folder, never in git; see
 /// tools/release.ps1). GitHub alone is not trusted: a release without a valid signature by this key is refused.
 const PUBKEY: [u8; 32] = [
-    0x80, 0xf8, 0xe0, 0xec, 0x13, 0xfb, 0xd9, 0x58, 0x48, 0xd7, 0x27, 0xb6, 0x55, 0xc5, 0x87, 0x4a, 0x8d, 0x74, 0xde, 0x47, 0xcf, 0x26, 0x23, 0x04, 0x29, 0x07, 0x34, 0x15, 0x46, 0xa6,
+    0x80, 0xf8, 0xe0, 0xec, 0x13, 0xfb, 0xd9, 0x58, 0x48, 0xd7, 0x27, 0xb6, 0x55, 0xc5, 0x87, 0x4d, 0x8a, 0x74, 0xde, 0x47, 0xcf, 0x26, 0x23, 0x04, 0x29, 0x07, 0x34, 0x15, 0x46, 0xa6,
     0xb2, 0xef,
 ];
 /// the signed message is this tag + SHA-256 of the installer (examples/sign.rs builds the same bytes)
@@ -435,6 +435,15 @@ mod tests {
         assert!(!signature_ok(&key, &hash, &bent), "a damaged signature");
         assert!(!signature_ok(&PUBKEY, &hash, &sig), "a signature by another key must not pass for the shipped key");
         assert!(!signature_ok(&[0u8; 32], &hash, &sig), "a degenerate key");
+    }
+
+    /// The real thing: the hash and signature published with release v0.8.1 must verify against the key built into the app.
+    /// (A typo in `PUBKEY` once made every real update fail with "bad signature" while the tests above, which use their own key, stayed green.)
+    #[test]
+    fn the_shipped_key_verifies_a_real_release() {
+        let hash = parse_digest("sha256:6aca20b1ba628e0e241c2ef785f701a62c1ed5bc80e932feb463b9ec152ad606").unwrap();
+        let sig = parse_sig("04cd4894c7a2e943f39b2ea8c51a1a0e1508e31f95eae7e3e6a55ca9ffc20d3db15c375a3940fde78caa10658c1eae41a23848da5bb10d83aacb90a02fb3e109").unwrap();
+        assert!(signature_ok(&PUBKEY, &hash, &sig), "PUBKEY in src/update.rs is not the public half of keys/update-signing.key");
     }
 
     #[test]
